@@ -37,6 +37,7 @@
 mod contracts;
 mod heat;
 mod particles;
+mod rigid;
 
 use std::time::{Duration, Instant};
 
@@ -233,6 +234,7 @@ pub fn all_cases() -> Vec<Case> {
     let mut cases = Vec::new();
     cases.extend_from_slice(particles::CASES);
     cases.extend_from_slice(heat::CASES);
+    cases.extend_from_slice(rigid::CASES);
     cases.extend_from_slice(contracts::CASES);
     cases
 }

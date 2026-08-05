@@ -1679,6 +1679,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-domain-rigid2d"
+version = "0.1.0"
+dependencies = [
+ "lattice-ir",
+]
+
+[[package]]
 name = "lattice-ir"
 version = "0.1.0"
 dependencies = [
@@ -1717,6 +1724,7 @@ version = "0.1.0"
 dependencies = [
  "lattice-domain-grid2d",
  "lattice-domain-particle",
+ "lattice-domain-rigid2d",
  "lattice-ir",
  "lattice-observe",
 ]

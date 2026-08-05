@@ -1,0 +1,13 @@
+[package]
+name = "lattice-domain-rigid2d"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "2D rigid-body mechanics: shapes, contacts, constraints"
+
+[dependencies]
+lattice-ir.workspace = true
+
+[lints]
+workspace = true

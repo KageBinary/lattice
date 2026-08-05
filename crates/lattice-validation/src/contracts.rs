@@ -12,6 +12,7 @@
 
 use lattice_domain_grid2d::{Diffusivity, HeatDomain, TimeScheme};
 use lattice_domain_particle::{HarmonicWell, Integrator, ParticleDomain, ParticleSpec};
+use lattice_domain_rigid2d::RigidDomain;
 use lattice_ir::{Domain, Grid2d, SolverContract, StabilityReason};
 
 use crate::{Case, Level, Outcome};
@@ -54,6 +55,10 @@ fn all_contracts() -> Vec<&'static SolverContract> {
         contracts
             .push(HeatDomain::new("audit", grid, Diffusivity::Uniform(1.0)).with_scheme(scheme).contract());
     }
+    // The rigid module publishes one contract rather than one per integrator: a
+    // sequential-impulse solver assumes semi-implicit Euler, and offering an
+    // alternative would be offering something that does not work.
+    contracts.push(RigidDomain::new("audit", 1).contract());
     contracts
 }
 

@@ -88,6 +88,7 @@
 //! ```
 
 pub mod arena;
+pub mod bodies;
 pub mod contract;
 pub mod diagnostics;
 pub mod graph;
@@ -99,6 +100,7 @@ pub mod render;
 pub mod rng;
 
 pub use arena::{Arena, Frame};
+pub use bodies::{BodySpec, Motion, RigidBodyStore};
 pub use contract::{
     ContractGap, Domain, FidelityProfile, Precision, SolverContract, StabilityReason, StableStep,
     StepContext,
@@ -115,8 +117,8 @@ pub use model::{
     BufferKind, BufferPlan, BufferSpec, CompiledModel, DomainSpec, ObserverSpec, VisualSpec,
 };
 pub use ids::{
-    BufferId, DomainId, FieldId, MaterialId, ObserverId, OperatorId, ParticleId, ParticleKind,
-    PortId, ReactionId, SpeciesId,
+    BodyId, BufferId, DomainId, FieldId, MaterialId, ObserverId, OperatorId, ParticleId,
+    ParticleKind, PortId, ReactionId, ShapeId, SpeciesId,
 };
 pub use particles::{Dynamics, ForceAccumulation, ParticleSpec, ParticleStore};
 pub use render::{bounds_of, RenderChannel};
