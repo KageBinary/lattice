@@ -1,0 +1,12 @@
+// expect: E0210
+// There is no `triangle` initializer. The message lists what does exist.
+
+project unknown_initializer {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g = triangle(1 kelvin) {
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+}

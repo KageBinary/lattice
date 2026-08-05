@@ -1,0 +1,6 @@
+// expect: E0400
+// Length plus time. The diagnostic names both sides and underlines each.
+
+project adding_incompatible {
+  grid g { size: [8, 8]; extent: [1 meter + 2 second, 1 meter]; }
+}

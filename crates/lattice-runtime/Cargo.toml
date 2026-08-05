@@ -1,0 +1,14 @@
+[package]
+name = "lattice-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Clock, timestep negotiation, scheduling, and run artifacts"
+
+[dependencies]
+lattice-ir.workspace = true
+lattice-observe.workspace = true
+
+[lints]
+workspace = true

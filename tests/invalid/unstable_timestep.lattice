@@ -1,0 +1,13 @@
+// expect: E0405
+// An explicit scheme past its von Neumann stability limit. Refused at compile time
+// rather than discovered when the field fills with NaN (NFR-007).
+
+project unstable_timestep {
+  grid g { size: [64, 64]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g = 298 kelvin {
+    diffusivity: 1 meter^2 / second;
+  }
+
+  solve heat(temperature) with explicit(dt=1 second);
+}

@@ -93,6 +93,11 @@ pub struct HeatDomain {
     last_outcome: Option<SolveOutcome>,
     preferred_dt: f64,
     steps: u64,
+    /// What the values are measured in, for labelling plots and observations.
+    ///
+    /// The solver does not need this — it computes in unit-free SI either way — but a
+    /// reader of a heatmap does. The compiler knows the field's dimension and sets it.
+    display_unit: String,
 }
 
 /// Halo width. One cell is all a 5-point stencil reads.
@@ -129,7 +134,19 @@ impl HeatDomain {
             last_outcome: None,
             preferred_dt,
             steps: 0,
+            display_unit: "field units".to_string(),
         }
+    }
+
+    /// Label the values with a unit, for plots and observations.
+    pub fn with_display_unit(mut self, unit: impl Into<String>) -> Self {
+        self.display_unit = unit.into();
+        self
+    }
+
+    /// The unit the values are labelled with.
+    pub fn display_unit(&self) -> &str {
+        &self.display_unit
     }
 
     /// Choose the time scheme.
@@ -504,6 +521,8 @@ impl Domain for HeatDomain {
     fn observe(&self, out: &mut Observations) {
         let prefix = &self.name;
         out.record_invariant(format!("{prefix}.integral"), Invariant::FieldIntegral, self.integral());
+        // `Observation::unit` is `&'static str`, so a compiler-supplied unit cannot be
+        // stored there; the render channel carries it instead.
         out.record_metric(format!("{prefix}.min"), self.field.min_interior(), "field units");
         out.record_metric(format!("{prefix}.max"), self.field.max_interior(), "field units");
 
@@ -521,6 +540,15 @@ impl Domain for HeatDomain {
                 ObservationKind::Residual,
             );
         }
+    }
+
+    fn render_channels(&self) -> Vec<lattice_ir::RenderChannel<'_>> {
+        vec![lattice_ir::RenderChannel::Scalar {
+            name: &self.name,
+            field: &self.field,
+            grid: self.grid,
+            unit: &self.display_unit,
+        }]
     }
 }
 

@@ -1,0 +1,7 @@
+// expect: E0204
+// A setting the declaration does not understand. Silently ignoring it would produce
+// a model that compiles, runs, and is not the one the user described.
+
+project unknown_setting {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; diffusivity: 1 meter^2/second; }
+}

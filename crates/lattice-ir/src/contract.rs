@@ -412,6 +412,15 @@ pub trait Domain {
 
     /// Report metrics, invariants and residuals for this step.
     fn observe(&self, out: &mut Observations);
+
+    /// Read-only views a viewer may draw (spec §7.3, "render channels").
+    ///
+    /// Defaults to none so a solver can be written without one, but a domain that
+    /// exposes nothing cannot be inspected when it misbehaves — which is exactly
+    /// when P7 says visualization earns its place.
+    fn render_channels(&self) -> Vec<crate::render::RenderChannel<'_>> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

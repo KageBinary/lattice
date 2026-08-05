@@ -1,0 +1,12 @@
+// expect: E0206
+// There is no `magnetohydrodynamics` solver, and it is not on any milestone either.
+
+project unknown_solver {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g = 298 kelvin {
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  solve magnetohydrodynamics(temperature) with crank_nicolson(dt=0.1 second);
+}

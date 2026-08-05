@@ -1,0 +1,13 @@
+// expect: E0405
+// A negative diffusivity runs the heat equation backwards, amplifying every
+// short-wavelength mode without bound. The message says so.
+
+project negative_diffusivity {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g = 298 kelvin {
+    diffusivity: -1e-5 meter^2 / second;
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+}

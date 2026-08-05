@@ -1,0 +1,14 @@
+// expect: E0403
+// Degrees Celsius is an affine scale: 0 °C is 273.15 K, so dividing by it has no
+// consistent meaning. The fix — use kelvin — is in the message.
+
+project affine_unit {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g = 298 kelvin {
+    diffusivity: 1e-5 meter^2 / second;
+    boundary_left: flux(gradient=5 joule / celsius);
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+}

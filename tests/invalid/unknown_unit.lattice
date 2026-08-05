@@ -1,0 +1,6 @@
+// expect: E0200
+// A misspelled unit. The compiler suggests the closest registered spelling.
+
+project unknown_unit {
+  grid g { size: [8, 8]; extent: [1 metre_, 1 meter]; }
+}

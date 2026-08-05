@@ -1,0 +1,7 @@
+// expect: E0108
+// Dimensions are tracked as integer exponents, so `meter^0.5` has no representation.
+// Rejected by the parser, with the reason stated.
+
+project fractional_exponent {
+  grid g { size: [8, 8]; extent: [1 meter^0.5, 1 meter]; }
+}

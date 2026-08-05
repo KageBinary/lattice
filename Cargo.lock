@@ -6,12 +6,27 @@ version = 4
 name = "lattice-cli"
 version = "0.1.0"
 dependencies = [
+ "lattice-compiler",
  "lattice-domain-grid2d",
  "lattice-domain-particle",
  "lattice-ir",
  "lattice-observe",
+ "lattice-runtime",
+ "lattice-syntax",
  "lattice-units",
  "lattice-validation",
+]
+
+[[package]]
+name = "lattice-compiler"
+version = "0.1.0"
+dependencies = [
+ "lattice-domain-grid2d",
+ "lattice-domain-particle",
+ "lattice-ir",
+ "lattice-runtime",
+ "lattice-syntax",
+ "lattice-units",
 ]
 
 [[package]]
@@ -42,6 +57,21 @@ name = "lattice-observe"
 version = "0.1.0"
 dependencies = [
  "lattice-ir",
+]
+
+[[package]]
+name = "lattice-runtime"
+version = "0.1.0"
+dependencies = [
+ "lattice-ir",
+ "lattice-observe",
+]
+
+[[package]]
+name = "lattice-syntax"
+version = "0.1.0"
+dependencies = [
+ "lattice-units",
 ]
 
 [[package]]

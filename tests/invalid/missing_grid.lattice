@@ -1,0 +1,12 @@
+// expect: E0202
+// A field on a grid that was never declared. The message lists the ones that were.
+
+project missing_grid {
+  grid chamber { size: [8, 8]; extent: [1 meter, 1 meter]; }
+
+  field temperature on chambre = 298 kelvin {
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+}

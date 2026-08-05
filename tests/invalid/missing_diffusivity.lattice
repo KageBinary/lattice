@@ -1,0 +1,11 @@
+// expect: E0203
+// A field cannot be solved by the heat module without a diffusivity, and guessing
+// one would produce a plausible number from an unstated assumption.
+
+project missing_diffusivity {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g = 298 kelvin;
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+}

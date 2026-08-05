@@ -21,6 +21,7 @@ mod args;
 mod bench;
 mod demo;
 mod inspect;
+mod project;
 mod render;
 
 use std::process::ExitCode;
@@ -58,6 +59,14 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     }
 
     match args.command.as_deref().expect("checked above") {
+        "check" => {
+            check_flags(args, &["quiet"])?;
+            project::check(args)
+        }
+        "run" => {
+            check_flags(args, &["duration", "steps", "timestep", "json", "quiet"])?;
+            project::run(args)
+        }
         "validate" => cmd_validate(args),
         "bench" => cmd_bench(args),
         "demo" => cmd_demo(args),
@@ -67,7 +76,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         other => Err(format!(
-            "unknown command `{other}`; expected validate, bench, demo, or inspect"
+            "unknown command `{other}`; expected check, run, validate, bench, demo, or inspect"
         )),
     }
 }
@@ -261,6 +270,16 @@ USAGE
   lattice <command> [options]
 
 COMMANDS
+  check <file.lattice>     compile a model and print its report without running it
+    --quiet                  suppress the model report, keep the diagnostics
+
+  run <file.lattice>       compile and execute a model
+    --duration <seconds>     override the model's `duration:`
+    --steps <n>              stop after this many steps
+    --timestep <seconds>     override the negotiated timestep
+    --json <path>            write the run artifact
+    --quiet                  suppress the visualization
+
   validate                 run the validation suite and report measured error metrics
     --filter <pattern>       run only cases whose name or domain contains <pattern>
     --json <path>            write a machine-readable report
@@ -283,6 +302,8 @@ COMMANDS
   --version, -V            version and build configuration
 
 EXAMPLES
+  lattice check examples/slab.lattice
+  lattice run examples/slab.lattice --json runs/slab.json
   lattice validate
   lattice validate --filter grid2d --json runs/validation.json
   lattice bench heat --scale 2
@@ -394,9 +415,21 @@ mod tests {
     #[test]
     fn usage_text_documents_every_command() {
         let text = usage();
-        for command in ["validate", "bench", "demo", "inspect"] {
+        for command in ["check", "run", "validate", "bench", "demo", "inspect"] {
             assert!(text.contains(command), "usage is missing `{command}`");
         }
         assert!(text.contains("EXIT CODES"), "exit codes must be documented");
+    }
+
+    #[test]
+    fn check_and_run_require_a_file() {
+        assert!(run(&parse("check")).is_err());
+        assert!(run(&parse("run")).is_err());
+    }
+
+    #[test]
+    fn check_and_run_reject_unknown_flags() {
+        let error = run(&parse("check model.lattice --verbse")).unwrap_err();
+        assert!(error.contains("--verbse"), "{error}");
     }
 }

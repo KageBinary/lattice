@@ -1,0 +1,7 @@
+// expect: E0201
+// The same grid declared twice. Both spans are shown.
+
+project duplicate_declaration {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; }
+  grid g { size: [16, 16]; extent: [2 meter, 2 meter]; }
+}

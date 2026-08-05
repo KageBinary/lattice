@@ -1,0 +1,20 @@
+// expect: E0900
+// Chemistry is milestone M3. The declaration parses and its settings are checked,
+// but nothing can execute it — so this is an error, not a silent omission. A model
+// whose chemistry was quietly dropped would run and produce confident wrong numbers.
+
+project unimplemented_reaction {
+  grid chamber { size: [16, 16]; extent: [1 meter, 1 meter]; }
+
+  species A on chamber = left_half(1 mole / meter^2) {
+    diffusivity: 1e-9 meter^2 / second;
+  }
+
+  reaction decay {
+    reactants: A;
+    products: B;
+    enthalpy: -25 kilojoule / mole;
+  }
+
+  solve diffusion(A) with crank_nicolson(dt=1 second);
+}

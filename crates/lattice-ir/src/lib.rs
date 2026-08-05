@@ -12,6 +12,8 @@
 //! | Module | Provides | Spec |
 //! |---|---|---|
 //! | [`ids`] | Typed identifiers for every index space | §7.1 |
+//! | [`model`] | The compiled model and its buffer plan | §7.2, §8.4 |
+//! | [`graph`] | The scheduled operation graph | §9.2 |
 //! | [`particles`] | Structure-of-arrays particle storage with stable handles | §11.2, §15.2 |
 //! | [`grid`] | Uniform grids, halo'd scalar/vector fields, boundary conditions | §11.3 |
 //! | [`arena`] | Preallocated per-step scratch space | NFR-001 |
@@ -88,9 +90,12 @@
 pub mod arena;
 pub mod contract;
 pub mod diagnostics;
+pub mod graph;
 pub mod grid;
 pub mod ids;
+pub mod model;
 pub mod particles;
+pub mod render;
 pub mod rng;
 
 pub use arena::{Arena, Frame};
@@ -102,12 +107,17 @@ pub use diagnostics::{
     ConservationLedger, DriftMonitor, Invariant, Observation, ObservationKind, Observations,
     Reconciliation, ResidualHistory, SolveOutcome, Transfer,
 };
+pub use graph::{GraphError, Operation, OperationGraph, OperationKind};
 pub use grid::{
     Boundary, BoundaryError, BoundarySet, Grid2d, ScalarField, Side, VectorField,
+};
+pub use model::{
+    BufferKind, BufferPlan, BufferSpec, CompiledModel, DomainSpec, ObserverSpec, VisualSpec,
 };
 pub use ids::{
     BufferId, DomainId, FieldId, MaterialId, ObserverId, OperatorId, ParticleId, ParticleKind,
     PortId, ReactionId, SpeciesId,
 };
 pub use particles::{Dynamics, ForceAccumulation, ParticleSpec, ParticleStore};
+pub use render::{bounds_of, RenderChannel};
 pub use rng::{Pcg32, RngSnapshot};

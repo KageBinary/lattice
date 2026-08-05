@@ -1,0 +1,33 @@
+// A mass on a spring.
+//
+// The simplest model that has an exact answer: a particle in a harmonic well at
+// omega = sqrt(k/m) = 2 rad/s, so one period is pi seconds. Velocity Verlet is
+// symplectic, so the energy oscillates within a bounded band forever rather than
+// drifting — watch `p.total_energy` in the artifact.
+//
+// Try `--timestep 1.1 second` to see the runtime refuse an unstable step rather than
+// clamping it: the stability limit here is 2/omega = 1 s.
+//
+//   lattice run examples/oscillator.lattice --json runs/oscillator.json
+
+project oscillator {
+  dimensions: 2;
+  fidelity: engineering_2d;
+  duration: 20 second;
+
+  particles p {
+    count: 1;
+
+    // Particles are placed on a lattice at `origin + (i + 0.5) * spacing`, so a
+    // single particle with this region and spacing starts at (1 m, 1 m).
+    region:  [2 meter, 2 meter];
+    spacing: 2 meter;
+    mass:    1 kilogram;
+
+    force: harmonic_well(center=[0 meter, 0 meter], stiffness=4 newton/meter);
+  }
+
+  solve dynamics(p) with velocity_verlet(dt=0.005 second);
+
+  observe p every 0.25 second;
+}

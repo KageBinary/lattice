@@ -177,7 +177,20 @@ pub fn sparkline(values: &[f64], width: usize) -> String {
         };
         out.push(symbol as char);
     }
-    format!("{out}   [{:.6e} .. {:.6e}]", min, max)
+
+    // A sparkline always fills its full range, so a quantity varying by one part in
+    // 40,000 draws the same dramatic shape as one that doubles. Beside a series that
+    // genuinely swings, that reads as instability where there is none — so when the
+    // variation is small relative to the value, say so.
+    let mean = finite.iter().sum::<f64>() / finite.len() as f64;
+    let relative = if mean == 0.0 { f64::INFINITY } else { span / mean.abs() };
+    let note = if relative < 1e-3 {
+        format!("  ({relative:.1e} relative, drawn at full scale)")
+    } else {
+        String::new()
+    };
+
+    format!("{out}   [{min:.6e} .. {max:.6e}]{note}")
 }
 
 fn format_value(v: f64) -> String {
@@ -334,5 +347,21 @@ mod tests {
         let nan_line = sparkline(&with_nan, 10);
         assert!(nan_line.contains('!'), "{nan_line}");
         assert!(!nan_line.contains("constant at"), "{nan_line}");
+    }
+
+    /// A symplectic integrator's energy oscillates by a tiny fraction of its value.
+    /// Drawn at full scale beside a series that genuinely swings, that reads as
+    /// instability — so the plot states how small the variation really is.
+    #[test]
+    fn a_nearly_constant_series_says_how_nearly() {
+        // Total energy wobbling by 1 part in 40,000, as velocity Verlet produces.
+        let values: Vec<f64> =
+            (0..40).map(|i| 4.0 + 1e-4 * (i as f64 / 4.0).sin()).collect();
+        let line = sparkline(&values, 40);
+        assert!(line.contains("relative, drawn at full scale"), "{line}");
+
+        // A series that genuinely doubles needs no such caveat.
+        let swinging: Vec<f64> = (0..40).map(|i| 1.0 + i as f64 / 40.0).collect();
+        assert!(!sparkline(&swinging, 40).contains("drawn at full scale"));
     }
 }

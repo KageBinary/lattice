@@ -6,26 +6,38 @@ the non-obvious decisions were made that way.
 ## Layering
 
 ```
-                    ┌─────────────────────────────────────┐
-   authoring        │  lattice-cli   (validate/bench/demo) │
-                    └──────────────────┬──────────────────┘
+                       ┌──────────────────────────────────┐
+   authoring           │ lattice-cli  check/run/validate  │
+                       │              bench/demo/inspect  │
+                       └───────────────┬──────────────────┘
                                        │
-        ┌──────────────────────────────┼──────────────────────────────┐
-        │                              │                              │
-┌───────▼────────┐          ┌──────────▼──────────┐        ┌──────────▼────────┐
-│ lattice-       │          │ lattice-domain-     │        │ lattice-observe   │
-│ validation     │          │ particle, -grid2d   │        │ (JSON, timing,    │
-│ (the lab)      │          │ (the physics)       │        │  run artifacts)   │
-└───────┬────────┘          └──────────┬──────────┘        └──────────┬────────┘
-        │                              │                              │
-        └──────────────────────────────┼──────────────────────────────┘
+     ┌─────────────────┬───────────────┼───────────────┬──────────────────┐
+     │                 │               │               │                  │
+┌────▼─────────┐ ┌─────▼──────┐ ┌──────▼───────┐ ┌─────▼────────┐ ┌───────▼───────┐
+│ lattice-     │ │ lattice-   │ │ lattice-     │ │ lattice-     │ │ lattice-      │
+│ validation   │ │ compiler   │ │ runtime      │ │ domain-*     │ │ observe       │
+│ (the lab)    │ │ resolve,   │ │ clock, dt    │ │ (the physics)│ │ JSON, timing, │
+│              │ │ check,     │ │ negotiation, │ │              │ │ artifacts     │
+│              │ │ lower      │ │ stepping     │ │              │ │               │
+└────┬─────────┘ └──┬──────┬──┘ └──────┬───────┘ └─────┬────────┘ └───────┬───────┘
+     │              │      │           │               │                  │
+     │       ┌──────▼───┐  └───────────┼───────────────┼──────────────────┘
+     │       │ lattice- │              │               │
+     │       │ syntax   │              │               │
+     │       │ lex,     │              │               │
+     │       │ parse,   │              │               │
+     │       │ diagnose │              │               │
+     │       └──────┬───┘              │               │
+     │              │                  │               │
+     └──────────────┴──────────────────┴───────────────┘
                                        │
                           ┌────────────▼────────────┐
                           │  lattice-ir             │
                           │  IDs, SoA storage,      │
                           │  grids, arenas,         │
                           │  Domain contract,       │
-                          │  diagnostics            │
+                          │  CompiledModel, graph,  │
+                          │  diagnostics, render    │
                           └────────────┬────────────┘
                                        │
                           ┌────────────▼────────────┐
@@ -35,7 +47,68 @@ the non-obvious decisions were made that way.
 ```
 
 Dependencies point downward only. `lattice-ir` holds no physics; the domain crates
-hold no storage layout decisions.
+hold no storage layout decisions; `lattice-runtime` does not depend on the compiler —
+it takes a `CompiledModel` and a `Vec<Box<dyn Domain>>`, and the CLI wires the two
+together.
+
+## The compilation pipeline
+
+Spec §8.4 lists nine steps. Text becomes a runnable model like this:
+
+```
+  .lattice text
+       │
+       ▼  lattice-syntax
+  tokens ──► AST                    units are ordinary identifiers here;
+       │                            nothing is resolved yet
+       ▼  lattice-compiler
+  ┌────────────────────────────────────────────────────────┐
+  │ resolve   grids, fields, particle sets, unit names      │
+  │ check     every expression, dimensionally  (FR-002)     │
+  │ select    which solver implements each `solve`          │
+  │ plan      buffers, scratch arena size                   │
+  │ schedule  operation graph from read/write sets          │
+  └────────────────────────────────────────────────────────┘
+       │
+       ├──► CompiledModel   immutable: what the model *is*
+       └──► Vec<Box<dyn Domain>>   the solvers that will run it
+```
+
+Two decisions in that pipeline shaped everything downstream.
+
+### Units are not a lexical concern
+
+The first design gave the lexer a "unit mode" entered after a number. It could not
+decide what `100 / dt` meant, because the lexer does not know what has been declared.
+
+So there is no unit mode. `kilojoule` lexes as an identifier, and name resolution
+decides: declared names first, then the unit registry. `100 / dt` is a division by a
+parameter; `100 / second` is a frequency; both are one rule. An identifier that is
+neither gets a diagnostic naming both possibilities, rather than "unknown unit `dt`"
+when the user meant a parameter they forgot to declare.
+
+The cost is that `35 kilojoule` has no operator between its terms — and adjacency has
+to bind *tighter* than `*` and `/`, or `10 meter / 2 second` groups as `((10 m)/2)·s`
+and yields m·s. A dimensioned literal is one atom.
+
+### Declaration kinds are not in the grammar
+
+`grid` was a keyword until spec §25.2's `grid: [768, 384];` — where `grid` is a
+*setting key* inside a domain block — showed why that fails. Now `grid chamber { … }`,
+`reaction r { … }` and `wavepacket initial { … }` all take one generic
+`<kind> <name> { … }` path, and the *compiler* decides which kinds it knows.
+
+A new solver family therefore needs no grammar change, and an unknown kind gets a
+diagnostic that distinguishes "not a thing" from "not implemented until M5".
+
+### A field's dimension comes from its initial value
+
+`field temperature on bar = 273.15 kelvin;` is a temperature field because its initial
+value is a temperature. Every boundary, source and solver parameter is then checked
+against that.
+
+The alternative — a separate `dimension:` declaration — is one more thing to keep in
+sync, and the failure mode when it drifts is a model that compiles and is wrong.
 
 ## The one invariant that shapes everything
 
@@ -206,17 +279,32 @@ The RNG is a hand-written PCG32 with pinned test vectors. `rand` promises
 reproducibility within a major version; a checkpoint recorded today must replay in five
 years.
 
-## Deliberate omissions at M0
+## How complete the §7.2 split is
 
-- **No model file format.** Models are built through the Rust API. The `.lattice` DSL
-  of spec §25 is M1, and building it before the runtime it targets exists would be
-  designing against a guess.
-- **No operation graph.** Spec §8 makes the IR the central novel component, and it is —
-  but a scheduler with nothing to schedule is speculative. It arrives with the compiler
-  that produces it.
+Spec §7.2 wants each solver separated into an immutable schema and a mutable state
+block. `CompiledModel` is the immutable half at the *model* level: domains, buffer
+plan, operation graph, observers, notes. But a `HeatDomain` still owns both its
+configuration and its field values, so the runtime instantiates domains from a compiled
+model and keeps them alongside it.
+
+That is stated rather than papered over. The architectural line is drawn — the runtime
+never reaches into a solver's internals, and everything it needs to schedule comes from
+the model — and solvers cross it one at a time.
+
+## Deliberate omissions
+
 - **No parallelism.** Everything is single-threaded scalar CPU. §15.3 wants parallel
-  iterators and SIMD; §15.1 says *"optimize after validation"*, and the validation
-  suite is what makes an optimization safe to attempt.
+  iterators and SIMD; §15.1 says *"optimize after validation"*. The operation graph
+  already computes which operations are independent and reports the ideal speedup, so
+  the information is there when the execution is.
+- **No coupling.** `couple a.b -> c.d` parses, type-checks as far as it can, and then
+  errors with "milestone M3". The conservation ledger that will account for those
+  transfers is already built and tested — diagnostics have to exist before the thing
+  they diagnose, not after.
+- **No user-defined expressions.** Spec §8.3's expression language, which compiles
+  custom force and rate laws to CPU and GPU kernels, is M6. Until then the builtin
+  vocabulary is a closed set, and an unrecognized function is an error that *lists what
+  is available*.
 - **No GPU.** M4.
 
 Each of these is a case of spec §21.1: *"New domains should not be added while the

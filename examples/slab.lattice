@@ -1,0 +1,37 @@
+// Steady conduction across a slab.
+//
+// A bar held at two temperatures relaxes to the linear profile every heat-transfer
+// textbook opens with. The validation suite checks this analytically
+// (`dirichlet_slab_linear_profile`); this is the same physics as a model file.
+//
+//   lattice check examples/slab.lattice
+//   lattice run   examples/slab.lattice
+
+project slab {
+  dimensions: 2;
+  fidelity: engineering_2d;
+
+  // The diffusion time across the bar is L^2/D = 100 s, so 400 s is comfortably
+  // into steady state and the profile really is the straight line.
+  duration: 400 second;
+
+  grid bar { size: [64, 8]; extent: [1 meter, 0.125 meter]; }
+
+  // The field's dimension is inferred from its initial value: this is a temperature
+  // field because 273.15 kelvin is a temperature. Every boundary below is checked
+  // against that, so `fixed(5 second)` here would be a compile error.
+  field temperature on bar = 273.15 kelvin {
+    diffusivity: 1e-2 meter^2 / second;
+
+    boundary:       insulated;
+    boundary_left:  fixed(273.15 kelvin);
+    boundary_right: fixed(373.15 kelvin);
+  }
+
+  // dt is about 80x the explicit stability limit for this grid and diffusivity,
+  // which is the entire reason to pay for an implicit solve.
+  solve heat(temperature) with crank_nicolson(dt=0.5 second);
+
+  observe temperature every 20 second;
+  visualize temperature as heatmap;
+}

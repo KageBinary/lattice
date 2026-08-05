@@ -1,0 +1,22 @@
+[package]
+name = "lattice-compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Resolves names and units, checks dimensions, and lowers a parsed project into a runnable compiled model"
+
+[dependencies]
+lattice-units.workspace = true
+lattice-syntax.workspace = true
+lattice-ir.workspace = true
+lattice-domain-grid2d.workspace = true
+lattice-domain-particle.workspace = true
+
+[dev-dependencies]
+# The fixture test compiles every example *and runs it*, which is the only way to
+# check that a model that compiles is actually steppable.
+lattice-runtime.workspace = true
+
+[lints]
+workspace = true

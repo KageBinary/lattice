@@ -525,6 +525,22 @@ impl Domain for ParticleDomain {
         out.record_invariant(format!("{prefix}.momentum_y"), Invariant::MomentumY, py);
         out.record_metric(format!("{prefix}.max_speed"), self.max_speed(), "m/s");
     }
+
+    fn render_channels(&self) -> Vec<lattice_ir::RenderChannel<'_>> {
+        // With a declared region, draw that. Without one, fit the view to the
+        // particles rather than guessing a box and cropping whatever escapes.
+        let (origin, extent) = match self.bounds {
+            Some(bounds) => (bounds.min, bounds.size),
+            None => lattice_ir::bounds_of(self.store.pos_x(), self.store.pos_y()),
+        };
+        vec![lattice_ir::RenderChannel::Particles {
+            name: &self.name,
+            x: self.store.pos_x(),
+            y: self.store.pos_y(),
+            origin,
+            extent,
+        }]
+    }
 }
 
 #[cfg(test)]

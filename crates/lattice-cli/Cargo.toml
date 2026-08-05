@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 lattice-ir.workspace = true
 lattice-units.workspace = true
+lattice-syntax.workspace = true
+lattice-compiler.workspace = true
+lattice-runtime.workspace = true
 lattice-observe.workspace = true
 lattice-validation.workspace = true
 lattice-domain-particle.workspace = true

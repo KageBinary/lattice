@@ -40,37 +40,72 @@ condition.
   integrator forced an explicit answer to "does this scheme conserve energy?" for each
   one, which is a question a single shared document lets you avoid.
 
-## M1 — Compiled model (next)
+## M1 — Compiled model ✅
 
 **Spec exit condition:** *"same project executes headless and interactively."*
 
+Delivered:
+
+- **`lattice-syntax`** — source map with spans, tokenizer, AST, recursive-descent
+  parser with error recovery, and diagnostics that render a caret under the offending
+  characters. Parses spec §25.1, §25.2 and §12.2 verbatim.
+- **`lattice-compiler`** — name and unit resolution, dimensional checking of every
+  expression (FR-002), field-dimension inference from initial values, solver
+  selection, buffer planning, operation-graph construction, and the model report.
+- **`lattice-runtime`** — clock, timestep negotiation across domains, observers on a
+  cadence, and run artifacts.
+- **`lattice-ir` additions** — `CompiledModel`, `BufferPlan`, the operation graph with
+  hazard-derived edges and parallel levels, and render channels.
+- **`lattice check` and `lattice run`** — M1's exit condition, minus a window.
+- **Five example models and sixteen invalid fixtures**, each fixture declaring the
+  diagnostic code it must produce.
+
+591 tests. Clippy clean. Still zero external dependencies.
+
+### What M1 taught us
+
+- **Units cannot be a lexical concern.** The first design gave the lexer a "unit mode"
+  after a number. It could not answer what `100 / dt` meant, because the lexer does not
+  know what has been declared. Making units *ordinary identifiers*, resolved after
+  declared names, removed the whole problem and made the grammar smaller.
+- **Adjacency has to bind tighter than division.** `10 meter / 2 second` parsed as
+  `m·s` until juxtaposition was given its own precedence level. A dimensioned literal
+  is one atom, and that is not negotiable notation.
+- **Declaration kinds do not belong in the grammar.** `grid` was a keyword until
+  spec §25.2's `grid: [768, 384];` — a *setting key* — showed why that fails. Parsing
+  `<kind> <name> { … }` generically and letting the compiler decide which kinds it knows
+  also means a new solver family needs no grammar change.
+- **Diagnostics are a design surface.** The fixture suite asserts the *specific* code
+  each invalid model produces, and that every rejection carries a source position and
+  either a fix or the rule it enforces. A test that only checks "this failed" passes
+  just as happily when the model is rejected for the wrong reason.
+
+## M2 — Mechanics and fields (next)
+
+**Spec exit condition:** *"canonical validation suite passes"* for particles, simple
+rigid bodies, fields, diffusion and observers.
+
 Needed:
 
-1. **`lattice-syntax`** — lexer, parser, AST, and source-positioned diagnostics for the
-   `.lattice` DSL of §25. The unit parser already produces the error shape this needs;
-   the remaining work is spans and a project grammar.
-2. **`lattice-compiler`** — name and type resolution, dimensional checking of every
-   expression (FR-002), lowering to domain operations, read/write set construction, and
-   the buffer plan that sizes the arenas M0 currently sizes by hand.
-3. **Operation graph** — the DAG §9.2 describes, with the scheduler that walks it. This
-   is the point at which `lattice-ir` grows the "immutable `CompiledModel`" half of the
-   §7.2 split that M0 only half-implements.
-4. **Ten invalid fixture models** — §20.4 asks for at least ten deliberately invalid
-   models rejected with source-positioned errors. The unit layer already carries eleven
-   of these at expression level; they need to be lifted to whole models.
-
-The acceptance test is spec §25.1's `hot_reaction` project parsing, compiling, and
-reporting its dimensional errors — even before the chemistry it describes exists.
+1. **`lattice-domain-rigid2d`** — circles, boxes and convex polygons; forces, torques
+   and impulses; a broadphase grid or BVH, narrowphase contacts, friction and
+   restitution; distance, pin, spring and motor constraints (§11.1).
+2. **Collision validation** — §19.2's elastic and inelastic collision cases, which M0
+   deliberately left out because the rigid module did not exist.
+3. **`material` declarations** — the §8.2 material concept, which rigid bodies are the
+   first real consumer of.
+4. **CPU parallelism** — §15.3 asks for parallel iterators over independent operations.
+   The operation graph already computes which operations those are and reports the
+   ideal speedup; nothing consumes that yet.
 
 ## Later milestones
 
 | Milestone | Result | Blocked on |
 |---|---|---|
-| M2 — Mechanics and fields | rigid bodies, contacts, constraints, observers | M1 for scene description |
-| M3 — Chemistry | reaction networks, reaction-diffusion, heat coupling, ledger | M1; the ledger itself is already built |
-| M4 — Portable GPU | `wgpu` compute, kernel cache, zero-copy rendering | M1's operation graph |
+| M3 — Chemistry | reaction networks, reaction-diffusion, heat coupling, ledger | M2; the ledger and coupling diagnostics are already built |
+| M4 — Portable GPU | `wgpu` compute, kernel cache, zero-copy rendering | the operation graph, which exists |
 | M5 — Molecular and quantum | LJ MD proper, bonds, `quantum2d` | M2 |
-| M6 — Extensibility | expression compiler, Python API, plugin SDK | M1 |
+| M6 — Extensibility | expression compiler (§8.3), Python API, plugin SDK | M1, done |
 | M7 — Productization | packages, report export, reproducibility artifacts | M3 |
 | M8 — External solvers | quantum/FMI adapters with provenance | M7 |
 

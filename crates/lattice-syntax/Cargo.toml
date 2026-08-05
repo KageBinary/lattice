@@ -1,0 +1,13 @@
+[package]
+name = "lattice-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Lexer, AST, parser, and source-positioned diagnostics for the .lattice project language"
+
+[dependencies]
+lattice-units.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+// expect: E0400
+// FR-002's motivating case: a temperature field given a time-valued boundary.
+// The field's dimension came from `298 kelvin`, so this is caught against it.
+
+project dimension_mismatch {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g = 298 kelvin {
+    diffusivity: 1e-5 meter^2 / second;
+    boundary_left: fixed(5 second);
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+}

@@ -1,0 +1,14 @@
+// expect: E0204
+// `sigmaa` is not an argument of `gaussian`. The message lists the ones that are.
+
+project mistyped_argument {
+  grid g { size: [16, 16]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g =
+      gaussian(center=[0.5 meter, 0.5 meter], sigmaa=0.1 meter, peak=100 kelvin)
+  {
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+}

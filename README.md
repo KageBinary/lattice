@@ -13,11 +13,14 @@ A 2D-first multiphysics, chemistry, and quantum simulation runtime.
 
 ---
 
-## Status: milestone M0 complete
+## Status: milestones M0 and M1 complete
 
-The spec lays out nine milestones, M0 through M8. **M0 — Numerical kernel spike** is
-done, with its exit condition met: *"analytic heat + particle demos and benchmark
-harness."*
+The spec lays out nine milestones, M0 through M8.
+
+- **M0 — Numerical kernel spike.** Exit condition: *"analytic heat + particle demos
+  and benchmark harness."*
+- **M1 — Compiled model.** Exit condition: *"same project executes headless and
+  interactively."*
 
 Being specific about that, in the spirit of design principle **P1 — scientific
 honesty over feature count**:
@@ -27,20 +30,25 @@ honesty over feature count**:
 | Area | Implemented | Validated by |
 |---|---|---|
 | **Units** | 7-dimension analysis, SI registry with prefixes, unit-expression parser, CODATA constants | 83 tests; every dimensioned literal in the spec's example models parses to the right dimension |
-| **Storage** | Structure-of-arrays particles with stable handles, halo'd grid fields, bump arenas, reproducible RNG | 81 tests; no allocation in stepping loops |
+| **Language** | The `.lattice` DSL — lexer, parser, AST, source-positioned diagnostics with carets | Parses spec §25.1, §25.2 and §12.2 verbatim |
+| **Compiler** | Name and unit resolution, dimensional checking of every expression, solver selection, buffer planning, operation graph, model report | 16 invalid fixtures each rejected for its declared reason |
+| **Runtime** | Clock, timestep negotiation across domains, observers on a cadence, run artifacts | Refuses unstable steps before running; halts on the first non-finite value |
+| **Storage** | Structure-of-arrays particles with stable handles, halo'd grid fields, bump arenas, reproducible RNG | 112 tests; no allocation in stepping loops |
 | **Particles** | Explicit Euler, semi-implicit Euler, velocity Verlet; gravity, drag, harmonic wells, Lennard-Jones; uniform cell list | Free fall, oscillator period, energy drift, convergence order, momentum conservation |
 | **Heat / diffusion** | Finite-volume `∇·(D∇u)`, explicit / Crank–Nicolson / backward Euler, matrix-free conjugate gradient, Dirichlet / Neumann / Robin / periodic boundaries, variable diffusivity | Analytic heat kernel, manufactured solutions, convergence orders, conservation, series conduction |
-| **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories | Every solver publishes equations, assumptions, and what it does *not* conserve |
-| **Tooling** | `lattice validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal field viewer | 365 tests across 7 crates |
+| **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 591 tests across 10 crates |
 
 ### What is not built yet
 
 Rigid bodies, fluids, waves, electromagnetism, chemistry, molecular dynamics beyond
-Lennard-Jones, the quantum module, the project DSL and model compiler, the coupling
-scheduler, GPU execution, the graphical viewer, and the Python SDK. Those are M1–M8.
+Lennard-Jones, the quantum module, the coupling scheduler, GPU execution, the
+graphical viewer, and the Python SDK. Those are M2–M8.
 
-There is **no model file format yet** — models are built through the Rust API. The
-`.lattice` DSL of spec §25 is M1 work.
+Constructs the language accepts but cannot execute — `reaction`, `couple`,
+`domain quantum2d` — are **compile errors that name the milestone that will implement
+them**. Not warnings: a model whose chemistry was silently dropped would run and
+produce confident wrong numbers.
 
 ### What this is not
 
@@ -57,8 +65,70 @@ toolchain — see [docs/development.md](docs/development.md).
 
 ```console
 $ cargo build --release
+$ ./target/release/lattice check examples/slab.lattice
+$ ./target/release/lattice run   examples/slab.lattice
 $ ./target/release/lattice validate
-$ ./target/release/lattice demo oscillator
+```
+
+### A model
+
+Models are written in the `.lattice` language — see
+[docs/language.md](docs/language.md) for the reference, and `examples/` for five
+working scenes.
+
+```
+project slab {
+  fidelity: engineering_2d;
+  duration: 400 second;
+
+  grid bar { size: [64, 8]; extent: [1 meter, 0.125 meter]; }
+
+  // The field's dimension comes from its initial value: this is a temperature field
+  // because 273.15 kelvin is a temperature. Every boundary below is checked against
+  // that, so `fixed(5 second)` would be a compile error.
+  field temperature on bar = 273.15 kelvin {
+    diffusivity: 1e-2 meter^2 / second;
+    boundary:       insulated;
+    boundary_left:  fixed(273.15 kelvin);
+    boundary_right: fixed(373.15 kelvin);
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.5 second);
+  observe temperature every 20 second;
+  visualize temperature as heatmap;
+}
+```
+
+`lattice run` on that reaches the linear steady profile every conduction textbook
+opens with:
+
+```text
+  temperature — 64x8 scalar field in K
+  |     ........::::::::--------=======++++++++********########%%%%%%%%@@@@|
+  |     ........::::::::--------=======++++++++********########%%%%%%%%@@@@|
+  |     ........::::::::--------=======++++++++********########%%%%%%%%@@@@|
+  scale: 273.931250  .:-=+*#%@ 372.368750   span 9.844e1
+```
+
+273.93 K and 372.37 K are the first and last *cell centres* — half a cell in from the
+273.15 and 373.15 faces, which is exactly where they should be.
+
+### `lattice check`
+
+Compiles without running, and prints the model report spec §8.4 step 9 calls for:
+which solver was selected, what it assumes, what it does not conserve, how much memory
+it will take, and what the compiler had to approximate.
+
+```text
+domains (1)
+  temperature : grid2d.heat[crank_nicolson]
+      64x8 on `bar`, values in temperature (K), D = 1.0000e-2 m^2/s,
+      left Dirichlet, right Dirichlet, bottom Neumann, top Neumann
+
+operation graph
+3 operations in 3 levels (max width 1)
+  ...
+  total cost 10240.2, critical path 10240.2 (ideal speedup 1.00x)
 ```
 
 ### `lattice validate`
@@ -141,30 +211,42 @@ Follows spec §24, with crates added as each milestone lands.
 lattice/
   crates/
     lattice-units/            dimensions, quantities, unit registry and parser
-    lattice-ir/               typed IDs, SoA storage, grids, arenas, solver contracts
+    lattice-syntax/           lexer, AST, parser, source-positioned diagnostics
+    lattice-ir/               typed IDs, SoA storage, grids, arenas, solver contracts,
+                              compiled model, operation graph, render channels
+    lattice-compiler/         name and unit resolution, dimensional checking, lowering
+    lattice-runtime/          clock, timestep negotiation, stepping, run artifacts
     lattice-domain-particle/  integrators, force laws, neighbour search
     lattice-domain-grid2d/    diffusion operator, boundaries, conjugate gradient
     lattice-observe/          JSON, timing profiles, run artifacts
     lattice-validation/       the validation lab
     lattice-cli/              the `lattice` binary
+  examples/                   working .lattice models
+  tests/invalid/              models that must be rejected, each declaring why
   docs/
     architecture.md           how the code maps onto the specification
+    language.md               the .lattice language reference
     development.md            toolchain setup and conventions
-    roadmap.md                what M0 delivered and what M1 needs
+    roadmap.md                what each milestone delivered
     spec/                     the source specification
 ```
 
 ## Dependencies
 
-There are none. Every crate builds from `std` alone.
+There are none. Every crate builds from `std` alone — including, somewhat to my own
+surprise, the whole M1 compiler and its diagnostics.
 
-This is deliberate at M0 and will not survive contact with M4 (`wgpu`) or M6 (`pyo3`).
-Spec §24.1 permits mature libraries *"where they do not define the core semantics"* —
-and units, dimensional analysis, the IR, and the reproducibility guarantee all *are*
-core semantics. Writing the ~40-line PCG generator rather than depending on `rand`
-buys a reproducibility promise that outlives any dependency's major version, which
-FR-011 needs. The JSON writer exists because artifacts must be byte-stable and must
-preserve `NaN`, and general-purpose serializers do neither.
+This will not survive contact with M4 (`wgpu`) or M6 (`pyo3`), and external crates are
+approved for those. Spec §24.1 permits mature libraries *"where they do not define the
+core semantics"*, and the line has held so far because units, dimensional analysis,
+the IR, and the reproducibility guarantee all *are* core semantics:
+
+- The ~40-line PCG generator, rather than `rand`, buys a reproducibility promise that
+  outlives any dependency's major version — which FR-011 needs.
+- The JSON writer exists because artifacts must be byte-stable and must preserve
+  `NaN`, and general-purpose serializers do neither.
+- The parser is hand-written because FR-002's diagnostics are a *product surface*, not
+  an implementation detail, and a generator's error messages are nobody's design.
 
 ## Design principles in practice
 

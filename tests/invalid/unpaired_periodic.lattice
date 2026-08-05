@@ -1,0 +1,14 @@
+// expect: E0405
+// Periodic on one edge of an axis and not the other has no meaning.
+// Spec §8.4 step 8 calls this boundary completeness.
+
+project unpaired_periodic {
+  grid g { size: [8, 8]; extent: [1 meter, 1 meter]; }
+
+  field temperature on g = 298 kelvin {
+    diffusivity: 1e-5 meter^2 / second;
+    boundary_left: periodic;
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+}

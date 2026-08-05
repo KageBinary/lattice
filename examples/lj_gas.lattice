@@ -1,0 +1,33 @@
+// A Lennard-Jones gas melting out of a lattice.
+//
+// 256 particles start on a square lattice with a random velocity spread whose net
+// momentum is exactly zero. The lattice melts as potential energy converts to
+// kinetic, but the total is conserved — and because pair forces are applied as equal
+// and opposite, so is momentum, to round-off.
+//
+//   lattice run examples/lj_gas.lattice
+
+project lj_gas {
+  dimensions: 2;
+  fidelity: molecular;
+  duration: 2 second;
+
+  particles atoms {
+    count:   256;
+    region:  [22.4 meter, 22.4 meter];
+    spacing: 1.4 meter;
+    mass:    1 kilogram;
+
+    // An initial velocity spread. Reduced units throughout: this is a
+    // dimensionless LJ fluid wearing SI clothing, not a real substance.
+    speed: 0.4 meter / second;
+    seed:  20260805;
+
+    boundary: periodic;
+    force: lennard_jones(epsilon=1 joule, sigma=1 meter, cutoff=2.5 meter);
+  }
+
+  solve dynamics(atoms) with velocity_verlet(dt=0.005 second);
+
+  observe atoms every 0.05 second;
+}

@@ -1,0 +1,28 @@
+// A heat pulse spreading in a closed box.
+//
+// The analytic solution is the heat kernel: variance grows as sigma^2 + 2Dt while the
+// integral is unchanged. Because every boundary is insulated and there is no source,
+// the field integral is conserved to round-off — watch `temperature.integral` in the
+// run artifact hold steady while the peak falls.
+//
+//   lattice run examples/diffusing_pulse.lattice --json runs/pulse.json
+
+project diffusing_pulse {
+  dimensions: 2;
+  fidelity: engineering_2d;
+  duration: 30 second;
+
+  grid box { size: [64, 64]; extent: [1 meter, 1 meter]; }
+
+  field temperature on box =
+      gaussian(center=[0.5 meter, 0.5 meter], sigma=0.06 meter, peak=100 kelvin)
+  {
+    diffusivity: 1e-4 meter^2 / second;
+    boundary: insulated;
+  }
+
+  solve heat(temperature) with crank_nicolson(dt=0.1 second);
+
+  observe temperature every 2 second;
+  visualize temperature as heatmap;
+}

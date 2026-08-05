@@ -1,0 +1,34 @@
+// Two species mixing by diffusion.
+//
+// This is spec §20.3's flagship scene with its chemistry removed: two species start
+// on opposite sides of a chamber and interdiffuse. Adding the reaction that makes
+// them react, release heat, and change their own rate constant needs the chemistry
+// module — milestone M3. Until then this compiles, runs, and conserves both species.
+//
+//   lattice run examples/two_species.lattice
+
+project two_species {
+  dimensions: 2;
+  fidelity: engineering_2d;
+  duration: 200 second;
+
+  grid chamber { size: [128, 64]; extent: [2 meter, 1 meter]; }
+
+  // `species` is `field` with an intent. Both compile to the same transport solver;
+  // the difference will start to matter when reactions can consume them.
+  species A on chamber = left_half(1 mole / meter^2) {
+    diffusivity: 2e-4 meter^2 / second;
+    boundary: insulated;
+  }
+
+  species B on chamber = right_half(1 mole / meter^2) {
+    diffusivity: 2e-4 meter^2 / second;
+    boundary: insulated;
+  }
+
+  solve diffusion(A, B) with crank_nicolson(dt=0.5 second);
+
+  observe A every 10 second;
+  observe B every 10 second;
+  visualize A as heatmap;
+}
