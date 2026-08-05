@@ -1,0 +1,29 @@
+[package]
+name = "lattice-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line runner: validate, benchmark, demo, and inspect"
+
+[[bin]]
+name = "lattice"
+path = "src/main.rs"
+
+[dependencies]
+lattice-ir.workspace = true
+lattice-units.workspace = true
+lattice-observe.workspace = true
+lattice-validation.workspace = true
+lattice-domain-particle.workspace = true
+lattice-domain-grid2d.workspace = true
+
+# Not inherited from the workspace: `unreachable_pub` fires on every item in a
+# binary crate, since nothing in a binary is reachable from outside it.
+[lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "allow"
+
+[lints.clippy]
+needless_collect = "warn"
+redundant_clone = "warn"

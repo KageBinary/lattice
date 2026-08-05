@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/lattice-sim/lattice"
+description = "Project Lattice — a 2D-first multiphysics, chemistry, and quantum simulation runtime"
+
+# Entries are added as each crate lands, so the workspace always builds.
+[workspace.dependencies]
+lattice-units = { path = "crates/lattice-units", version = "0.1.0" }
+lattice-ir = { path = "crates/lattice-ir", version = "0.1.0" }
+lattice-observe = { path = "crates/lattice-observe", version = "0.1.0" }
+lattice-domain-particle = { path = "crates/lattice-domain-particle", version = "0.1.0" }
+lattice-domain-grid2d = { path = "crates/lattice-domain-grid2d", version = "0.1.0" }
+lattice-validation = { path = "crates/lattice-validation", version = "0.1.0" }
+
+# Spec §15.1: "Optimize after validation." Release builds are what the benchmark
+# harness measures, so they carry debug line tables for profiling.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+inherits = "release"
+
+# Spec §19: the validation suite runs convergence studies that need many steps.
+# A debug-mode grid sweep is unusably slow, so tests get real optimization.
+[profile.test]
+opt-level = 2
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# NFR-001: no heap allocation in validated hot loops. These lints do not prove
+# that, but they catch the easy accidental violations.
+needless_collect = "warn"
+redundant_clone = "warn"

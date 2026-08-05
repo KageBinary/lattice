@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Run artifacts and benchmark output (§18.1). Regenerate with `lattice bench`.
+/runs/
+/out/
+*.lattice-run/

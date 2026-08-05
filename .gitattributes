@@ -1,0 +1,6 @@
+# Normalize to LF in the repository. Numerical fixtures and expected-diagnostic
+# files are compared byte-for-byte by tests, so a platform-dependent line ending
+# would make them fail on one OS and pass on another.
+* text=auto eol=lf
+*.png binary
+*.docx binary

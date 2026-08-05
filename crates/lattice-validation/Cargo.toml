@@ -1,0 +1,16 @@
+[package]
+name = "lattice-validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The validation lab: analytic, manufactured, and property tests with measured error reporting"
+
+[dependencies]
+lattice-ir.workspace = true
+lattice-observe.workspace = true
+lattice-domain-particle.workspace = true
+lattice-domain-grid2d.workspace = true
+
+[lints]
+workspace = true
