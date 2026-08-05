@@ -103,6 +103,12 @@ pub struct HeatDomain {
 /// Halo width. One cell is all a 5-point stencil reads.
 const HALO: usize = 1;
 
+/// What the values are called before anyone says otherwise.
+///
+/// A solver run straight from Rust may genuinely not know; a model compiled from
+/// `.lattice` source always does, because the compiler read the field's dimension.
+const UNLABELLED: &str = "field units";
+
 impl HeatDomain {
     /// Build a domain on `grid` with the given diffusivity.
     ///
@@ -134,7 +140,7 @@ impl HeatDomain {
             last_outcome: None,
             preferred_dt,
             steps: 0,
-            display_unit: "field units".to_string(),
+            display_unit: UNLABELLED.to_string(),
         }
     }
 
@@ -147,6 +153,21 @@ impl HeatDomain {
     /// The unit the values are labelled with.
     pub fn display_unit(&self) -> &str {
         &self.display_unit
+    }
+
+    /// The unit of `∫u dA`.
+    ///
+    /// [`Invariant::FieldIntegral`] carries a placeholder unit because the IR cannot
+    /// know what is being integrated — that is the honest answer at that layer. This
+    /// solver does know: the area integral of a field in K is in K·m^2. Publishing the
+    /// placeholder next to a scale bar that says "K" leaves a reader deciding which of
+    /// the two labels to believe.
+    pub fn integral_unit(&self) -> String {
+        if self.display_unit == UNLABELLED {
+            Invariant::FieldIntegral.si_unit().to_string()
+        } else {
+            format!("{}·m^2", self.display_unit)
+        }
     }
 
     /// Choose the time scheme.
@@ -520,11 +541,14 @@ impl Domain for HeatDomain {
 
     fn observe(&self, out: &mut Observations) {
         let prefix = &self.name;
-        out.record_invariant(format!("{prefix}.integral"), Invariant::FieldIntegral, self.integral());
-        // `Observation::unit` is `&'static str`, so a compiler-supplied unit cannot be
-        // stored there; the render channel carries it instead.
-        out.record_metric(format!("{prefix}.min"), self.field.min_interior(), "field units");
-        out.record_metric(format!("{prefix}.max"), self.field.max_interior(), "field units");
+        out.record(
+            format!("{prefix}.integral"),
+            self.integral(),
+            self.integral_unit(),
+            ObservationKind::Invariant(Invariant::FieldIntegral),
+        );
+        out.record_metric(format!("{prefix}.min"), self.field.min_interior(), self.display_unit.clone());
+        out.record_metric(format!("{prefix}.max"), self.field.max_interior(), self.display_unit.clone());
 
         if let Some(outcome) = self.last_outcome {
             out.record(
@@ -536,7 +560,7 @@ impl Domain for HeatDomain {
             out.record(
                 format!("{prefix}.solver_residual"),
                 outcome.residual(),
-                "field units",
+                self.display_unit.clone(),
                 ObservationKind::Residual,
             );
         }
@@ -578,4 +602,41 @@ pub fn heated_edge(side: lattice_ir::Side, value: f64) -> BoundarySet {
     let mut bs = BoundarySet::INSULATED;
     bs.set(side, Boundary::fixed(value));
     bs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn domain(name: &str) -> HeatDomain {
+        let grid = Grid2d::new(16, 16, [1.0, 1.0]);
+        HeatDomain::new(name, grid, Diffusivity::Uniform(1.0))
+    }
+
+    /// The viewer draws a scale bar labelled "K" beside a table row reading
+    /// "(field unit)·m^2", and a reader has to decide which one is lying.
+    #[test]
+    fn the_integral_carries_the_unit_of_the_field_it_integrated() {
+        assert_eq!(
+            domain("h").integral_unit(),
+            "(field unit)·m^2",
+            "with nothing declared, the IR placeholder is still the honest answer"
+        );
+
+        let labelled = domain("h").with_display_unit("K");
+        assert_eq!(labelled.integral_unit(), "K·m^2", "an area integral of kelvin is K·m^2");
+
+        // And it survives into the observation, which is where a reader sees it.
+        let mut out = Observations::new();
+        labelled.observe(&mut out);
+        assert_eq!(out.get("h.integral").unwrap().unit, "K·m^2");
+        assert_eq!(out.get("h.max").unwrap().unit, "K", "and agrees with the scale bar");
+        assert!(
+            matches!(
+                out.get("h.integral").unwrap().kind,
+                ObservationKind::Invariant(Invariant::FieldIntegral)
+            ),
+            "relabelling the unit must not stop it counting as a conserved quantity"
+        );
+    }
 }

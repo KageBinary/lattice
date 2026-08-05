@@ -21,6 +21,7 @@ lattice-observe = { path = "crates/lattice-observe", version = "0.1.0" }
 lattice-domain-particle = { path = "crates/lattice-domain-particle", version = "0.1.0" }
 lattice-domain-grid2d = { path = "crates/lattice-domain-grid2d", version = "0.1.0" }
 lattice-validation = { path = "crates/lattice-validation", version = "0.1.0" }
+lattice-viewer = { path = "crates/lattice-viewer", version = "0.1.0" }
 
 # Spec §15.1: "Optimize after validation." Release builds are what the benchmark
 # harness measures, so they carry debug line tables for profiling.

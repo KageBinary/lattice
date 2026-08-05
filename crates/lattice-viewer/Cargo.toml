@@ -1,0 +1,34 @@
+[package]
+name = "lattice-viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Desktop viewer: field heatmaps, particle scatter, live conservation plots, and solver diagnostics"
+
+# A separate binary from `lattice`. The GPU stack is ~200 crates and several
+# minutes of cold build; keeping it out of the core CLI means `lattice validate`
+# stays dependency-free and fast to build (spec §24 lists lattice-viewer as its
+# own crate for the same reason).
+[[bin]]
+name = "lattice-view"
+path = "src/main.rs"
+
+[dependencies]
+lattice-ir.workspace = true
+lattice-units.workspace = true
+lattice-syntax.workspace = true
+lattice-compiler.workspace = true
+lattice-runtime.workspace = true
+lattice-observe.workspace = true
+
+eframe = "0.36"
+egui_plot = "0.37"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "allow"
+
+[lints.clippy]
+needless_collect = "warn"
+redundant_clone = "warn"

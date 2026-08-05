@@ -20,7 +20,7 @@ The spec lays out nine milestones, M0 through M8.
 - **M0 — Numerical kernel spike.** Exit condition: *"analytic heat + particle demos
   and benchmark harness."*
 - **M1 — Compiled model.** Exit condition: *"same project executes headless and
-  interactively."*
+  interactively."* Both halves: `lattice run` headless, `lattice-view` in a window.
 
 Being specific about that, in the spirit of design principle **P1 — scientific
 honesty over feature count**:
@@ -37,13 +37,15 @@ honesty over feature count**:
 | **Particles** | Explicit Euler, semi-implicit Euler, velocity Verlet; gravity, drag, harmonic wells, Lennard-Jones; uniform cell list | Free fall, oscillator period, energy drift, convergence order, momentum conservation |
 | **Heat / diffusion** | Finite-volume `∇·(D∇u)`, explicit / Crank–Nicolson / backward Euler, matrix-free conjugate gradient, Dirichlet / Neumann / Robin / periodic boundaries, variable diffusivity | Analytic heat kernel, manufactured solutions, convergence orders, conservation, series conduction |
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 591 tests across 10 crates |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 636 tests across 11 crates |
+| **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, transport controls, live plots, conservation drift and the solver's contract | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
 
 Rigid bodies, fluids, waves, electromagnetism, chemistry, molecular dynamics beyond
-Lennard-Jones, the quantum module, the coupling scheduler, GPU execution, the
-graphical viewer, and the Python SDK. Those are M2–M8.
+Lennard-Jones, the quantum module, the coupling scheduler, GPU execution, and the
+Python SDK. Those are M2–M8. The viewer draws through a CPU texture upload, which is
+fine at 64×64 and will not be at 768×384; GPU rendering is M4.
 
 Constructs the language accepts but cannot execute — `reaction`, `couple`,
 `domain quantum2d` — are **compile errors that name the milestone that will implement
@@ -68,6 +70,14 @@ $ cargo build --release
 $ ./target/release/lattice check examples/slab.lattice
 $ ./target/release/lattice run   examples/slab.lattice
 $ ./target/release/lattice validate
+```
+
+To watch one run instead, build the viewer — a separate binary, because its GPU stack
+is a few hundred crates and the core CLI stays dependency-free without it:
+
+```console
+$ cargo build --release -p lattice-viewer
+$ ./target/release/lattice-view examples/diffusing_pulse.lattice --play
 ```
 
 ### A model
@@ -201,6 +211,31 @@ grid2d.heat[crank_nicolson] — scalar transport by diffusion on a uniform 2D gr
         first-order accurate across a diagonal material interface
 ```
 
+### `lattice-view`
+
+A window on a running model: the field or the particles at full size, and beside them
+the numbers that say whether to believe the picture — every observed quantity, how far
+each conserved one has drifted and against what, the timestep as a fraction of its
+stability limit, and the solver's published contract.
+
+```text
+stability
+  ✔ stable        dt is 2% of the 0.2646 s limit
+  set by domain `atoms`
+conservation
+  total_energy
+  ! drifting slowly          -2.530e-4 of the initial value
+  momentum_x
+  ✔ conserved to round-off   -1.454e-16 of momentum_scale
+```
+
+That last line is the whole idea. Total momentum in a system set up at rest is
+conserved *at zero*, so its initial value is round-off; dividing by it reported a
+flawless run as `✖ not conserved -7.288e1`. The particle domain now publishes
+`momentum_scale = Σ|mᵢvᵢ|` — a scale only it can know — and the viewer says which
+denominator it used. See [docs/viewer.md](docs/viewer.md), which is mostly a list of
+ways a picture can assert something the data does not say.
+
 ---
 
 ## Repository layout
@@ -221,6 +256,8 @@ lattice/
     lattice-observe/          JSON, timing profiles, run artifacts
     lattice-validation/       the validation lab
     lattice-cli/              the `lattice` binary
+    lattice-viewer/           the `lattice-view` window: colourmaps, heatmaps,
+                              plots, the diagnostics panel
   examples/                   working .lattice models
   tests/invalid/              models that must be rejected, each declaring why
   docs/
@@ -228,18 +265,24 @@ lattice/
     language.md               the .lattice language reference
     development.md            toolchain setup and conventions
     roadmap.md                what each milestone delivered
+    viewer.md                 what the window shows and the rules it draws by
     spec/                     the source specification
 ```
 
 ## Dependencies
 
-There are none. Every crate builds from `std` alone — including, somewhat to my own
-surprise, the whole M1 compiler and its diagnostics.
+Ten of the eleven crates have none. Everything from units through the compiler to the
+validation lab builds from `std` alone — including, somewhat to my own surprise, the
+whole M1 compiler and its diagnostics.
 
-This will not survive contact with M4 (`wgpu`) or M6 (`pyo3`), and external crates are
-approved for those. Spec §24.1 permits mature libraries *"where they do not define the
-core semantics"*, and the line has held so far because units, dimensional analysis,
-the IR, and the reproducibility guarantee all *are* core semantics:
+The exception is `lattice-viewer`, which needs `eframe`/`egui` and `egui_plot` to have
+a window at all. Spec §24.1 permits mature libraries *"where they do not define the
+core semantics"*, and an immediate-mode widget set does not: the colourmaps, the drift
+arithmetic, and every rule in [docs/viewer.md](docs/viewer.md) are ours and are tested
+here. `cargo test` on the other ten crates does not build it.
+
+Elsewhere the line has held because units, dimensional analysis, the IR, and the
+reproducibility guarantee all *are* core semantics:
 
 - The ~40-line PCG generator, rather than `rand`, buys a reproducibility promise that
   outlives any dependency's major version — which FR-011 needs.
@@ -247,6 +290,8 @@ the IR, and the reproducibility guarantee all *are* core semantics:
   `NaN`, and general-purpose serializers do neither.
 - The parser is hand-written because FR-002's diagnostics are a *product surface*, not
   an implementation detail, and a generator's error messages are nobody's design.
+
+M4 (`wgpu`) and M6 (`pyo3`) will add more.
 
 ## Design principles in practice
 

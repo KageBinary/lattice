@@ -33,14 +33,28 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test                      # 365 tests across 7 crates
+$ cargo test                      # 636 tests across 11 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
+$ cargo build --release -p lattice-viewer   # the `lattice-view` window
 ```
 
 Tests run at `opt-level = 2` (see the root `Cargo.toml`). The validation suite runs
 convergence studies over thousands of steps; at `opt-level = 0` they take minutes
 instead of a second.
+
+`lattice-viewer` is the only crate with external dependencies, and a cold build of its
+GPU stack takes several minutes. Nothing else depends on it, so building or testing any
+other crate by name never pays for it. Changing anything a domain *publishes* —
+`Observations`, `RenderChannel` — does reach it, so run the whole workspace before
+committing.
+
+**A green test suite does not mean the window is right.** Every defect found in the
+viewer so far was found by screenshotting the running program, not by a test: round-off
+plotted as a dramatic oscillation, a values table saying "field units" beside a scale
+bar saying "K", a legend box parked on the curve it labelled, and a perfectly conserved
+momentum reported as `not conserved` because the denominator was `1e-15`. Build it, run
+it on `examples/lj_gas.lattice` and `examples/diffusing_pulse.lattice`, and look at it.
 
 **Always benchmark a release build.** `lattice bench` prints a loud warning when
 `debug_assertions` is on, because a timing from an unoptimized build is off by an order

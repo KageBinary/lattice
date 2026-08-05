@@ -334,6 +334,19 @@ impl ParticleDomain {
         [px, py]
     }
 
+    /// The sum of the individual momentum magnitudes, kg·m/s.
+    ///
+    /// The scale against which a *net* momentum of zero should be judged: a residual
+    /// of 1e-13 means nothing on its own, and everything when the parts summing to it
+    /// are of order 100.
+    pub fn momentum_scale(&self) -> f64 {
+        let (vx, vy, m) = (self.store.vel_x(), self.store.vel_y(), self.store.mass());
+        (0..vx.len())
+            .filter(|&i| m[i].is_finite())
+            .map(|i| m[i] * (vx[i] * vx[i] + vy[i] * vy[i]).sqrt())
+            .sum()
+    }
+
     /// Fastest particle speed, m/s.
     pub fn max_speed(&self) -> f64 {
         let (vx, vy) = (self.store.vel_x(), self.store.vel_y());
@@ -523,6 +536,18 @@ impl Domain for ParticleDomain {
         out.record_invariant(format!("{prefix}.total_energy"), Invariant::Energy, kinetic + potential);
         out.record_invariant(format!("{prefix}.momentum_x"), Invariant::MomentumX, px);
         out.record_invariant(format!("{prefix}.momentum_y"), Invariant::MomentumY, py);
+
+        // Total momentum is conserved *at zero* for a system set up at rest, so
+        // "drift relative to the initial value" divides by round-off and reports a
+        // perfectly conserved run as catastrophically broken. The meaningful scale is
+        // the sum of the individual momenta being cancelled — which only this domain
+        // knows. Publishing it lets a reader (or a viewer) judge the residual against
+        // something physical.
+        out.record_metric(
+            format!("{prefix}.momentum_scale"),
+            self.momentum_scale(),
+            Invariant::MomentumX.si_unit(),
+        );
         out.record_metric(format!("{prefix}.max_speed"), self.max_speed(), "m/s");
     }
 

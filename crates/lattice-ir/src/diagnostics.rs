@@ -137,7 +137,12 @@ pub struct Observation {
     /// Value in coherent SI.
     pub value: f64,
     /// SI unit string, for display.
-    pub unit: &'static str,
+    ///
+    /// `Cow` rather than `&'static str` because a solver's unit may be decided at
+    /// compile time — a heat field knows it is in kelvin only because the model said
+    /// so. Labelling it "field units" instead would throw away something the compiler
+    /// already worked out.
+    pub unit: Cow<'static, str>,
     /// What sort of reading this is.
     pub kind: ObservationKind,
 }
@@ -162,10 +167,10 @@ impl Observations {
         &mut self,
         name: impl Into<Cow<'static, str>>,
         value: f64,
-        unit: &'static str,
+        unit: impl Into<Cow<'static, str>>,
         kind: ObservationKind,
     ) {
-        self.entries.push(Observation { name: name.into(), value, unit, kind });
+        self.entries.push(Observation { name: name.into(), value, unit: unit.into(), kind });
     }
 
     /// Record a conserved quantity, taking the unit from the invariant.
@@ -183,7 +188,7 @@ impl Observations {
         &mut self,
         name: impl Into<Cow<'static, str>>,
         value: f64,
-        unit: &'static str,
+        unit: impl Into<Cow<'static, str>>,
     ) {
         self.record(name, value, unit, ObservationKind::Metric);
     }

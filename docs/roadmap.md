@@ -56,11 +56,17 @@ Delivered:
   cadence, and run artifacts.
 - **`lattice-ir` additions** — `CompiledModel`, `BufferPlan`, the operation graph with
   hazard-derived edges and parallel levels, and render channels.
-- **`lattice check` and `lattice run`** — M1's exit condition, minus a window.
+- **`lattice check` and `lattice run`** — the headless half of M1's exit condition.
+- **`lattice-viewer` / `lattice-view`** — the interactive half: a window with field
+  heatmaps on a perceptually uniform ramp, particle scatter, play/pause/step/reset and
+  speed, live plots grouped one-per-unit, conservation drift with a verdict, the
+  timestep against its stability limit, and the solver contract. Documented in
+  [viewer.md](viewer.md). The project's first external dependencies
+  (`eframe`, `egui_plot`), in a crate the other ten do not build.
 - **Five example models and sixteen invalid fixtures**, each fixture declaring the
   diagnostic code it must produce.
 
-591 tests. Clippy clean. Still zero external dependencies.
+636 tests. Clippy clean.
 
 ### What M1 taught us
 
@@ -79,6 +85,17 @@ Delivered:
   each invalid model produces, and that every rejection carries a source position and
   either a fix or the rule it enforces. A test that only checks "this failed" passes
   just as happily when the model is rejected for the wrong reason.
+- **A green test suite does not mean the window is right.** Every viewer defect found
+  so far was found by screenshotting the running program: round-off plotted as a
+  dramatic oscillation, a values table saying "field units" beside a scale bar saying
+  "K", a legend box parked on the curve it labelled, and a perfectly conserved momentum
+  reported as `✖ not conserved` because the denominator was `1e-15`. None of them were
+  reachable from a unit test that did not already know to look. They are covered by
+  tests now — written after the screenshot, not before.
+- **Relative error needs a scale, and sometimes only the domain has it.** A quantity
+  conserved *at zero* has no scale of its own. `ParticleDomain` publishes
+  `momentum_scale = Σ|mᵢvᵢ|` for exactly this, and the viewer states which denominator
+  it used rather than leaving a reader to guess.
 
 ## M2 — Mechanics and fields (next)
 
@@ -97,6 +114,9 @@ Needed:
 4. **CPU parallelism** — §15.3 asks for parallel iterators over independent operations.
    The operation graph already computes which operations those are and reports the
    ideal speedup; nothing consumes that yet.
+5. **Viewer support for the new domain** — bodies, contacts and constraint forces are
+   §17 render channels that do not exist yet. A rigid-body module whose contacts cannot
+   be seen fails the same standard M2 is being held to.
 
 ## Later milestones
 

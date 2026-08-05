@@ -6,10 +6,12 @@ the non-obvious decisions were made that way.
 ## Layering
 
 ```
-                       ┌──────────────────────────────────┐
-   authoring           │ lattice-cli  check/run/validate  │
-                       │              bench/demo/inspect  │
-                       └───────────────┬──────────────────┘
+                  ┌───────────────────────┐  ┌──────────────────┐
+   authoring      │ lattice-cli           │  │ lattice-viewer   │
+                  │ check/run/validate    │  │ `lattice-view`   │
+                  │ bench/demo/inspect    │  │ the window       │
+                  └───────────┬───────────┘  └────────┬─────────┘
+                              └────────┬──────────────┘
                                        │
      ┌─────────────────┬───────────────┼───────────────┬──────────────────┐
      │                 │               │               │                  │
@@ -50,6 +52,12 @@ Dependencies point downward only. `lattice-ir` holds no physics; the domain crat
 hold no storage layout decisions; `lattice-runtime` does not depend on the compiler —
 it takes a `CompiledModel` and a `Vec<Box<dyn Domain>>`, and the CLI wires the two
 together.
+
+`lattice-viewer` sits beside the CLI rather than under it: both are consumers of the
+same compile-then-run path, and neither is on the other's path. Nothing below the
+authoring layer knows a window exists — a domain publishes `Observations` and
+`RenderChannel`s and cannot tell whether they are going to a terminal, a JSON artifact,
+or a texture. See [viewer.md](viewer.md).
 
 ## The compilation pipeline
 
