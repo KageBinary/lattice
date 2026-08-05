@@ -268,6 +268,20 @@ impl ReactingMixture {
     }
 }
 
+/// The coupling ports this domain offers (spec §14.1).
+static PORTS: [lattice_ir::PortSpec; 2] = [
+    lattice_ir::PortSpec::publishes_field(
+        "heat_release",
+        "W/m^2",
+        "heat released by reaction, averaged over the step just taken",
+    ),
+    lattice_ir::PortSpec::consumes_field(
+        "temperature",
+        "K",
+        "the temperature every cell reacts at, which Arrhenius rate laws read",
+    ),
+];
+
 /// The contract. One entry, because the splitting and the schemes it composes are not
 /// separately selectable — offering a first-order split would be offering a worse
 /// answer for no saving worth having.
@@ -460,6 +474,34 @@ impl Domain for ReactingMixture {
             ObservationKind::Count,
         );
         out.record_metric(format!("{prefix}.stiffness"), self.worst_stiffness, "1");
+    }
+
+    fn ports(&self) -> &'static [lattice_ir::PortSpec] {
+        &PORTS
+    }
+
+    fn port_grid(&self) -> Option<Grid2d> {
+        Some(self.grid)
+    }
+
+    fn read_port(&self, name: &str, out: &mut lattice_ir::PortData) -> bool {
+        match (name, out.as_field_mut()) {
+            ("heat_release", Some(buffer)) => {
+                buffer.copy_interior_from(&self.heat);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn write_port(&mut self, name: &str, value: &lattice_ir::PortData) -> bool {
+        match (name, value.as_field()) {
+            ("temperature", Some(field)) => {
+                self.set_temperature_field(field);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn render_channels(&self) -> Vec<lattice_ir::RenderChannel<'_>> {

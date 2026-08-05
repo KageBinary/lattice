@@ -100,6 +100,22 @@ pub struct HeatDomain {
     display_unit: String,
 }
 
+/// The coupling ports this solver offers (spec §14.1).
+static PORTS: [lattice_ir::PortSpec; 2] = [
+    lattice_ir::PortSpec::publishes_field(
+        "field",
+        "field units",
+        "the solved field itself, cell by cell",
+    ),
+    lattice_ir::PortSpec::consumes_field(
+        "source",
+        "field units / s",
+        "a source term added to every cell. For temperature this is K/s, NOT a power \
+         density: converting one to the other needs an areal heat capacity, which is a \
+         property of neither domain and which spec 14.1 puts on the coupling edge",
+    ),
+];
+
 /// Halo width. One cell is all a 5-point stencil reads.
 const HALO: usize = 1;
 
@@ -563,6 +579,36 @@ impl Domain for HeatDomain {
                 self.display_unit.clone(),
                 ObservationKind::Residual,
             );
+        }
+    }
+
+    fn ports(&self) -> &'static [lattice_ir::PortSpec] {
+        &PORTS
+    }
+
+    fn port_grid(&self) -> Option<Grid2d> {
+        Some(self.grid)
+    }
+
+    fn read_port(&self, name: &str, out: &mut lattice_ir::PortData) -> bool {
+        match (name, out.as_field_mut()) {
+            ("field", Some(buffer)) => {
+                buffer.copy_interior_from(&self.field);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn write_port(&mut self, name: &str, value: &lattice_ir::PortData) -> bool {
+        match (name, value.as_field()) {
+            ("source", Some(field)) => {
+                let mut source = ScalarField::new(&self.grid, HALO);
+                source.copy_interior_from(field);
+                self.set_source(source);
+                true
+            }
+            _ => false,
         }
     }
 

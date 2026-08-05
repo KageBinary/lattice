@@ -96,6 +96,7 @@ pub mod grid;
 pub mod ids;
 pub mod model;
 pub mod particles;
+pub mod port;
 pub mod render;
 pub mod rng;
 
@@ -121,5 +122,6 @@ pub use ids::{
     ParticleKind, PortId, ReactionId, ShapeId, SpeciesId,
 };
 pub use particles::{Dynamics, ForceAccumulation, ParticleSpec, ParticleStore};
+pub use port::{PortData, PortDirection, PortShape, PortSpec};
 pub use render::{bounds_of, RenderChannel};
 pub use rng::{Pcg32, RngSnapshot};

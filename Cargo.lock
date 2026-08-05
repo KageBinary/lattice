@@ -1664,6 +1664,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-coupling"
+version = "0.1.0"
+dependencies = [
+ "lattice-domain-chemistry",
+ "lattice-domain-grid2d",
+ "lattice-ir",
+]
+
+[[package]]
 name = "lattice-domain-chemistry"
 version = "0.1.0"
 dependencies = [

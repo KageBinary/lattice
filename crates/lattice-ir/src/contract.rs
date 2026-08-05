@@ -421,6 +421,40 @@ pub trait Domain {
     fn render_channels(&self) -> Vec<crate::render::RenderChannel<'_>> {
         Vec::new()
     }
+
+    /// The quantities this domain publishes to, or will accept from, a coupling edge
+    /// (spec §14.1).
+    ///
+    /// Declared rather than discovered: an edge naming a port that does not exist is a
+    /// compile error with a list of what does, which is a far better outcome than an
+    /// edge that silently transfers nothing.
+    fn ports(&self) -> &'static [crate::port::PortSpec] {
+        &[]
+    }
+
+    /// Copy a published port's current value into `out`.
+    ///
+    /// Returns false for a name this domain does not publish, or a buffer of the wrong
+    /// shape. Copying rather than lending is deliberate — see [`crate::port`].
+    fn read_port(&self, _name: &str, _out: &mut crate::port::PortData) -> bool {
+        false
+    }
+
+    /// Accept a value on a consumed port.
+    ///
+    /// Returns false for a name this domain does not consume. The value has already
+    /// been through the edge's mapping, so it arrives in *this* domain's units.
+    fn write_port(&mut self, _name: &str, _value: &crate::port::PortData) -> bool {
+        false
+    }
+
+    /// The grid a field-shaped port lives on, when there is one.
+    ///
+    /// The scheduler needs it to size a staging buffer and to integrate a per-cell rate
+    /// into the total the ledger records.
+    fn port_grid(&self) -> Option<crate::grid::Grid2d> {
+        None
+    }
 }
 
 #[cfg(test)]

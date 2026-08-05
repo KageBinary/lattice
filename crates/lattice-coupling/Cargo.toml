@@ -1,0 +1,17 @@
+[package]
+name = "lattice-coupling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Coupling edges, port mappings, and the conservation ledger"
+
+[dependencies]
+lattice-ir.workspace = true
+
+[dev-dependencies]
+lattice-domain-grid2d.workspace = true
+lattice-domain-chemistry.workspace = true
+
+[lints]
+workspace = true

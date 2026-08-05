@@ -320,6 +320,17 @@ mod tests {
         assert!(rate.is_finite() && rate == 0.0, "{rate}");
     }
 
+    /// The same clamp also scrubs a NaN concentration, because `NaN.max(0.0)` is `0.0`
+    /// in IEEE 754. That is worth knowing rather than discovering: a poisoned cell
+    /// stops poisoning its neighbours here, so a NaN that reaches a *rate* came from
+    /// the temperature or the rate constant, not from a concentration.
+    #[test]
+    fn a_nan_concentration_is_scrubbed_by_the_same_clamp() {
+        let law = RateLaw::mass_action(1.0);
+        assert_eq!(mass_action_rate(&law, &[(0, 1.0)], &[], &[f64::NAN], 300.0), 0.0);
+        assert_eq!(f64::NAN.max(0.0), 0.0, "which is the IEEE rule this relies on");
+    }
+
     /// An order-2 constant written in 1/s is wrong by a factor with the dimensions of a
     /// concentration, and the number looks plausible either way.
     #[test]
