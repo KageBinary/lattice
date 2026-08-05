@@ -1,0 +1,17 @@
+// expect: E0211
+// Every narrowphase routine here assumes convexity. A concave outline has to be built
+// from several bodies, and saying so beats producing contacts that point the wrong way.
+
+project concave_polygon {
+  body dent {
+    shape: polygon(
+      [0 meter, 0 meter],
+      [2 meter, 0 meter],
+      [1 meter, 0.5 meter],
+      [2 meter, 2 meter],
+      [0 meter, 2 meter]
+    );
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

@@ -1656,6 +1656,7 @@ version = "0.1.0"
 dependencies = [
  "lattice-domain-grid2d",
  "lattice-domain-particle",
+ "lattice-domain-rigid2d",
  "lattice-ir",
  "lattice-runtime",
  "lattice-syntax",

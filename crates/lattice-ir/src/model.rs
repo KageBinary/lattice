@@ -51,6 +51,15 @@ pub enum BufferKind {
         /// Maximum particles.
         capacity: usize,
     },
+    /// Structure-of-arrays rigid-body state.
+    ///
+    /// Distinct from [`BufferKind::ParticleArrays`] because a body carries fourteen
+    /// channels to a particle's nine — the rotational half — and the memory report
+    /// would be wrong to conflate them.
+    RigidBodyArrays {
+        /// Maximum bodies.
+        capacity: usize,
+    },
     /// A plain run of `f64` values.
     Scratch {
         /// Element count.
@@ -70,6 +79,9 @@ impl BufferKind {
             BufferKind::ParticleArrays { capacity } => {
                 capacity * crate::particles::ParticleStore::BYTES_PER_PARTICLE
             }
+            BufferKind::RigidBodyArrays { capacity } => {
+                capacity * crate::bodies::RigidBodyStore::BYTES_PER_BODY
+            }
             BufferKind::Scratch { elements } => elements * F64,
         }
     }
@@ -80,6 +92,7 @@ impl BufferKind {
             BufferKind::ScalarField { nx, ny, halo } => format!("scalar {nx}x{ny} halo {halo}"),
             BufferKind::VectorField { nx, ny, halo } => format!("vector {nx}x{ny} halo {halo}"),
             BufferKind::ParticleArrays { capacity } => format!("particles cap {capacity}"),
+            BufferKind::RigidBodyArrays { capacity } => format!("bodies cap {capacity}"),
             BufferKind::Scratch { elements } => format!("scratch {elements}"),
         }
     }

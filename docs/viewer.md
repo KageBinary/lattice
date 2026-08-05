@@ -181,6 +181,52 @@ it, and only a genuine runaway is critical:
 
 ---
 
+## Rigid bodies and contacts
+
+Bodies are drawn as filled outlines: static ones in neutral grey, dynamic ones in a
+series colour. The difference is in lightness as well as chroma, so it survives
+greyscale and colour vision deficiency without needing a legend. It answers the two
+questions a rigid scene provokes — *why is the ground falling* and *why is the crate
+not* — by looking at the picture.
+
+Contacts are drawn **over** the bodies rather than in a panel of their own. A set of
+points beside the geometry they belong to would leave the reader to align two pictures
+by eye. Each contact is a dot with a short arrow along the normal; the arrow is a fixed
+screen length because it is a direction, not a magnitude, and drawing it proportional
+to anything would invite someone to measure it. Overlap depth is shown by the dot's
+size, so no colour scale is needed.
+
+That the module publishes contacts at all is the point. §17 asks for constraints and
+forces to be visible, and a contact solver is the hardest kind of code to debug without
+them: jitter, sinking and sticking look identical from outside, and completely
+different once the normals are on screen.
+
+The geometry reaches the viewer as a flat table of body-local vertices plus per-body
+poses, because `lattice-ir` holds no physics and cannot name a circle. The table is
+built once when a shape is registered and borrowed unchanged thereafter; circles arrive
+already tessellated, which is what a renderer would have done with them anyway.
+
+## The panel reads the domain's claim, not the name
+
+The conservation panel used to decide "should this be conserved?" by matching names —
+`momentum_x`, `total_energy`, and so on. That guess cannot distinguish a closed system
+from an open one, because they publish the same names for the same quantities.
+
+It matters. A rigid scene with gravity and a floor publishes a momentum that is
+*supposed* to change: gravity injects it every step and a static body absorbs whatever
+hits it. Flagging that as a conservation failure fires an alarm on every correct model
+a reader writes, which is how they learn to stop reading the panel.
+
+Series now carry the `ObservationKind` the domain declared, and the panel reports only
+what the solver actually promised. When a domain promises nothing — which is the honest
+answer for most rigid scenes — the panel says so:
+
+```text
+conservation
+  no conserved quantity here — gravity adds momentum and a static body
+  absorbs it, so this domain publishes none
+```
+
 ## Smaller decisions worth stating
 
 **The legend goes below the plot, not inside it.** A floating legend has to land

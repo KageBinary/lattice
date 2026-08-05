@@ -1,0 +1,16 @@
+// expect: E0400
+// This is a 2D world, so a density is a mass per unit AREA. Accepting kg/m^3 would
+// make every mass in the scene wrong by a factor of one metre, silently.
+
+project volumetric_density {
+  material steel {
+    density: 7850 kilogram / meter^3;
+  }
+
+  body block {
+    shape:    box(1 meter, 1 meter);
+    material: steel;
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

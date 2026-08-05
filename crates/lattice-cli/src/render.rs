@@ -85,6 +85,9 @@ pub fn scatter(
     extent: [f64; 2],
     columns: usize,
     rows: usize,
+    // What the marks are, for the caption. A picture that calls a body outline
+    // "1104 particles" has told the reader something false about the model.
+    noun: &str,
 ) -> String {
     let mut counts = vec![0u32; columns * rows];
     let mut outside = 0usize;
@@ -123,7 +126,7 @@ pub fn scatter(
         out.push_str("|\n");
     }
     out.push_str(&format!(
-        "  {} particles, densest cell holds {busiest}",
+        "  {} {noun}, densest cell holds {busiest}",
         xs.len()
     ));
     if outside > 0 {
@@ -291,9 +294,14 @@ mod tests {
     fn scatter_places_particles_and_counts_strays() {
         let xs = [0.1, 0.9, 5.0];
         let ys = [0.1, 0.9, 5.0];
-        let text = scatter(&xs, &ys, [0.0, 0.0], [1.0, 1.0], 10, 5);
+        let text = scatter(&xs, &ys, [0.0, 0.0], [1.0, 1.0], 10, 5, "particles");
         assert!(text.contains("3 particles"), "{text}");
         assert!(text.contains("1 outside the view"), "{text}");
+
+        // The caption names what was actually drawn. A body outline plotted as
+        // "1104 particles" tells the reader something false about the model.
+        let outline = scatter(&xs, &ys, [0.0, 0.0], [1.0, 1.0], 10, 5, "outline points");
+        assert!(outline.contains("3 outline points"), "{outline}");
     }
 
     #[test]

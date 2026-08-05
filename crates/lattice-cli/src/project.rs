@@ -200,7 +200,40 @@ fn render_channel(channel: &RenderChannel<'_>) -> String {
             out.push_str(&render::heatmap(field, 72, 20));
         }
         RenderChannel::Particles { x, y, origin, extent, .. } => {
-            out.push_str(&render::scatter(x, y, *origin, *extent, 72, 20));
+            out.push_str(&render::scatter(x, y, *origin, *extent, 72, 20, "particles"));
+        }
+        RenderChannel::Bodies { x, origin, extent, .. } => {
+            // A terminal cannot fill a polygon, so the outlines are plotted as the
+            // points they are made of. The silhouette is recognizable and nothing is
+            // implied that the data does not have — `lattice-view` draws them properly.
+            let mut outline = Vec::new();
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for index in 0..x.len() {
+                channel.body_outline(index, &mut outline);
+                // Walk every edge including the closing one, interpolating along it so
+                // a large body does not appear as four disconnected corners.
+                const STEPS: u32 = 12;
+                for edge in 0..outline.len() {
+                    let from = outline[edge];
+                    let to = outline[(edge + 1) % outline.len()];
+                    for step in 0..STEPS {
+                        let t = f64::from(step) / f64::from(STEPS);
+                        xs.push(from[0] + t * (to[0] - from[0]));
+                        ys.push(from[1] + t * (to[1] - from[1]));
+                    }
+                }
+            }
+            out.push_str(&render::scatter(&xs, &ys, *origin, *extent, 72, 20, "outline points"));
+        }
+        RenderChannel::Contacts { x, depth, .. } => {
+            // Overlaying these on the ASCII silhouette would put two marks in one cell
+            // and hide both. The numbers are what a terminal can show honestly.
+            let deepest = depth.iter().copied().fold(0.0, f64::max);
+            out.push_str(&format!(
+                "  {} contact points, deepest overlap {deepest:.3e} m
+",
+                x.len()
+            ));
         }
     }
     if channel.has_non_finite() {

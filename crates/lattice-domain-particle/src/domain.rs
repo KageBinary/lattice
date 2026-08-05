@@ -527,12 +527,14 @@ impl Domain for ParticleDomain {
             "1",
             lattice_ir::ObservationKind::Count,
         );
-        out.record_invariant(format!("{prefix}.kinetic_energy"), Invariant::KineticEnergy, kinetic);
-        out.record_invariant(
-            format!("{prefix}.potential_energy"),
-            Invariant::PotentialEnergy,
-            potential,
-        );
+        // The halves are *metrics*: a gas melting out of a lattice converts potential
+        // energy into kinetic on purpose, and both are supposed to move. Only the sum
+        // is an invariant. Publishing the halves as invariants too would have a healthy
+        // run report two conservation failures every step, which is how a reader learns
+        // to stop reading the panel.
+        let unit = Invariant::Energy.si_unit();
+        out.record_metric(format!("{prefix}.kinetic_energy"), kinetic, unit);
+        out.record_metric(format!("{prefix}.potential_energy"), potential, unit);
         out.record_invariant(format!("{prefix}.total_energy"), Invariant::Energy, kinetic + potential);
         out.record_invariant(format!("{prefix}.momentum_x"), Invariant::MomentumX, px);
         out.record_invariant(format!("{prefix}.momentum_y"), Invariant::MomentumY, py);

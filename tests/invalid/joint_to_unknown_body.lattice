@@ -1,0 +1,21 @@
+// expect: E0202
+// A joint endpoint that names nothing would silently constrain slot 0 to slot 0.
+
+project joint_to_unknown_body {
+  body anchor {
+    shape:  circle(0.1 meter);
+    motion: static;
+  }
+
+  body bob {
+    shape: circle(0.2 meter);
+    at:    [1 meter, 0 meter];
+  }
+
+  joint arm {
+    kind:   pin;
+    bodies: [anchor, weight];
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

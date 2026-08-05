@@ -1,0 +1,11 @@
+// expect: E0405
+// A segment encloses no area, so density gives it no mass. A massless dynamic body is
+// a division by zero waiting to happen; the model has to say whether it meant a wall.
+
+project massless_segment {
+  body rail {
+    shape: segment(5 meter);
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

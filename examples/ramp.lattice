@@ -1,0 +1,115 @@
+// A crate slides down a ramp, a ball bounces, and a pendulum swings, in a closed yard.
+//
+// Everything M2 added, in one scene: shapes, materials, static and dynamic bodies,
+// Coulomb friction on a slope, restitution against the floor, and a pin joint.
+//
+// The ramp is at 0.35 rad, so tan(theta) = 0.365. The ice crate meets it with a pair
+// friction of sqrt(0.8 x 0.1) = 0.28, which is below the threshold, so it slides.
+// Change the crate's material to `rubber` — pair friction sqrt(0.8 x 0.9) = 0.85 —
+// and it stays put. That threshold is the Coulomb friction law, and it is one of the
+// module's validation cases.
+//
+//   lattice run  examples/ramp.lattice
+//   lattice-view examples/ramp.lattice --play
+
+project ramp {
+  dimensions: 2;
+  fidelity: interactive;
+  duration: 8 second;
+
+  domain rigid2d yard {
+    gravity:    9.80665 meter / second^2;
+    iterations: 10;
+  }
+
+  // Densities are per unit AREA. This is a 2D world; giving it a thickness would make
+  // every mass wrong by a factor nobody declared, and §14.1 says such a conversion
+  // belongs in a port rather than hidden in a solver. These are the familiar 3D
+  // densities times a 10 cm slab, which is what a reader is really picturing.
+  material concrete {
+    density:     240 kilogram / meter^2;
+    restitution: 0.1;
+    friction:    0.8;
+  }
+
+  material ice {
+    density:     92 kilogram / meter^2;
+    restitution: 0.05;
+    friction:    0.1;
+  }
+
+  material rubber {
+    density:     110 kilogram / meter^2;
+    restitution: 0.7;
+    friction:    0.9;
+  }
+
+  // The yard: a floor and two walls, so nothing can leave. An unbounded scene looks
+  // fine for a few seconds and then quietly turns into free fall, which reads as an
+  // unstable solver and is not one.
+  body floor {
+    shape:    box(10 meter, 0.3 meter);
+    at:       [0 meter, -3 meter];
+    material: concrete;
+    motion:   static;
+  }
+
+  body left_wall {
+    shape:    box(0.3 meter, 3 meter);
+    at:       [-10 meter, 0 meter];
+    material: concrete;
+    motion:   static;
+  }
+
+  body right_wall {
+    shape:    box(0.3 meter, 3 meter);
+    at:       [10 meter, 0 meter];
+    material: concrete;
+    motion:   static;
+  }
+
+  body slope {
+    shape:    box(4 meter, 0.25 meter);
+    at:       [-4.5 meter, 0.5 meter];
+    angle:    0.35;
+    material: concrete;
+    motion:   static;
+  }
+
+  body crate {
+    shape:    box(0.4 meter, 0.4 meter);
+    at:       [-6.5 meter, 2 meter];
+    angle:    0.35;
+    material: ice;
+  }
+
+  body ball {
+    shape:    circle(0.35 meter);
+    at:       [1 meter, 4 meter];
+    material: rubber;
+  }
+
+  // A pendulum: a static hook and a bob on a pin joint, released horizontally.
+  body hook {
+    shape:    circle(0.08 meter);
+    at:       [5 meter, 2 meter];
+    material: concrete;
+    motion:   static;
+  }
+
+  body bob {
+    shape:    circle(0.25 meter);
+    at:       [6.5 meter, 2 meter];
+    material: rubber;
+  }
+
+  joint arm {
+    kind:     pin;
+    bodies:   [hook, bob];
+    anchor_b: [-1.5 meter, 0 meter];
+  }
+
+  solve rigid(yard) with sequential_impulse(dt = 0.004 second);
+
+  observe yard every 0.02 second;
+}

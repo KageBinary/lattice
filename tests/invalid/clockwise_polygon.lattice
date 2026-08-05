@@ -1,0 +1,12 @@
+// expect: E0211
+// A clockwise polygon is the shape a model authored for a y-down coordinate system
+// produces, and that model's gravity is about to be wrong too. Reversing the vertices
+// silently would hide the real problem.
+
+project clockwise_polygon {
+  body wedge {
+    shape: polygon([0 meter, 0 meter], [0 meter, 1 meter], [1 meter, 0 meter]);
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

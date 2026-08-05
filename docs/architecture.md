@@ -18,9 +18,9 @@ the non-obvious decisions were made that way.
 ┌────▼─────────┐ ┌─────▼──────┐ ┌──────▼───────┐ ┌─────▼────────┐ ┌───────▼───────┐
 │ lattice-     │ │ lattice-   │ │ lattice-     │ │ lattice-     │ │ lattice-      │
 │ validation   │ │ compiler   │ │ runtime      │ │ domain-*     │ │ observe       │
-│ (the lab)    │ │ resolve,   │ │ clock, dt    │ │ (the physics)│ │ JSON, timing, │
-│              │ │ check,     │ │ negotiation, │ │              │ │ artifacts     │
-│              │ │ lower      │ │ stepping     │ │              │ │               │
+│ (the lab)    │ │ resolve,   │ │ clock, dt    │ │ particle,    │ │ JSON, timing, │
+│              │ │ check,     │ │ negotiation, │ │ grid2d,      │ │ artifacts     │
+│              │ │ lower      │ │ stepping     │ │ rigid2d      │ │               │
 └────┬─────────┘ └──┬──────┬──┘ └──────┬───────┘ └─────┬────────┘ └───────┬───────┘
      │              │      │           │               │                  │
      │       ┌──────▼───┐  └───────────┼───────────────┼──────────────────┘
@@ -259,6 +259,85 @@ amount of integrator accuracy would recover it.
 One wrinkle: on a periodic axis with fewer than three cells, several of the nine 3×3
 offsets alias the *same* cell. Neighbour cells are deduplicated per cell at
 construction, or each pair would be reported three times.
+
+## An invariant is a claim, not a label
+
+`ObservationKind::Invariant` asserts that a quantity should not change, and everything
+downstream believes it: the viewer's conservation panel flags any drift, the run report
+calls it out. So publishing something as an invariant that is not one does not merely
+mislabel it — it fires an alarm on every correct run, and an alarm that always fires is
+one a reader learns to ignore. That is a worse outcome than saying nothing.
+
+Two versions of this mistake shipped and had to be fixed:
+
+**Kinetic energy.** Both the particle and rigid modules published `kinetic_energy` and
+`potential_energy` as invariants. Neither is conserved on its own in any system where
+anything happens — a Lennard-Jones gas melting out of a lattice converts one into the
+other *on purpose*. Only the sum is an invariant. The halves are metrics now.
+
+**Momentum in an open world.** The rigid module declared momentum conserved, which is
+true of the impulse solve and false of almost any scene. Gravity injects momentum every
+step. A static body is an infinite sink for it: a ball bouncing off the ground changes
+the system's total by twice its own. `RigidDomain::observe` therefore publishes momentum
+as an invariant *only* when `is_closed()` — no gravity, no static bodies — and as a
+metric otherwise. The number and its unit are identical either way; what changes is
+whether anything claims it should hold still. When there is nothing to claim, the panel
+says so in as many words rather than showing an empty heading.
+
+The rule this leaves behind, written on `ObservationKind` where the next domain will
+read it: **publish everything, claim only what you can defend.**
+
+A corollary for the viewer: it used to decide "should this be conserved?" by matching
+observation names against a list — `momentum_x`, `total_energy`, and so on. That guess
+cannot tell a closed world from an open one, because they publish the same names. It
+now reads the kind the domain declared, which is the domain's own promise rather than
+the viewer's assumption.
+
+## Rigid bodies: what is exact and what is not
+
+The contact solver is projected Gauss–Seidel on the velocity constraints — sequential
+impulses. Three things follow, and `crates/lattice-domain-rigid2d/src/lib.rs` states
+all three rather than leaving them to be discovered:
+
+**Linear momentum is exact at any iteration count.** Every impulse goes through one
+function that applies it equal and opposite to the pair, so a starved solve looks like
+bodies sinking into each other and never like momentum appearing from nowhere. A
+validation case runs the solver at *one* iteration and asserts a relative drift below
+1e-12. It is the same argument the particle module's pair forces rest on.
+
+**Angular momentum is exact under the impulses and not under position correction.**
+Displacing a body without changing its velocity changes its orbital angular momentum
+`m(r × v)` about any fixed origin, by `dt·(J_p × Δv)` per correction impulse. No
+position-correction scheme avoids this. Rather than describe the amount as small, the
+solver measures it every step and publishes it as `correction_drift`.
+
+**Energy is not conserved and is not claimed to be.** Restitution below 1 removes it on
+purpose; Coulomb friction removes it as heat that nothing here accounts for. The one
+configuration where nothing removes it — restitution 1, no friction — is a validation
+case, and it holds to 8.000000000 J exactly.
+
+### Why joints and contacts share one sweep
+
+A pendulum resting against a wall is held by both a pin and a contact, and neither is
+right on its own: satisfying the pin pushes the bob into the wall, satisfying the
+contact swings it off the pin. Solving one set to convergence and then the other simply
+alternates between the two answers. `RigidDomain::advance` interleaves them in a single
+Gauss–Seidel sweep, which is what lets them negotiate.
+
+### Why the pin joint inverts a 2×2
+
+A pin is two coupled scalar constraints, and the coupling is not small: a body pinned
+far from its centre of mass presents wildly different resistance along the two axes.
+Solving them as independent scalars converges at a rate set by that ratio — which for a
+pendulum bob means it does not converge at all in any sane iteration count. The first
+implementation did exactly that and reported a period eight times too fast. Inverting
+the 2×2 effective-mass matrix solves both exactly in one go.
+
+The same joint also applied its equal-and-opposite impulses at each body's *own* anchor.
+Those are different points whenever the joint is violated, and two opposite impulses at
+two different points are a couple — angular momentum created from nothing. Both impulses
+now act at the anchors' midpoint, which is exact when the joint is satisfied and honest
+when it is not.
 
 ## Diagnostics and the coupling ledger
 

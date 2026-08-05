@@ -13,7 +13,7 @@ A 2D-first multiphysics, chemistry, and quantum simulation runtime.
 
 ---
 
-## Status: milestones M0 and M1 complete
+## Status: milestones M0, M1 and M2 complete
 
 The spec lays out nine milestones, M0 through M8.
 
@@ -21,6 +21,9 @@ The spec lays out nine milestones, M0 through M8.
   and benchmark harness."*
 - **M1 — Compiled model.** Exit condition: *"same project executes headless and
   interactively."* Both halves: `lattice run` headless, `lattice-view` in a window.
+- **M2 — Mechanics and fields.** Exit condition: *"canonical validation suite passes."*
+  33 of 33 cases, including §19.2's elastic and inelastic collision and constrained
+  motion, which M0 had to leave out because the rigid module did not exist.
 
 Being specific about that, in the spirit of design principle **P1 — scientific
 honesty over feature count**:
@@ -35,17 +38,20 @@ honesty over feature count**:
 | **Runtime** | Clock, timestep negotiation across domains, observers on a cadence, run artifacts | Refuses unstable steps before running; halts on the first non-finite value |
 | **Storage** | Structure-of-arrays particles with stable handles, halo'd grid fields, bump arenas, reproducible RNG | 112 tests; no allocation in stepping loops |
 | **Particles** | Explicit Euler, semi-implicit Euler, velocity Verlet; gravity, drag, harmonic wells, Lennard-Jones; uniform cell list | Free fall, oscillator period, energy drift, convergence order, momentum conservation |
+| **Rigid bodies** | Circles, boxes, convex polygons, segments; sweep-and-prune broadphase, SAT narrowphase, friction and restitution; distance, rope, pin, spring and motor joints; sequential-impulse solver with warm starting | Elastic collision exchanges velocities exactly; inelastic loses exactly the predicted energy; pendulum period within 0.008% of analytic; Coulomb friction threshold to the digit |
 | **Heat / diffusion** | Finite-volume `∇·(D∇u)`, explicit / Crank–Nicolson / backward Euler, matrix-free conjugate gradient, Dirichlet / Neumann / Robin / periodic boundaries, variable diffusivity | Analytic heat kernel, manufactured solutions, convergence orders, conservation, series conduction |
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 636 tests across 11 crates |
-| **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, transport controls, live plots, conservation drift and the solver's contract | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 757 tests across 12 crates |
+| **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, conservation drift and the solver's contract | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
 
-Rigid bodies, fluids, waves, electromagnetism, chemistry, molecular dynamics beyond
-Lennard-Jones, the quantum module, the coupling scheduler, GPU execution, and the
-Python SDK. Those are M2–M8. The viewer draws through a CPU texture upload, which is
-fine at 64×64 and will not be at 768×384; GPU rendering is M4.
+Fluids, waves, electromagnetism, chemistry, molecular dynamics beyond Lennard-Jones,
+the quantum module, the coupling scheduler, GPU execution, and the Python SDK. Those
+are M3–M8. The viewer draws through a CPU texture upload, which is fine at 64×64 and
+will not be at 768×384; GPU rendering is M4. Rigid-body collision detection is
+discrete, so a fast thin projectile can pass through a thin wall — continuous
+collision detection is what §11.1 lists under "later".
 
 Constructs the language accepts but cannot execute — `reaction`, `couple`,
 `domain quantum2d` — are **compile errors that name the milestone that will implement
@@ -253,6 +259,7 @@ lattice/
     lattice-runtime/          clock, timestep negotiation, stepping, run artifacts
     lattice-domain-particle/  integrators, force laws, neighbour search
     lattice-domain-grid2d/    diffusion operator, boundaries, conjugate gradient
+    lattice-domain-rigid2d/   shapes, broadphase, contacts, joints, impulse solver
     lattice-observe/          JSON, timing profiles, run artifacts
     lattice-validation/       the validation lab
     lattice-cli/              the `lattice` binary

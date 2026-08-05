@@ -156,15 +156,15 @@ const INITIALIZERS: &[&str] =
 const BOUNDARIES: &[&str] = &["periodic", "insulated", "fixed", "flux", "robin"];
 
 /// A helper over a call's arguments.
-struct Call<'a> {
-    name: &'a str,
-    span: Span,
-    arguments: &'a [Argument],
+pub(crate) struct Call<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) span: Span,
+    pub(crate) arguments: &'a [Argument],
 }
 
 impl<'a> Call<'a> {
     /// Match `name(args)` or a bare `name`, which is treated as a call with none.
-    fn match_expr(expr: &'a Expr) -> Option<Call<'a>> {
+    pub(crate) fn match_expr(expr: &'a Expr) -> Option<Call<'a>> {
         match &expr.kind {
             ExprKind::Call(callee, arguments) => {
                 let name = callee.as_name()?;
@@ -175,23 +175,23 @@ impl<'a> Call<'a> {
         }
     }
 
-    fn named(&self, key: &str) -> Option<&'a Expr> {
+    pub(crate) fn named(&self, key: &str) -> Option<&'a Expr> {
         self.arguments
             .iter()
             .find(|a| a.name.as_ref().is_some_and(|n| n.text == key))
             .map(|a| &a.value)
     }
 
-    fn positional(&self, index: usize) -> Option<&'a Expr> {
+    pub(crate) fn positional(&self, index: usize) -> Option<&'a Expr> {
         self.arguments.iter().filter(|a| a.name.is_none()).nth(index).map(|a| &a.value)
     }
 
     /// A named argument, falling back to a positional one at `index`.
-    fn get(&self, key: &str, index: usize) -> Option<&'a Expr> {
+    pub(crate) fn get(&self, key: &str, index: usize) -> Option<&'a Expr> {
         self.named(key).or_else(|| self.positional(index))
     }
 
-    fn require(&self, key: &str, index: usize, diagnostics: &mut Diagnostics) -> Option<&'a Expr> {
+    pub(crate) fn require(&self, key: &str, index: usize, diagnostics: &mut Diagnostics) -> Option<&'a Expr> {
         match self.get(key, index) {
             Some(expr) => Some(expr),
             None => {
@@ -209,7 +209,7 @@ impl<'a> Call<'a> {
     ///
     /// A silently ignored `sigmaa=0.1` produces a model that compiles, runs, and is
     /// wrong — the worst of the three outcomes.
-    fn reject_unknown(&self, allowed: &[&str], diagnostics: &mut Diagnostics) {
+    pub(crate) fn reject_unknown(&self, allowed: &[&str], diagnostics: &mut Diagnostics) {
         for argument in self.arguments {
             let Some(name) = &argument.name else { continue };
             if allowed.contains(&name.text.as_str()) {

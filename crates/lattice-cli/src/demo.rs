@@ -435,6 +435,7 @@ fn lj_gas(options: &Options) -> DemoResult {
         [box_size, box_size],
         72,
         24,
+        "particles",
     ));
     visual.push_str(&format!(
         "\n  E/E0    {}\n  kinetic {}\n",

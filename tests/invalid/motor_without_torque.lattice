@@ -1,0 +1,22 @@
+// expect: E0203
+// A motor with an unbounded torque budget would move any load, which is a servo
+// nobody has. The budget is what makes it stall instead of cheating.
+
+project motor_without_torque {
+  body frame {
+    shape:  circle(0.1 meter);
+    motion: static;
+  }
+
+  body wheel {
+    shape: circle(0.4 meter);
+  }
+
+  joint drive {
+    kind:   motor;
+    bodies: [frame, wheel];
+    speed:  6 / second;
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

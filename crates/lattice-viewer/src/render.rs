@@ -15,7 +15,7 @@
 //! (spec NFR-007).
 
 use eframe::egui::{self, ColorImage, Pos2, Rect, Stroke, Vec2};
-use lattice_ir::ScalarField;
+use lattice_ir::{RenderChannel, ScalarField};
 
 use crate::palette::{self, Colormap, Mode, Palette, Status};
 
@@ -161,6 +161,155 @@ pub fn draw_particles(
     outside
 }
 
+/// Maps world coordinates onto a screen rectangle, with y increasing upward.
+///
+/// Shared by the body and contact renderers so a contact point lands exactly where the
+/// surfaces it belongs to are drawn. Two copies of this arithmetic would drift apart,
+/// and the drift would be invisible until someone tried to debug a contact.
+#[derive(Clone, Copy, Debug)]
+pub struct WorldView {
+    rect: Rect,
+    origin: [f64; 2],
+    extent: [f64; 2],
+}
+
+impl WorldView {
+    /// A view of `origin`..`origin + extent` drawn into `rect`.
+    pub fn new(rect: Rect, origin: [f64; 2], extent: [f64; 2]) -> WorldView {
+        WorldView { rect, origin, extent }
+    }
+
+    /// World point to screen position. `None` for a non-finite coordinate.
+    pub fn project(&self, world: [f64; 2]) -> Option<Pos2> {
+        if !(world[0].is_finite() && world[1].is_finite()) {
+            return None;
+        }
+        let fx = (world[0] - self.origin[0]) / self.extent[0];
+        let fy = (world[1] - self.origin[1]) / self.extent[1];
+        Some(Pos2::new(
+            self.rect.left() + fx as f32 * self.rect.width(),
+            // Flip y so increasing y draws upward.
+            self.rect.bottom() - fy as f32 * self.rect.height(),
+        ))
+    }
+
+    /// Screen pixels per world metre, on the x axis.
+    pub fn scale(&self) -> f32 {
+        if self.extent[0] > 0.0 {
+            self.rect.width() / self.extent[0] as f32
+        } else {
+            1.0
+        }
+    }
+}
+
+/// Draw rigid bodies as filled outlines.
+///
+/// Static bodies get the surface's own muted ink and dynamic ones a series colour, so
+/// the two questions a rigid scene provokes — "why is the ground falling" and "why is
+/// the crate not" — are answered by looking at it. That distinction is carried by
+/// lightness as well as hue, so it survives greyscale and colour vision deficiency.
+///
+/// Returns how many bodies fell outside the view.
+pub fn draw_bodies(
+    painter: &egui::Painter,
+    view: WorldView,
+    channel: &RenderChannel<'_>,
+    palette: &Palette,
+) -> usize {
+    let RenderChannel::Bodies { x, is_static, .. } = channel else {
+        return 0;
+    };
+
+    let dynamic = palette.series(0);
+    let critical = palette.status(Status::Critical);
+    let mut world = Vec::with_capacity(32);
+    let mut screen: Vec<Pos2> = Vec::with_capacity(32);
+    let mut outside = 0usize;
+
+    for index in 0..x.len() {
+        channel.body_outline(index, &mut world);
+        if world.is_empty() {
+            continue;
+        }
+        screen.clear();
+        let mut lost = false;
+        for point in &world {
+            match view.project(*point) {
+                Some(position) => screen.push(position),
+                None => lost = true,
+            }
+        }
+        if lost || screen.len() < 2 {
+            // A body at NaN has no position to draw, so mark the corner rather than
+            // dropping it silently (NFR-007).
+            painter.circle_filled(view.rect.left_top() + Vec2::new(6.0, 6.0), 5.0, critical);
+            outside += 1;
+            continue;
+        }
+        if screen.iter().all(|p| !view.rect.contains(*p)) {
+            outside += 1;
+        }
+
+        // Scenery in neutral grey, movers in a saturated hue: the difference is in
+        // lightness as well as chroma, so it survives greyscale and colour vision
+        // deficiency without needing a legend.
+        let is_wall = is_static[index];
+        let fill = if is_wall { palette.axis } else { dynamic };
+        let stroke = Stroke::new(1.5, if is_wall { palette.border } else { palette.text_primary });
+
+        // A two-point outline is a segment: it has no interior, and filling one would
+        // draw a wall that is not there.
+        if screen.len() > 2 {
+            painter.add(egui::Shape::convex_polygon(screen.clone(), fill, stroke));
+        } else {
+            painter.line_segment([screen[0], screen[1]], Stroke::new(2.5, palette.border));
+        }
+    }
+    outside
+}
+
+/// Draw contact points and their normals.
+///
+/// The arrow points the way the solver is pushing, which is the single most useful
+/// thing to see when a stack is misbehaving: jitter, sinking and sticking are
+/// indistinguishable from outside and obvious once the normals are on screen. Depth is
+/// shown by the marker's size rather than by colour, so the scale bar a colour encoding
+/// would demand is not needed.
+pub fn draw_contacts(
+    painter: &egui::Painter,
+    view: WorldView,
+    channel: &RenderChannel<'_>,
+    palette: &Palette,
+) {
+    let RenderChannel::Contacts { x, y, normal_x, normal_y, depth, .. } = channel else {
+        return;
+    };
+
+    // A fixed screen length, so a normal stays legible at any zoom. It is a direction,
+    // not a magnitude — drawing it proportional to anything would invite a reader to
+    // measure it.
+    let arrow = (view.rect.width() * 0.02).clamp(6.0, 18.0);
+    let color = palette.status(Status::Warning);
+
+    for index in 0..x.len() {
+        let Some(at) = view.project([x[index], y[index]]) else { continue };
+        if !view.rect.contains(at) {
+            continue;
+        }
+        let normal = Vec2::new(normal_x[index] as f32, -normal_y[index] as f32);
+        let length = normal.length();
+        if length > 0.0 {
+            let tip = at + normal / length * arrow;
+            painter.line_segment([at, tip], Stroke::new(1.5, color));
+        }
+        // Deeper overlap draws a larger dot, bounded so a badly overlapped scene stays
+        // readable rather than becoming one enormous blob.
+        let size = (2.0_f32 + (depth[index] * f64::from(view.scale())) as f32).clamp(2.0, 6.0);
+        painter.circle_filled(at, size, color);
+    }
+}
+
 /// Draw the colour-scale legend for a continuous map.
 ///
 /// Required, not optional: a continuous encoding with no scale is unreadable, and the
@@ -252,7 +401,10 @@ pub fn stability_verdict(dt: f64, limit: f64) -> Verdict {
         return Verdict {
             status: Status::Good,
             label: "unconditional".to_string(),
-            detail: "no stability limit — an implicit scheme".to_string(),
+            // Not "an implicit scheme": the rigid module is explicit and symplectic and
+            // still has no step limit of its own. What the two share is that nothing in
+            // the *integrator* bounds dt — which is what this line is reporting.
+            detail: "the integrator imposes no step limit".to_string(),
         };
     }
     let margin = dt / limit;

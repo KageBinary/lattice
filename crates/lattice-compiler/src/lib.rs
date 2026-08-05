@@ -60,6 +60,7 @@
 pub mod builtins;
 pub mod compile;
 pub mod eval;
+pub mod rigid;
 
 pub use compile::{compile, Compiled};
 pub use eval::Evaluator;

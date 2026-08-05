@@ -10,6 +10,7 @@ use crate::broadphase::{shape_lookup, world_bounds, BroadPhase};
 use crate::constraint::{Joint, JointSolver};
 use crate::contact::Contact;
 use crate::narrowphase::{generate_contacts, LINEAR_SLOP};
+use crate::math::Vec2;
 use crate::shape::{Collider, MassProperties, Shape, ShapeError};
 use crate::solver::{ContactSolver, SolveReport, SolverConfig};
 
@@ -60,7 +61,33 @@ pub struct RigidDomain {
     correction_drift: f64,
     /// Whether [`Domain::prepare`] has run since the last [`Domain::advance`].
     prepared: bool,
+
+    // --- Render tables ---------------------------------------------------------
+    /// Every registered shape's outline, body-local and concatenated.
+    ///
+    /// Built once per [`RigidDomain::register`] and borrowed unchanged thereafter — a
+    /// shape does not move in its own frame, so there is nothing per-step to redo.
+    outlines: Vec<[f64; 2]>,
+    /// Where each shape's outline begins in `outlines`, with a final end sentinel.
+    outline_starts: Vec<u32>,
+    /// Which outline each body slot wears, refreshed each step because slots move.
+    body_outline: Vec<u32>,
+    /// Which body slots are immovable, refreshed each step for the same reason.
+    body_static: Vec<bool>,
+    /// The last step's contacts, flattened for a viewer.
+    contact_x: Vec<f64>,
+    contact_y: Vec<f64>,
+    contact_nx: Vec<f64>,
+    contact_ny: Vec<f64>,
+    contact_depth: Vec<f64>,
 }
+
+/// Segments used to draw a circle.
+///
+/// A viewer would tessellate one anyway; doing it here means the render channel can be
+/// a flat vertex table and [`lattice_ir`] never has to know what a circle is. Twenty-four
+/// is smooth at any size a 2D scene is viewed at, and the error is under 1%.
+const CIRCLE_SEGMENTS: usize = 24;
 
 impl RigidDomain {
     /// A world named `name` with room for `capacity` bodies.
@@ -81,6 +108,17 @@ impl RigidDomain {
             last_joint_error: 0.0,
             correction_drift: 0.0,
             prepared: false,
+            outlines: Vec::new(),
+            // One sentinel, so an empty table is still well-formed: outline `i` spans
+            // `starts[i]..starts[i + 1]` and there are zero outlines.
+            outline_starts: vec![0],
+            body_outline: Vec::new(),
+            body_static: Vec::new(),
+            contact_x: Vec::new(),
+            contact_y: Vec::new(),
+            contact_nx: Vec::new(),
+            contact_ny: Vec::new(),
+            contact_depth: Vec::new(),
         }
     }
 
@@ -107,6 +145,8 @@ impl RigidDomain {
     /// Shapes are shared: a stack of fifty identical crates registers one shape and
     /// fifty bodies referencing it.
     pub fn register(&mut self, collider: Collider) -> ShapeId {
+        append_outline(&collider.shape, &mut self.outlines);
+        self.outline_starts.push(self.outlines.len() as u32);
         self.colliders.push(collider);
         ShapeId::from_index((self.colliders.len() - 1) as u32)
     }
@@ -200,9 +240,73 @@ impl RigidDomain {
         self.correction_drift = 0.0;
     }
 
+    /// True when nothing outside the bodies can add or remove momentum.
+    ///
+    /// Needs both: no gravity, because it injects momentum every step, and no static
+    /// bodies, because each is an infinite sink for whatever hits it. A closed world is
+    /// the only one whose total momentum is a conserved quantity, and it is the case
+    /// the module's collision validation runs in.
+    pub fn is_closed(&self) -> bool {
+        self.gravity == [0.0, 0.0] && (0..self.bodies.len()).all(|slot| !self.bodies.is_static(slot))
+    }
+
     /// The world-space bounding box of every body, for a viewer.
     pub fn bounds(&self) -> crate::shape::Aabb {
         world_bounds(&self.bodies, shape_lookup(&self.bodies, &self.colliders))
+    }
+}
+
+impl RigidDomain {
+    /// Copy this step's poses and contacts into the flat tables a viewer reads.
+    ///
+    /// Costs a handful of writes per body and per contact, against a contact list that
+    /// was just built from scratch — so it is strictly cheaper than the work that
+    /// produced it, and it makes contacts a published quantity rather than something a
+    /// debugger has to reach in and find.
+    fn refresh_render_tables(&mut self) {
+        let count = self.bodies.len();
+        self.body_outline.clear();
+        self.body_static.clear();
+        for slot in 0..count {
+            self.body_outline.push(self.bodies.shape()[slot].raw());
+            self.body_static.push(self.bodies.is_static(slot));
+        }
+
+        self.contact_x.clear();
+        self.contact_y.clear();
+        self.contact_nx.clear();
+        self.contact_ny.clear();
+        self.contact_depth.clear();
+        for contact in &self.contacts {
+            for point in contact.manifold.points() {
+                self.contact_x.push(point.position.x);
+                self.contact_y.push(point.position.y);
+                self.contact_nx.push(contact.manifold.normal.x);
+                self.contact_ny.push(contact.manifold.normal.y);
+                self.contact_depth.push(point.penetration);
+            }
+        }
+    }
+}
+
+/// Append a shape's closed outline, in body-local coordinates.
+fn append_outline(shape: &Shape, out: &mut Vec<[f64; 2]>) {
+    match shape {
+        Shape::Circle { radius } => {
+            for step in 0..CIRCLE_SEGMENTS {
+                let angle = core::f64::consts::TAU * step as f64 / CIRCLE_SEGMENTS as f64;
+                out.push([radius * angle.cos(), radius * angle.sin()]);
+            }
+        }
+        Shape::Polygon(polygon) => {
+            out.extend(polygon.vertices().iter().map(|v: &Vec2| v.to_array()));
+        }
+        // Two points, drawn as a degenerate outline. A segment has no interior, and
+        // filling one would draw a wall that is not there.
+        Shape::Segment { half_length } => {
+            out.push([-half_length, 0.0]);
+            out.push([*half_length, 0.0]);
+        }
     }
 }
 
@@ -251,6 +355,12 @@ static CONTRACT: SolverContract = SolverContract {
                 step than the thinnest obstacle it could pass through",
     conserves: &[Invariant::MomentumX, Invariant::MomentumY],
     known_non_conservation: &[
+        "momentum is conserved by the contact and joint solve — every impulse is applied \
+         equal and opposite — but NOT by a scene. Gravity injects momentum every step, \
+         and a static body is an infinite sink for it: a ball bouncing off the ground \
+         changes the total by twice its own. Total momentum is a conserved quantity only \
+         in a world with no gravity and no static bodies, and this module publishes it as \
+         an invariant only in exactly that case",
         "energy is not conserved and is not meant to be: restitution below 1 removes it \
          on purpose, and Coulomb friction removes it as heat that nothing here accounts \
          for. A scene with restitution 1 and no friction does conserve energy, and the \
@@ -394,6 +504,7 @@ impl Domain for RigidDomain {
 
         self.bodies.integrate_positions(dt);
 
+        self.refresh_render_tables();
         self.last_joint_error = self.joint_solver.max_error(&self.joints);
         self.last_report =
             SolveReport { points, iterations, residual, penetration, angular_drift };
@@ -401,28 +512,91 @@ impl Domain for RigidDomain {
         self.steps += 1;
     }
 
+    fn render_channels(&self) -> Vec<lattice_ir::RenderChannel<'_>> {
+        if self.bodies.is_empty() {
+            return Vec::new();
+        }
+        let bounds = self.bounds();
+        // A margin, so bodies resting exactly on the edge of the scene are not clipped
+        // in half by their own bounding box.
+        let (origin, extent) = if bounds.is_empty() {
+            ([0.0, 0.0], [1.0, 1.0])
+        } else {
+            let size = bounds.size();
+            let margin = [(size.x * 0.05).max(0.1), (size.y * 0.05).max(0.1)];
+            (
+                [bounds.min.x - margin[0], bounds.min.y - margin[1]],
+                [size.x + 2.0 * margin[0], size.y + 2.0 * margin[1]],
+            )
+        };
+
+        let mut channels = vec![lattice_ir::RenderChannel::Bodies {
+            name: &self.name,
+            x: self.bodies.pos_x(),
+            y: self.bodies.pos_y(),
+            cos: self.bodies.rot_cos(),
+            sin: self.bodies.rot_sin(),
+            outline: &self.body_outline,
+            vertices: &self.outlines,
+            starts: &self.outline_starts,
+            is_static: &self.body_static,
+            origin,
+            extent,
+        }];
+        if !self.contact_x.is_empty() {
+            channels.push(lattice_ir::RenderChannel::Contacts {
+                name: &self.name,
+                x: &self.contact_x,
+                y: &self.contact_y,
+                normal_x: &self.contact_nx,
+                normal_y: &self.contact_ny,
+                depth: &self.contact_depth,
+            });
+        }
+        channels
+    }
+
     fn observe(&self, out: &mut Observations) {
         let prefix = &self.name;
         let momentum = self.bodies.linear_momentum();
 
         out.record_metric(format!("{prefix}.count"), self.bodies.len() as f64, "1");
-        out.record_invariant(
-            format!("{prefix}.kinetic_energy"),
-            Invariant::KineticEnergy,
-            self.bodies.kinetic_energy(),
-        );
-        out.record_invariant(format!("{prefix}.momentum_x"), Invariant::MomentumX, momentum[0]);
-        out.record_invariant(format!("{prefix}.momentum_y"), Invariant::MomentumY, momentum[1]);
+        // A metric, not an invariant. Restitution and friction remove kinetic energy on
+        // purpose, gravity adds it, and nothing here tracks the gravitational potential
+        // that would complete the budget — so there is no energy this module conserves
+        // and none is claimed.
         out.record_metric(
-            format!("{prefix}.momentum_scale"),
-            self.bodies.momentum_scale(),
-            Invariant::MomentumX.si_unit(),
+            format!("{prefix}.kinetic_energy"),
+            self.bodies.kinetic_energy(),
+            Invariant::Energy.si_unit(),
         );
-        out.record_invariant(
-            format!("{prefix}.angular_momentum"),
-            Invariant::AngularMomentum,
-            self.bodies.angular_momentum(),
-        );
+
+        // Momentum is published as an *invariant* only in a scene where it actually is
+        // one. Gravity injects momentum every step and a static body absorbs whatever
+        // hits it, so in the ordinary case — a floor, a wall, and something falling —
+        // the total is supposed to change, and labelling it "conserved" would train a
+        // reader to ignore a diagnostic that is shouting on every model they write.
+        // A metric with the same name and unit carries exactly the same number; what
+        // changes is whether anything claims it should hold still.
+        let unit = Invariant::MomentumX.si_unit();
+        if self.is_closed() {
+            out.record_invariant(format!("{prefix}.momentum_x"), Invariant::MomentumX, momentum[0]);
+            out.record_invariant(format!("{prefix}.momentum_y"), Invariant::MomentumY, momentum[1]);
+            out.record_invariant(
+                format!("{prefix}.angular_momentum"),
+                Invariant::AngularMomentum,
+                self.bodies.angular_momentum(),
+            );
+        } else {
+            out.record_metric(format!("{prefix}.momentum_x"), momentum[0], unit);
+            out.record_metric(format!("{prefix}.momentum_y"), momentum[1], unit);
+            out.record_metric(
+                format!("{prefix}.angular_momentum"),
+                self.bodies.angular_momentum(),
+                Invariant::AngularMomentum.si_unit(),
+            );
+        }
+        out.record_metric(format!("{prefix}.momentum_scale"), self.bodies.momentum_scale(), unit);
         // The declared non-conservation, measured rather than described. A reader can
         // see how much angular momentum position correction actually spent.
         out.record_metric(
@@ -592,6 +766,56 @@ mod tests {
         ));
     }
 
+    /// The scene a reader actually writes has a floor and gravity, and its momentum is
+    /// *supposed* to change. Publishing it as a conserved quantity there would make the
+    /// diagnostics panel shout on every model and teach the reader to ignore it.
+    #[test]
+    fn momentum_is_an_invariant_only_in_a_world_that_conserves_it() {
+        // A floor and gravity: neither closed nor claiming to be.
+        let mut open = ground_and_crate();
+        stepped(&mut open, 200);
+        assert!(!open.is_closed());
+        let mut out = Observations::new();
+        open.observe(&mut out);
+        assert!(matches!(out.get("scene.momentum_x").unwrap().kind, ObservationKind::Metric));
+        assert!(
+            matches!(out.get("scene.angular_momentum").unwrap().kind, ObservationKind::Metric),
+            "position correction and gravity both move it"
+        );
+
+        // Two discs colliding in free space: closed, and it says so.
+        let mut closed = RigidDomain::new("scene", 4).with_gravity([0.0, 0.0]);
+        let disc = closed.register(Collider::new(Shape::circle(0.5).unwrap()));
+        closed.spawn_with_mass(BodySpec::at([-2.0, 0.0], disc).with_velocity([1.0, 0.0]), 1.0);
+        closed.spawn_with_mass(BodySpec::at([2.0, 0.0], disc).with_velocity([-1.0, 0.0]), 1.0);
+        assert!(closed.is_closed());
+
+        let mut out = Observations::new();
+        closed.observe(&mut out);
+        assert!(matches!(
+            out.get("scene.momentum_x").unwrap().kind,
+            ObservationKind::Invariant(Invariant::MomentumX)
+        ));
+
+        // The number and its unit are the same either way; only the claim changes.
+        assert_eq!(out.get("scene.momentum_x").unwrap().unit, "kg·m/s");
+        let mut closed_out = Observations::new();
+        closed.observe(&mut closed_out);
+        assert_eq!(closed_out.value("scene.momentum_x"), Some(0.0));
+    }
+
+    /// A static body alone is enough to break it, even with no gravity: a wall absorbs
+    /// whatever hits it.
+    #[test]
+    fn a_single_wall_makes_a_world_open() {
+        let mut world = RigidDomain::new("scene", 4).with_gravity([0.0, 0.0]);
+        let disc = world.register(Collider::new(Shape::circle(0.5).unwrap()));
+        world.spawn_with_mass(BodySpec::at([0.0, 0.0], disc), 1.0);
+        assert!(world.is_closed());
+        world.spawn(BodySpec::statik([5.0, 0.0], disc));
+        assert!(!world.is_closed(), "a wall is an infinite momentum sink");
+    }
+
     /// The declared non-conservation is measured, not described.
     #[test]
     fn the_correction_drift_is_reported_and_starts_at_zero() {
@@ -693,6 +917,110 @@ mod tests {
         // ...and swing back up nearly to where it started, because a pin joint and a
         // symplectic integrator between them lose very little.
         assert!(highest > -0.05, "it only came back up to {highest}");
+    }
+
+    /// The outline table has to describe the shape a body actually wears, in world
+    /// coordinates, or the picture and the physics disagree — which is the one failure
+    /// mode a viewer cannot help you find.
+    #[test]
+    fn the_body_channel_draws_the_shape_the_body_wears() {
+        let mut world = RigidDomain::new("scene", 4);
+        let boxy = world.register(Collider::new(Shape::rectangle(2.0, 1.0).unwrap()));
+        let disc = world.register(Collider::new(Shape::circle(0.5).unwrap()));
+        world.spawn(BodySpec::statik([10.0, 5.0], boxy));
+        world.spawn_with_mass(BodySpec::at([0.0, 0.0], disc), 1.0);
+        stepped(&mut world, 1);
+
+        let channels = world.render_channels();
+        let bodies = channels
+            .iter()
+            .find(|c| matches!(c, lattice_ir::RenderChannel::Bodies { .. }))
+            .expect("a rigid domain must publish its bodies");
+
+        let mut outline = Vec::new();
+        bodies.body_outline(0, &mut outline);
+        assert_eq!(outline.len(), 4, "a box is four corners");
+        // Placed at (10, 5) with half-extents 2 x 1, so the corners are (8..12, 4..6).
+        let xs: Vec<f64> = outline.iter().map(|p| p[0]).collect();
+        let ys: Vec<f64> = outline.iter().map(|p| p[1]).collect();
+        assert!((xs.iter().copied().fold(f64::MAX, f64::min) - 8.0).abs() < 1e-9, "{outline:?}");
+        assert!((xs.iter().copied().fold(f64::MIN, f64::max) - 12.0).abs() < 1e-9, "{outline:?}");
+        assert!((ys.iter().copied().fold(f64::MAX, f64::min) - 4.0).abs() < 1e-9, "{outline:?}");
+        assert!((ys.iter().copied().fold(f64::MIN, f64::max) - 6.0).abs() < 1e-9, "{outline:?}");
+
+        // The circle is tessellated, and every vertex is on its rim — measured from
+        // where the body *is*, which after a step of gravity is no longer the origin.
+        bodies.body_outline(1, &mut outline);
+        assert!(outline.len() > 8, "a circle needs enough segments to look round");
+        let centre = [world.bodies().pos_x()[1], world.bodies().pos_y()[1]];
+        for point in &outline {
+            let radius = (point[0] - centre[0]).hypot(point[1] - centre[1]);
+            assert!((radius - 0.5).abs() < 1e-9, "{point:?} is not on the rim about {centre:?}");
+        }
+
+        // Out of range asks nothing and returns nothing.
+        bodies.body_outline(99, &mut outline);
+        assert!(outline.is_empty());
+    }
+
+    /// A rotated body's outline must rotate with it. Publishing body-local vertices and
+    /// forgetting to apply the pose draws a scene where nothing ever turns.
+    #[test]
+    fn a_rotated_body_draws_rotated() {
+        let mut world = RigidDomain::new("scene", 2).with_gravity([0.0, 0.0]);
+        let bar = world.register(Collider::new(Shape::rectangle(1.0, 0.1).unwrap()));
+        world.spawn(
+            BodySpec::statik([0.0, 0.0], bar).with_angle(core::f64::consts::FRAC_PI_2),
+        );
+        stepped(&mut world, 1);
+
+        let channels = world.render_channels();
+        let mut outline = Vec::new();
+        channels[0].body_outline(0, &mut outline);
+        // A quarter turn makes the 2 x 0.2 bar 0.2 wide and 2 tall.
+        let width = outline.iter().map(|p| p[0]).fold(f64::MIN, f64::max)
+            - outline.iter().map(|p| p[0]).fold(f64::MAX, f64::min);
+        let height = outline.iter().map(|p| p[1]).fold(f64::MIN, f64::max)
+            - outline.iter().map(|p| p[1]).fold(f64::MAX, f64::min);
+        assert!((width - 0.2).abs() < 1e-9, "width {width}");
+        assert!((height - 2.0).abs() < 1e-9, "height {height}");
+    }
+
+    /// Contacts are published, because a contact solver whose contacts cannot be seen
+    /// presents every failure — jitter, sinking, sticking — as the same symptom.
+    #[test]
+    fn contacts_are_published_with_their_normals() {
+        let mut world = ground_and_crate();
+        stepped(&mut world, 2000);
+
+        let channels = world.render_channels();
+        let contacts = channels
+            .iter()
+            .find_map(|c| match c {
+                lattice_ir::RenderChannel::Contacts { x, y, normal_x, normal_y, depth, .. } => {
+                    Some((*x, *y, *normal_x, *normal_y, *depth))
+                }
+                _ => None,
+            })
+            .expect("a resting crate is in contact with the ground");
+
+        let (x, y, nx, ny, depth) = contacts;
+        assert_eq!(x.len(), 2, "a box resting flat touches at two points");
+        assert_eq!(y.len(), x.len());
+        for index in 0..x.len() {
+            // The ground is body 0 and the crate is body 1, so the normal points up.
+            assert!(ny[index] > 0.9, "normal ({}, {}) should point up", nx[index], ny[index]);
+            assert!((nx[index].hypot(ny[index]) - 1.0).abs() < 1e-9, "normals must be unit");
+            assert!(depth[index] >= 0.0 && depth[index] < PENETRATION_ALARM);
+            // The contact is at the crate's underside, near y = 0.5.
+            assert!((y[index] - 0.5).abs() < 0.05, "contact at y = {}", y[index]);
+        }
+    }
+
+    #[test]
+    fn a_world_with_no_bodies_publishes_no_channels() {
+        let world = RigidDomain::new("empty", 4);
+        assert!(world.render_channels().is_empty());
     }
 
     #[test]

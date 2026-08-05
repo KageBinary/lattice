@@ -1,0 +1,22 @@
+// expect: E0208
+// A joint whose kind is a typo would otherwise be silently dropped, and the model
+// would run with the linkage missing — which looks like a solver that lets go.
+
+project unknown_joint_kind {
+  body anchor {
+    shape:  circle(0.1 meter);
+    motion: static;
+  }
+
+  body bob {
+    shape: circle(0.2 meter);
+    at:    [1 meter, 0 meter];
+  }
+
+  joint arm {
+    kind:   hinge;
+    bodies: [anchor, bob];
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

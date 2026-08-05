@@ -97,34 +97,86 @@ Delivered:
   `momentum_scale = Σ|mᵢvᵢ|` for exactly this, and the viewer states which denominator
   it used rather than leaving a reader to guess.
 
-## M2 — Mechanics and fields (next)
+## M2 — Mechanics and fields ✅
 
 **Spec exit condition:** *"canonical validation suite passes"* for particles, simple
-rigid bodies, fields, diffusion and observers.
+rigid bodies, fields, diffusion and observers. 33 of 33 cases pass.
+
+Delivered:
+
+- **`lattice-domain-rigid2d`** — circles, boxes, convex polygons and segments; forces,
+  torques and impulses; sweep-and-prune broadphase, separating-axis narrowphase,
+  Coulomb friction and restitution; distance, rope, pin, spring and motor joints
+  (§11.1's MVP row, complete). Contacts are resolved by sequential impulses with warm
+  starting, and joints are solved in the same interleaved sweep so the two sets
+  negotiate rather than alternate.
+- **`lattice-ir` additions** — `RigidBodyStore`, the rotational counterpart of
+  `ParticleStore`; a `runtime_id!` macro so `BodyId` and `ParticleId` share one
+  generation-checked implementation; `RenderChannel::Bodies` and
+  `RenderChannel::Contacts`.
+- **Collision validation** — §19.2's elastic and inelastic collision and constrained
+  motion, the rows M0 had to leave out. Elastic gives exactly ∓2.000000 m/s; inelastic
+  leaves exactly the 2.000000 J momentum conservation predicts; the pendulum period is
+  2.006250 s against an analytic 2.006409 s; a block on a 0.4 rad slope slides 24.03 m
+  at μ = 0.338 and 0.0000 m at μ = 0.507.
+- **`material`, `body` and `joint` declarations** — the §8.2 material concept, which
+  rigid bodies are the first real consumer of. No grammar change was needed: the
+  generic `<kind> <name> { … }` form already parsed them.
+- **Viewer support** — body outlines, static bodies drawn as scenery, contact points
+  and normals drawn over the geometry they belong to.
+
+757 tests. Clippy clean.
+
+### What M2 taught us
+
+- **A contract that overclaims is worse than no contract.** The rigid module first
+  declared momentum conserved, full stop. It is — under the impulse solve. It is not
+  under gravity, which injects momentum every step, or against a static body, which is
+  an infinite sink for it. Every realistic scene tripped the alarm, and an alarm that
+  fires on every correct run is one a reader learns to ignore. The domain now publishes
+  momentum as an invariant *only* in a world with no gravity and no static bodies, and
+  says so in the panel when it does not.
+- **The same trap caught the particle module.** Kinetic and potential energy were both
+  published as invariants; only their sum is one. A gas melting out of a lattice
+  converts one into the other *on purpose*. Fixed in both, and the reason is now
+  written on `ObservationKind` where the next domain will read it.
+- **The viewer must read the claim, not guess it.** It decided "should this be
+  conserved?" by matching names — `momentum_x`, `total_energy`. That guess cannot
+  distinguish a closed world from an open one. It now reads the `ObservationKind` the
+  domain published, which is the domain's own promise.
+- **Position correction is not free, and the amount is measurable.** Moving a body
+  without changing its velocity changes its angular momentum about any fixed origin by
+  `dt·(J × Δv)`. No scheme avoids it. It is measured every step and published as
+  `correction_drift`, which is a better answer than the word "small".
+- **A 2×2 matters.** The pin joint first solved x and y as independent scalars.
+  Convergence is set by the ratio of the two effective masses, and for a pendulum bob
+  that ratio is enormous — the period came out eight times too fast. Inverting the 2×2
+  fixed it in one iteration.
+
+## M3 — Chemistry (next)
+
+**Spec exit condition:** reaction networks, reaction-diffusion, heat coupling, ledger.
 
 Needed:
 
-1. **`lattice-domain-rigid2d`** — circles, boxes and convex polygons; forces, torques
-   and impulses; a broadphase grid or BVH, narrowphase contacts, friction and
-   restitution; distance, pin, spring and motor constraints (§11.1).
-2. **Collision validation** — §19.2's elastic and inelastic collision cases, which M0
-   deliberately left out because the rigid module did not exist.
-3. **`material` declarations** — the §8.2 material concept, which rigid bodies are the
-   first real consumer of.
+1. **`lattice-domain-chemistry`** — reaction networks with mass-action kinetics, the
+   Gillespie algorithm, and reaction-diffusion (§11.9, §19.2's Gray–Scott row).
+2. **The coupling scheduler** — `couple` blocks, typed ports, and convergence (§14).
+   The conservation ledger that will account for the transfers already exists in
+   `lattice-ir` and is unused.
+3. **The §20.3 flagship demo** — a reacting chamber: chemistry driving heat driving
+   flow, with the ledger balancing.
 4. **CPU parallelism** — §15.3 asks for parallel iterators over independent operations.
-   The operation graph already computes which operations those are and reports the
-   ideal speedup; nothing consumes that yet.
-5. **Viewer support for the new domain** — bodies, contacts and constraint forces are
-   §17 render channels that do not exist yet. A rigid-body module whose contacts cannot
-   be seen fails the same standard M2 is being held to.
+   The operation graph already computes which those are and reports the ideal speedup;
+   nothing consumes it yet. Deferred from M2 because a single rigid domain has nothing
+   to parallelize *across*; a coupled model does.
 
 ## Later milestones
 
 | Milestone | Result | Blocked on |
 |---|---|---|
-| M3 — Chemistry | reaction networks, reaction-diffusion, heat coupling, ledger | M2; the ledger and coupling diagnostics are already built |
 | M4 — Portable GPU | `wgpu` compute, kernel cache, zero-copy rendering | the operation graph, which exists |
-| M5 — Molecular and quantum | LJ MD proper, bonds, `quantum2d` | M2 |
+| M5 — Molecular and quantum | LJ MD proper, bonds, `quantum2d` | M2, done |
 | M6 — Extensibility | expression compiler (§8.3), Python API, plugin SDK | M1, done |
 | M7 — Productization | packages, report export, reproducibility artifacts | M3 |
 | M8 — External solvers | quantum/FMI adapters with provenance | M7 |

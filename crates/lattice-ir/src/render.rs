@@ -46,13 +46,78 @@ pub enum RenderChannel<'a> {
         /// View size, m.
         extent: [f64; 2],
     },
+    /// Rigid bodies: poses plus the closed outlines they wear.
+    ///
+    /// # Why an outline table rather than a shape
+    ///
+    /// This crate holds no physics, so it cannot name a circle or a convex polygon —
+    /// those types live in the domain crate, which depends on this one and not the
+    /// reverse. Handing over a flat table of body-local vertices keeps that direction
+    /// intact and costs nothing: the table is built once when a shape is registered
+    /// and borrowed unchanged thereafter, while the poses come straight out of the
+    /// store's arrays. A circle arrives already tessellated, which is what a renderer
+    /// would have done with it anyway.
+    Bodies {
+        /// Channel name.
+        name: &'a str,
+        /// Centre-of-mass x, m.
+        x: &'a [f64],
+        /// Centre-of-mass y, m.
+        y: &'a [f64],
+        /// Cosine of each body's orientation.
+        cos: &'a [f64],
+        /// Sine of each body's orientation.
+        sin: &'a [f64],
+        /// Which outline each body wears, as an index into `starts`.
+        outline: &'a [u32],
+        /// Every outline's vertices, body-local and concatenated.
+        vertices: &'a [[f64; 2]],
+        /// Where each outline begins in `vertices`, with a final end sentinel.
+        ///
+        /// Outline `i` occupies `vertices[starts[i] .. starts[i + 1]]`, so `starts` has
+        /// one more entry than there are outlines.
+        starts: &'a [u32],
+        /// True for each body that no impulse can move.
+        ///
+        /// Drawn differently, because "why is the ground falling" and "why is the crate
+        /// not falling" are the two questions a rigid scene provokes, and both are
+        /// answered by seeing which bodies are static.
+        is_static: &'a [bool],
+        /// Lower-left corner of the view, m.
+        origin: [f64; 2],
+        /// View size, m.
+        extent: [f64; 2],
+    },
+    /// Contact points and their normals.
+    ///
+    /// §17 asks for constraints and forces to be visible. A contact solver whose
+    /// contacts cannot be seen is the hardest kind of code to debug: every symptom —
+    /// jitter, sinking, sticking — looks the same from outside, and looks completely
+    /// different once the normals are on screen.
+    Contacts {
+        /// Channel name.
+        name: &'a str,
+        /// Contact point x, m.
+        x: &'a [f64],
+        /// Contact point y, m.
+        y: &'a [f64],
+        /// Normal x component, unit.
+        normal_x: &'a [f64],
+        /// Normal y component, unit.
+        normal_y: &'a [f64],
+        /// Overlap along the normal, m. Zero for a resting contact.
+        depth: &'a [f64],
+    },
 }
 
 impl RenderChannel<'_> {
     /// The channel's name.
     pub fn name(&self) -> &str {
         match self {
-            RenderChannel::Scalar { name, .. } | RenderChannel::Particles { name, .. } => name,
+            RenderChannel::Scalar { name, .. }
+            | RenderChannel::Particles { name, .. }
+            | RenderChannel::Bodies { name, .. }
+            | RenderChannel::Contacts { name, .. } => name,
         }
     }
 
@@ -63,6 +128,11 @@ impl RenderChannel<'_> {
                 format!("{}x{} scalar field in {unit}", field.nx(), field.ny())
             }
             RenderChannel::Particles { x, .. } => format!("{} particle positions", x.len()),
+            RenderChannel::Bodies { x, is_static, .. } => {
+                let statics = is_static.iter().filter(|s| **s).count();
+                format!("{} rigid bodies ({statics} static)", x.len())
+            }
+            RenderChannel::Contacts { x, .. } => format!("{} contact points", x.len()),
         }
     }
 
@@ -76,6 +146,41 @@ impl RenderChannel<'_> {
             RenderChannel::Particles { x, y, .. } => {
                 x.iter().chain(y.iter()).any(|v| !v.is_finite())
             }
+            RenderChannel::Bodies { x, y, cos, sin, .. } => {
+                x.iter().chain(*y).chain(*cos).chain(*sin).any(|v| !v.is_finite())
+            }
+            RenderChannel::Contacts { x, y, normal_x, normal_y, depth, .. } => x
+                .iter()
+                .chain(*y)
+                .chain(*normal_x)
+                .chain(*normal_y)
+                .chain(*depth)
+                .any(|v| !v.is_finite()),
+        }
+    }
+
+    /// The vertices of one body's outline, in world coordinates.
+    ///
+    /// Returns nothing for a channel that is not [`RenderChannel::Bodies`], or for an
+    /// index past the end — a viewer iterating bodies should not have to bounds-check
+    /// a table it did not build.
+    pub fn body_outline(&self, index: usize, out: &mut Vec<[f64; 2]>) {
+        out.clear();
+        let RenderChannel::Bodies { x, y, cos, sin, outline, vertices, starts, .. } = self else {
+            return;
+        };
+        if index >= x.len() {
+            return;
+        }
+        let Some(&slot) = outline.get(index) else { return };
+        let (Some(&from), Some(&to)) =
+            (starts.get(slot as usize), starts.get(slot as usize + 1))
+        else {
+            return;
+        };
+        let (c, s) = (cos[index], sin[index]);
+        for &[vx, vy] in &vertices[from as usize..to as usize] {
+            out.push([x[index] + c * vx - s * vy, y[index] + s * vx + c * vy]);
         }
     }
 }

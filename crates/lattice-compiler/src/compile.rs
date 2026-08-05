@@ -23,17 +23,21 @@
 use std::collections::BTreeMap;
 
 use lattice_domain_grid2d::{Diffusivity, HeatDomain, TimeScheme};
+use lattice_domain_rigid2d::{Collider, RigidDomain, SolverConfig};
+
+use crate::rigid;
 use lattice_domain_particle::{
     BoundaryBox, HarmonicWell, Integrator, LennardJones, LinearDrag, ParticleBoundary,
     ParticleDomain, ParticleSpec, UniformAcceleration,
 };
 use lattice_ir::{
-    BoundarySet, BufferKind, BufferPlan, CompiledModel, Domain, DomainId, DomainSpec,
+    BodySpec, BoundarySet, BufferKind, BufferPlan, CompiledModel, Domain, DomainId, DomainSpec,
     FidelityProfile, Grid2d, ObserverId, ObserverSpec, Operation, OperationGraph, OperationKind,
     Pcg32, Precision, Side, VisualSpec,
 };
 use lattice_syntax::{
-    Decl, Diagnostic, Diagnostics, Expr, FieldDecl, Ident, Project, SolveStmt, SourceFile, Span,
+    Decl, Diagnostic, Diagnostics, Expr, ExprKind, FieldDecl, Ident, Project, SolveStmt, SourceFile,
+    Span,
 };
 use lattice_units::{Dimension, UnitRegistry};
 
@@ -132,7 +136,38 @@ struct Compiler<'a> {
     grids: BTreeMap<String, GridInfo>,
     fields: BTreeMap<String, FieldInfo>,
     particles: BTreeMap<String, ParticlesInfo>,
+    materials: BTreeMap<String, rigid::Material>,
+    /// Bodies in declaration order, which is the order they take slots in.
+    bodies: Vec<rigid::BodyPlan>,
+    /// How many `body` declarations were *seen*, including those that failed to build.
+    ///
+    /// Kept separately so a scene whose bodies were all rejected reports the rejections
+    /// and not a second, misleading "this world has no bodies" on top of them.
+    declared_bodies: usize,
+    joints: Vec<rigid::JointPlan>,
+    /// Settings from an optional `domain rigid2d <name> { … }` block.
+    worlds: BTreeMap<String, RigidWorld>,
+    /// True once a `solve rigid(…)` has consumed the bodies.
+    bodies_solved: bool,
     notes: Vec<String>,
+}
+
+/// Settings for a rigid world, from `domain rigid2d <name> { … }`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct RigidWorld {
+    gravity: [f64; 2],
+    iterations: usize,
+    span: Span,
+}
+
+impl Default for RigidWorld {
+    fn default() -> Self {
+        RigidWorld {
+            gravity: [0.0, -lattice_units::constants::value::STANDARD_GRAVITY],
+            iterations: SolverConfig::default().velocity_iterations,
+            span: Span::new(0, 0),
+        }
+    }
 }
 
 impl<'a> Compiler<'a> {
@@ -144,6 +179,12 @@ impl<'a> Compiler<'a> {
             grids: BTreeMap::new(),
             fields: BTreeMap::new(),
             particles: BTreeMap::new(),
+            materials: BTreeMap::new(),
+            bodies: Vec::new(),
+            declared_bodies: 0,
+            joints: Vec::new(),
+            worlds: BTreeMap::new(),
+            bodies_solved: false,
             notes: Vec::new(),
         }
     }
@@ -167,6 +208,21 @@ impl<'a> Compiler<'a> {
         }
         for decl in project.declarations_of("particles") {
             self.declare_particles(decl);
+        }
+        // Materials, then bodies, then joints: each refers to the one before it by
+        // name, and resolving forward references would buy nothing but the ability to
+        // write a scene in a confusing order.
+        for domain in project.domains().filter(|d| d.family.text == "rigid2d") {
+            self.declare_rigid_world(domain);
+        }
+        for decl in project.declarations_of("material") {
+            self.declare_material(decl);
+        }
+        for decl in project.declarations_of("body") {
+            self.declare_body(decl);
+        }
+        for decl in project.declarations_of("joint") {
+            self.declare_joint(decl);
         }
         for field in project.fields() {
             self.declare_field(field, false);
@@ -763,10 +819,10 @@ impl<'a> Compiler<'a> {
     // --- unsupported constructs ---------------------------------------------
 
     fn reject_unsupported(&mut self, project: &Project) {
-        const KNOWN_KINDS: &[&str] = &["grid", "particles"];
+        const KNOWN_KINDS: &[&str] =
+            &["grid", "particles", "material", "body", "joint"];
         const PLANNED: &[(&str, &str, &str)] = &[
             ("reaction", "M3", "chemical reaction networks"),
-            ("material", "M2", "material property sets"),
             ("potential", "M5", "quantum potentials"),
             ("wavepacket", "M5", "quantum wave packets"),
             ("detector", "M5", "detectors"),
@@ -809,9 +865,12 @@ impl<'a> Compiler<'a> {
         }
 
         for domain in project.domains() {
+            // `rigid2d` was handled by `declare_rigid_world`.
+            if domain.family.text == "rigid2d" {
+                continue;
+            }
             let milestone = match domain.family.text.as_str() {
                 "quantum2d" => "M5",
-                "rigid2d" => "M2",
                 "fluid2d" => "M2",
                 _ => {
                     self.error(
@@ -858,6 +917,20 @@ impl<'a> Compiler<'a> {
             );
         }
 
+        if !self.bodies.is_empty() && !self.bodies_solved {
+            let span = self.bodies[0].span;
+            let count = self.bodies.len();
+            self.error(
+                Diagnostic::warning(format!(
+                    "{count} bodies are declared but no `solve rigid` names a world"
+                ))
+                .with_code("W0303")
+                .at(span, "declared here")
+                .note("they will sit where they were placed for the whole run")
+                .help("add `solve rigid(world) with sequential_impulse(dt = 0.008 second);`"),
+            );
+        }
+
         let unsolved_particles: Vec<(String, Span)> = self
             .particles
             .values()
@@ -871,6 +944,127 @@ impl<'a> Compiler<'a> {
                     .at(span, "no `solve` statement names this")
                     .help(format!("add `solve dynamics({name}) with velocity_verlet(dt=…);`")),
             );
+        }
+    }
+
+    // --- rigid bodies --------------------------------------------------------
+
+    fn declare_rigid_world(&mut self, decl: &lattice_syntax::DomainDecl) {
+        if let Some(existing) = self.worlds.get(&decl.name.text) {
+            let previous = existing.span;
+            self.error(
+                Diagnostic::error(format!("rigid world `{}` is declared twice", decl.name.text))
+                    .with_code("E0201")
+                    .at(decl.name.span, "redeclared here")
+                    .also(previous, "first declared here"),
+            );
+            return;
+        }
+
+        const ALLOWED: &[&str] = &["gravity", "iterations"];
+        for setting in &decl.settings {
+            if !ALLOWED.contains(&setting.key.text.as_str()) {
+                self.error(
+                    Diagnostic::error(format!(
+                        "a rigid2d domain has no setting called `{}`",
+                        setting.key.text
+                    ))
+                    .with_code("E0204")
+                    .at(setting.key.span, "unknown setting")
+                    .help(format!("rigid2d accepts: {}", ALLOWED.join(", "))),
+                );
+            }
+        }
+
+        let evaluator = self.evaluator();
+        let mut world = RigidWorld { span: decl.name.span, ..RigidWorld::default() };
+
+        if let Some(setting) = decl.setting("gravity") {
+            // Either a vector or a downward magnitude, matching how the particle
+            // module's `gravity(…)` force reads its argument.
+            world.gravity = if matches!(setting.value.kind, ExprKind::List(_) | ExprKind::Tuple(_)) {
+                evaluator
+                    .pair(&setting.value, Dimension::ACCELERATION, "`gravity`", &mut self.diagnostics)
+                    .unwrap_or(world.gravity)
+            } else {
+                evaluator
+                    .require(&setting.value, Dimension::ACCELERATION, "`gravity`", &mut self.diagnostics)
+                    .map_or(world.gravity, |magnitude| [0.0, -magnitude])
+            };
+        }
+        if let Some(setting) = decl.setting("iterations") {
+            if let Some(count) =
+                evaluator.count(&setting.value, "`iterations`", &mut self.diagnostics)
+            {
+                if count == 0 {
+                    self.error(
+                        Diagnostic::error("a contact solve needs at least one iteration")
+                            .with_code("E0405")
+                            .at(setting.value.span, "zero iterations")
+                            .note("with none, contacts are found and then ignored"),
+                    );
+                } else {
+                    world.iterations = count;
+                }
+            }
+        }
+
+        self.worlds.insert(decl.name.text.clone(), world);
+    }
+
+    fn declare_material(&mut self, decl: &Decl) {
+        if let Some(existing) = self.materials.get(&decl.name.text) {
+            let previous = existing.span;
+            self.error(
+                Diagnostic::error(format!("material `{}` is declared twice", decl.name.text))
+                    .with_code("E0201")
+                    .at(decl.name.span, "redeclared here")
+                    .also(previous, "first declared here")
+                    .help("give one of them a different name, or remove the duplicate"),
+            );
+            return;
+        }
+        self.check_settings(decl, rigid::MATERIAL_SETTINGS);
+        let evaluator = self.evaluator();
+        let material = rigid::material(decl, &evaluator, &mut self.diagnostics);
+        self.materials.insert(decl.name.text.clone(), material);
+    }
+
+    fn declare_body(&mut self, decl: &Decl) {
+        if let Some(existing) = self.bodies.iter().find(|b| b.name == decl.name.text) {
+            let previous = existing.span;
+            self.error(
+                Diagnostic::error(format!("body `{}` is declared twice", decl.name.text))
+                    .with_code("E0201")
+                    .at(decl.name.span, "redeclared here")
+                    .also(previous, "first declared here")
+                    .help("give one of them a different name, or remove the duplicate"),
+            );
+            return;
+        }
+        self.check_settings(decl, rigid::BODY_SETTINGS);
+        self.declared_bodies += 1;
+        let evaluator = self.evaluator();
+        if let Some(plan) = rigid::body(decl, &self.materials, &evaluator, &mut self.diagnostics) {
+            self.bodies.push(plan);
+        }
+    }
+
+    fn declare_joint(&mut self, decl: &Decl) {
+        if let Some(existing) = self.joints.iter().find(|j| j.name == decl.name.text) {
+            let previous = existing.span;
+            self.error(
+                Diagnostic::error(format!("joint `{}` is declared twice", decl.name.text))
+                    .with_code("E0201")
+                    .at(decl.name.span, "redeclared here")
+                    .also(previous, "first declared here"),
+            );
+            return;
+        }
+        self.check_settings(decl, rigid::JOINT_SETTINGS);
+        let evaluator = self.evaluator();
+        if let Some(plan) = rigid::joint(decl, &evaluator, &mut self.diagnostics) {
+            self.joints.push(plan);
         }
     }
 
@@ -891,6 +1085,7 @@ impl<'a> Compiler<'a> {
                     self.lower_dynamics(&target.value, &method, out);
                 }
             }
+            "rigid" | "bodies" | "contacts" => self.lower_rigid(solve, &method, out),
             other => {
                 let planned = match other {
                     "reactions" | "kinetics" => Some("M3"),
@@ -908,7 +1103,7 @@ impl<'a> Compiler<'a> {
                         Diagnostic::error(format!("`{other}` is not a known solver"))
                             .with_code("E0206")
                             .at(solve.solver.span, "unknown solver")
-                            .help("available now: heat, diffusion, transport, dynamics"),
+                            .help("available now: heat, diffusion, transport, dynamics, rigid"),
                     ),
                 }
             }
@@ -1201,6 +1396,211 @@ impl<'a> Compiler<'a> {
         out.domains.push(Box::new(domain));
     }
 
+    /// Turn every `body` and `joint` declaration into one rigid world.
+    ///
+    /// All bodies in a project join a single world. Two independent rigid worlds in one
+    /// model would need bodies to say which they belong to, and nothing yet wants that
+    /// — spec §14 puts interaction between domains in a `couple`, not in a shared body
+    /// list.
+    fn lower_rigid(&mut self, solve: &SolveStmt, method: &builtins::Method, out: &mut Lowering) {
+        let Some(target) = solve.targets.first() else {
+            return;
+        };
+        let Some(name) = target.value.as_name() else {
+            self.error(
+                Diagnostic::error("a rigid solver target must be a world name")
+                    .with_code("E0401")
+                    .at(target.value.span, "not a name")
+                    .help("write `solve rigid(world) with sequential_impulse(dt = 0.008 second);`"),
+            );
+            return;
+        };
+        if solve.targets.len() > 1 {
+            self.error(
+                Diagnostic::error("a rigid solve names one world")
+                    .with_code("E0401")
+                    .at(solve.targets[1].value.span, "extra target")
+                    .note("every declared body joins a single world"),
+            );
+        }
+
+        match method.name.as_str() {
+            "sequential_impulse" | "impulse" | "contacts" => {}
+            other => {
+                self.error(
+                    Diagnostic::error(format!("`{other}` is not a method for rigid bodies"))
+                        .with_code("E0207")
+                        .at(method.span, "unknown method")
+                        .note(
+                            "a sequential-impulse solver assumes semi-implicit Euler; offering \
+                             an alternative would be offering something that does not work",
+                        )
+                        .help("use `sequential_impulse(dt = …)`"),
+                );
+                return;
+            }
+        }
+
+        if self.bodies.is_empty() {
+            // Only when there were none to begin with. If every body was rejected, the
+            // reader already has a reason for each, and a second error saying the world
+            // is empty is a consequence rather than a cause.
+            if self.declared_bodies == 0 {
+                self.error(
+                    Diagnostic::error(format!("rigid world `{name}` has no bodies"))
+                        .with_code("E0203")
+                        .at(target.value.span, "nothing to solve")
+                        .help(
+                            "declare one with `body ground { shape: box(10 meter, 0.5 meter); }`",
+                        ),
+                );
+            }
+            return;
+        }
+
+        // A `domain rigid2d` block is optional; without one the world takes standard
+        // gravity and the solver's own defaults.
+        let settings = match self.worlds.get(name) {
+            Some(world) => *world,
+            None => {
+                if !self.worlds.is_empty() {
+                    let known: Vec<&str> = self.worlds.keys().map(String::as_str).collect();
+                    self.error(
+                        Diagnostic::error(format!("there is no rigid world called `{name}`"))
+                            .with_code("E0202")
+                            .at(target.value.span, "unknown world")
+                            .help(format!("declared worlds: {}", known.join(", "))),
+                    );
+                    return;
+                }
+                self.notes.push(format!(
+                    "rigid world `{name}` uses standard gravity; add \
+                     `domain rigid2d {name} {{ gravity: …; }}` to change it"
+                ));
+                RigidWorld::default()
+            }
+        };
+
+        let mut world = RigidDomain::new(name.to_string(), self.bodies.len())
+            .with_gravity(settings.gravity)
+            .with_solver(SolverConfig {
+                velocity_iterations: settings.iterations,
+                ..SolverConfig::default()
+            });
+        if let Some(dt) = method.timestep {
+            world = world.with_preferred_step(dt);
+        }
+
+        // Bodies take slots in declaration order, so a reader can match the report to
+        // the source by counting down the file.
+        let mut slots: BTreeMap<String, usize> = BTreeMap::new();
+        let plans = std::mem::take(&mut self.bodies);
+        for plan in &plans {
+            let shape = world.register(
+                Collider::new(plan.shape.clone())
+                    .with_restitution(plan.material.restitution)
+                    .with_friction(plan.material.friction),
+            );
+            let spec = BodySpec {
+                position: plan.at,
+                angle: plan.angle,
+                velocity: plan.velocity,
+                angular_velocity: plan.spin,
+                shape,
+                ..BodySpec::default()
+            };
+            let id = if plan.is_static {
+                world.spawn(BodySpec { mass: 0.0, inertia: 0.0, ..spec })
+            } else if let Some(mass) = plan.mass {
+                world.spawn_with_mass(spec, mass)
+            } else {
+                world.spawn_with_density(spec, plan.material.density)
+            };
+            let Some(id) = id else {
+                self.error(
+                    Diagnostic::error(format!("body `{}` did not fit in the world", plan.name))
+                        .with_code("E0405")
+                        .at(plan.span, "no room"),
+                );
+                continue;
+            };
+            let slot = world.slot_of(id).expect("just spawned");
+
+            // A dynamic body with no mass cannot be moved, and the model almost
+            // certainly meant something else.
+            if !plan.is_static && world.bodies().is_static(slot) {
+                self.error(
+                    Diagnostic::error(format!("body `{}` came out with no mass", plan.name))
+                        .with_code("E0405")
+                        .at(plan.span, "mass is zero")
+                        .note("density times area, or the explicit mass, evaluated to zero")
+                        .help("add `motion: static;` if it was meant to be immovable"),
+                );
+            }
+            slots.insert(plan.name.clone(), slot);
+        }
+
+        let joint_plans = std::mem::take(&mut self.joints);
+        for plan in &joint_plans {
+            let Some((a, b)) = rigid::resolve(plan, &slots, &mut self.diagnostics) else {
+                continue;
+            };
+            // "However far apart they are now" is what leaving the length out means.
+            let anchors = joint_anchors(&world, plan, a, b);
+            world.add_joint(plan.build(a, b, anchors));
+        }
+
+        self.bodies_solved = true;
+
+        let buffer = out
+            .buffers
+            .allocate(name.to_string(), BufferKind::RigidBodyArrays { capacity: plans.len() });
+        let id = DomainId::from_index(out.specs.len() as u32);
+        out.operations.push(
+            Operation::new(format!("prepare {name}"), OperationKind::Prepare)
+                .in_domain(id)
+                .writing(buffer)
+                .costing(0.1),
+        );
+        out.operations.push(
+            Operation::new(format!("advance {name}"), OperationKind::Advance)
+                .in_domain(id)
+                .reading(buffer)
+                .writing(buffer)
+                // Broadphase is n log n and the contact solve is per-point per-iteration;
+                // a body is worth several particles.
+                .costing(plans.len() as f64 * settings.iterations as f64),
+        );
+
+        let statics = plans.iter().filter(|p| p.is_static).count();
+        let mut summary = format!(
+            "{} bodies ({statics} static), gravity [{:.3}, {:.3}] m/s^2, {} contact iterations",
+            plans.len(),
+            settings.gravity[0],
+            settings.gravity[1],
+            settings.iterations
+        );
+        if !joint_plans.is_empty() {
+            summary.push_str(&format!(", {} joints", joint_plans.len()));
+        }
+        for plan in &plans {
+            self.notes.push(format!("body `{}`: {}", plan.name, rigid::describe(plan)));
+        }
+        for plan in &joint_plans {
+            self.notes.push(format!("joint `{}`: {}", plan.name, plan.describe()));
+        }
+
+        out.specs.push(DomainSpec {
+            id,
+            name: name.to_string(),
+            family: "rigid2d[sequential_impulse]".to_string(),
+            summary,
+            buffers: vec![buffer],
+            contract: Some(world.contract()),
+        });
+        out.domains.push(Box::new(world));
+    }
+
     /// Place particles and give them initial velocities.
     ///
     /// The velocity distribution is shifted so total momentum is exactly zero. Without
@@ -1333,4 +1733,21 @@ fn describe_boundaries(set: &BoundarySet) -> String {
         .map(|(name, boundary)| format!("{name} {}", boundary.kind_name()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The current world distance between a joint's two anchor points.
+///
+/// Used when the model left the length out: "however far apart they are now" is what a
+/// reader means by omitting it, and computing it from the placed bodies is the only way
+/// to honour that.
+fn joint_anchors(world: &RigidDomain, plan: &rigid::JointPlan, a: usize, b: usize) -> f64 {
+    let (local_a, local_b) = match plan.build {
+        rigid::JointShape::Distance { anchor_a, anchor_b, .. }
+        | rigid::JointShape::Pin { anchor_a, anchor_b }
+        | rigid::JointShape::Spring { anchor_a, anchor_b, .. } => (anchor_a, anchor_b),
+        rigid::JointShape::Motor { .. } => return 0.0,
+    };
+    let pa = world.bodies().to_world_point(a, local_a.to_array());
+    let pb = world.bodies().to_world_point(b, local_b.to_array());
+    (pb[0] - pa[0]).hypot(pb[1] - pa[1])
 }

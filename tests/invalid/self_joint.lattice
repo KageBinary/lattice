@@ -1,0 +1,15 @@
+// expect: E0401
+// A joint from a body to itself constrains nothing and presents infinite mass.
+
+project self_joint {
+  body bob {
+    shape: circle(0.2 meter);
+  }
+
+  joint arm {
+    kind:   pin;
+    bodies: [bob, bob];
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

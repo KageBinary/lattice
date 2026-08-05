@@ -115,9 +115,23 @@ impl fmt::Display for Invariant {
 }
 
 /// What kind of reading an [`Observation`] is.
+///
+/// # `Invariant` is a claim, not a label
+///
+/// Recording something as an [`ObservationKind::Invariant`] asserts that it should not
+/// change, and every downstream reader treats it that way — the viewer's conservation
+/// panel flags any drift, and the run report calls it out. So a quantity that is only
+/// *part* of a conserved total belongs here as a [`ObservationKind::Metric`] instead.
+///
+/// Kinetic energy is the standard trap. It is an [`Invariant::KineticEnergy`] in the
+/// ledger sense — you can account for how much of it turned into heat — but it is not
+/// conserved on its own in any system where anything happens. Publish `kinetic_energy`
+/// and `potential_energy` as metrics, and `total_energy` as the invariant. The same
+/// goes for momentum in a world with gravity or a wall: publish it, but do not claim it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObservationKind {
-    /// A quantity that should be conserved.
+    /// A quantity that should be conserved. See the type documentation — this is an
+    /// assertion, and a false one trains readers to ignore the diagnostics.
     Invariant(Invariant),
     /// A linear- or nonlinear-solver residual.
     Residual,

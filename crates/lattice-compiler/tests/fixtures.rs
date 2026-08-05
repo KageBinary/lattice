@@ -222,7 +222,9 @@ fn the_fixture_set_covers_every_diagnostic_class() {
         ("E0203", "resolution: missing required setting"),
         ("E0204", "resolution: unknown setting or argument"),
         ("E0206", "lowering: unknown solver"),
+        ("E0208", "lowering: unknown keyword value"),
         ("E0210", "builtins: unknown function"),
+        ("E0211", "geometry: an invalid shape"),
         ("E0400", "units: dimensional mismatch"),
         ("E0403", "units: affine scale in an expression"),
         ("E0405", "validation: value out of range"),
@@ -308,4 +310,98 @@ project ordered {
     let mut sorted = positions.clone();
     sorted.sort_unstable();
     assert_eq!(positions, sorted, "diagnostics should read in source order");
+}
+
+/// The rigid pipeline end to end: a model file becomes a world whose bodies behave.
+///
+/// `every_example_runs` takes twenty steps, which is enough to catch a crash and not
+/// nearly enough to catch physics. This one runs the ramp scene to a standstill and
+/// checks that everything is still where a reader would expect: inside the yard,
+/// resting, and with the pendulum still attached.
+#[test]
+fn the_ramp_example_settles_inside_its_yard() {
+    let path = repo_root().join("examples").join("ramp.lattice");
+    let file = load(path.as_path());
+    let (compiled, diagnostics) = compile_source(&file);
+    assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+    let compiled = compiled.unwrap();
+
+    let mut config = RunConfig::from_model(&compiled.model);
+    config.duration = Some(8.0);
+    config.max_steps = None;
+
+    let mut simulation = Simulation::new(compiled.model, compiled.domains);
+    let outcome = simulation.run(&config);
+    assert!(outcome.is_success(), "{}", outcome.stop.describe());
+
+    let series = |name: &str| -> Vec<f64> {
+        outcome
+            .artifact
+            .timeline()
+            .iter()
+            .filter_map(|sample| {
+                sample.values.iter().find(|(key, _)| key == name).map(|(_, value)| *value)
+            })
+            .collect()
+    };
+
+    // Nothing escaped: the yard is 20 m wide and the walls are 6 m tall, so a body in
+    // free fall would be moving far faster than anything inside can.
+    let speeds = series("yard.max_speed");
+    assert!(!speeds.is_empty(), "the observer recorded nothing");
+    let fastest = speeds.iter().copied().fold(0.0, f64::max);
+    assert!(fastest < 30.0, "something left the yard: {fastest} m/s");
+
+    // It settled. The pendulum keeps swinging — there is no drag and a pin joint is
+    // lossless — so the floor is the bob's kinetic energy, not zero.
+    let energy = series("yard.kinetic_energy");
+    let peak = energy.iter().copied().fold(0.0, f64::max);
+    let settled = *energy.last().unwrap();
+    assert!(peak > 100.0, "nothing ever moved: peak {peak} J");
+    assert!(settled < 0.5 * peak, "still {settled} J of a {peak} J peak — it never settled");
+
+    // The overlap stayed within the solver's dead band rather than growing.
+    let deepest = series("yard.penetration").iter().copied().fold(0.0, f64::max);
+    assert!(deepest < 0.05, "bodies sank into each other by {deepest} m");
+
+    // The pin joint held.
+    let joint_error = series("yard.joint_error").iter().copied().fold(0.0, f64::max);
+    assert!(joint_error < 0.01, "the pin drifted by {joint_error} m");
+
+    // The declared non-conservation stayed small — this is the number the contract
+    // promises to publish rather than describe.
+    let drift = series("yard.correction_drift").iter().copied().fold(0.0f64, |a, b| a.max(b.abs()));
+    let angular = series("yard.angular_momentum").iter().copied().fold(0.0f64, |a, b| a.max(b.abs()));
+    assert!(
+        drift < 0.05 * angular.max(1.0),
+        "position correction spent {drift} of an angular momentum scale of {angular}"
+    );
+}
+
+/// Materials are shared, so changing one changes every body wearing it. The friction
+/// threshold this example is built around depends on that working.
+#[test]
+fn a_material_reaches_every_body_that_names_it() {
+    let source = "
+        project shared {
+          duration: 1 second;
+          material grippy { density: 100 kilogram / meter^2; friction: 0.9; }
+          material slick  { density: 100 kilogram / meter^2; friction: 0.05; }
+          body a { shape: box(1 meter, 1 meter); material: grippy; }
+          body b { shape: box(1 meter, 1 meter); at: [5 meter, 0 meter]; material: grippy; }
+          body c { shape: box(1 meter, 1 meter); at: [10 meter, 0 meter]; material: slick; }
+          solve rigid(world) with sequential_impulse(dt = 0.008 second);
+        }
+    ";
+    let file = SourceFile::new("shared.lattice", source);
+    let (compiled, diagnostics) = compile_source(&file);
+    assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+
+    // The model's notes name each body and its coefficients, which is how a reader
+    // checks that `material:` did what they meant.
+    let notes = compiled.unwrap().model.notes.join("
+");
+    assert!(notes.contains("body `a`"), "{notes}");
+    assert!(notes.contains("mu = 0.9"), "{notes}");
+    assert!(notes.contains("mu = 0.05"), "{notes}");
 }

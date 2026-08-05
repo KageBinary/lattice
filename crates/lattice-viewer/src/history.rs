@@ -30,7 +30,7 @@
 //! the initial value is negligible against that scale, [`History::drift_of`] divides by
 //! the scale instead and says which basis it used. See [`DriftBasis`].
 
-use lattice_ir::Observations;
+use lattice_ir::{ObservationKind, Observations};
 
 /// One recorded quantity over time.
 #[derive(Clone, Debug)]
@@ -39,11 +39,25 @@ pub struct Series {
     pub name: String,
     /// Its SI unit, which is what groups it into a plot.
     pub unit: String,
+    /// What sort of reading it is, as the *domain* declared it.
+    ///
+    /// The viewer used to decide "should this be conserved?" by matching the name
+    /// against a list — `momentum_x`, `total_energy`, and so on. That guess is wrong
+    /// exactly where it matters: a rigid scene with gravity and a floor publishes a
+    /// momentum that is *supposed* to change, because gravity injects it and a wall
+    /// absorbs it. Reading the domain's own claim instead means the panel reports what
+    /// the solver promised rather than what the viewer assumed.
+    pub kind: ObservationKind,
     /// `[time, value]` pairs.
     pub points: Vec<[f64; 2]>,
 }
 
 impl Series {
+    /// True when the domain published this as a quantity it expects to hold.
+    pub fn is_invariant(&self) -> bool {
+        matches!(self.kind, ObservationKind::Invariant(_))
+    }
+
     /// The first recorded value.
     pub fn initial(&self) -> Option<f64> {
         self.points.first().map(|point| point[1])
@@ -175,6 +189,7 @@ impl History {
                     self.series.push(Series {
                         name: name.to_string(),
                         unit: observation.unit.to_string(),
+                        kind: observation.kind,
                         points: Vec::new(),
                     });
                     self.series.len() - 1
@@ -315,6 +330,23 @@ mod tests {
             out.record_invariant(name.to_string(), Invariant::Energy, *value);
         }
         out
+    }
+
+    /// The panel asks the domain what it promised rather than guessing from the name.
+    /// A rigid scene with gravity publishes a momentum that is supposed to change.
+    #[test]
+    fn a_series_remembers_the_kind_the_domain_declared() {
+        let mut history = History::default();
+        let mut sample = Observations::new();
+        sample.record_invariant("closed.momentum_x", Invariant::MomentumX, 0.0);
+        sample.record_metric("open.momentum_x", 71.0, "kg·m/s");
+        history.record(0.0, &sample);
+
+        assert!(history.get("closed.momentum_x").unwrap().is_invariant());
+        assert!(
+            !history.get("open.momentum_x").unwrap().is_invariant(),
+            "same name, different claim — the name was never the right thing to read"
+        );
     }
 
     #[test]

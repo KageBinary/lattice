@@ -290,6 +290,15 @@ impl Dimension {
     /// Also kinematic viscosity and thermal diffusivity: `L^2·T^-1`.
     pub const DIFFUSIVITY: Dimension = Dimension::from_exponents([2, 0, -1, 0, 0, 0, 0]);
     pub const STIFFNESS: Dimension = Dimension::from_exponents([0, 1, -2, 0, 0, 0, 0]);
+    /// A linear damping coefficient, `N·s/m` — the `c` in `F = −c·v`.
+    pub const DAMPING: Dimension = Dimension::from_exponents([0, 1, -1, 0, 0, 0, 0]);
+    /// Torque, `N·m`.
+    ///
+    /// Dimensionally identical to [`Dimension::ENERGY`], which is not a mistake: SI
+    /// genuinely cannot tell a newton-metre of torque from a joule of work, because
+    /// angle is dimensionless. Naming it separately documents intent at the call site
+    /// without pretending the units differ.
+    pub const TORQUE: Dimension = Dimension::ENERGY;
 
     // ---- Electromagnetism ------------------------------------------------------
 

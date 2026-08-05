@@ -444,6 +444,7 @@ impl Simulation {
                 lattice_ir::BufferKind::ScalarField { nx, ny, .. } => (nx * ny) as u64,
                 lattice_ir::BufferKind::VectorField { nx, ny, .. } => (2 * nx * ny) as u64,
                 lattice_ir::BufferKind::ParticleArrays { capacity } => capacity as u64,
+                lattice_ir::BufferKind::RigidBodyArrays { capacity } => capacity as u64,
                 lattice_ir::BufferKind::Scratch { .. } => 0,
             })
             .sum()

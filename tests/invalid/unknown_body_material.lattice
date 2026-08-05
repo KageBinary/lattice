@@ -1,0 +1,15 @@
+// expect: E0202
+// A material name with a typo would otherwise fall back to a default nobody chose.
+
+project unknown_body_material {
+  material oak {
+    density: 60 kilogram / meter^2;
+  }
+
+  body crate {
+    shape:    box(0.5 meter, 0.5 meter);
+    material: oka;
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

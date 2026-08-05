@@ -1,0 +1,17 @@
+// expect: E0405
+// A coefficient of restitution above 1 returns more energy than the collision had.
+// That is a typo, not a material, and it reads as an exploding solver.
+
+project restitution_above_one {
+  material superball {
+    density:     100 kilogram / meter^2;
+    restitution: 1.4;
+  }
+
+  body ball {
+    shape:    circle(0.2 meter);
+    material: superball;
+  }
+
+  solve rigid(world) with sequential_impulse(dt = 0.008 second);
+}

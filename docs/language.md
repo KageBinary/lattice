@@ -189,6 +189,100 @@ momentum is exactly zero — which is what makes the momentum diagnostic meaning
 `boundary:` is `periodic`, `reflective` or `open` (the default). A `region` is required
 for a periodic or reflective boundary, and for any force with a cutoff.
 
+## Rigid bodies
+
+A particle set is written as one declaration with a `count`, because its members are
+interchangeable. Rigid bodies are the opposite: a scene is *the ground*, *the ramp*,
+*the crate*, each with its own shape and role, and half of them are named by a joint.
+So each gets its own declaration.
+
+```
+domain rigid2d yard {
+  gravity:    9.80665 meter / second^2;   // or a [gx, gy] vector
+  iterations: 10;                          // contact solver passes per step
+}
+
+material concrete {
+  density:     240 kilogram / meter^2;
+  restitution: 0.1;
+  friction:    0.8;
+}
+
+body ground {
+  shape:    box(10 meter, 0.3 meter);
+  at:       [0 meter, -3 meter];
+  material: concrete;
+  motion:   static;
+}
+
+body crate {
+  shape:    box(0.4 meter, 0.4 meter);
+  at:       [-6.5 meter, 2 meter];
+  angle:    0.35;
+  material: ice;
+}
+
+joint arm {
+  kind:     pin;
+  bodies:   [hook, bob];
+  anchor_b: [-1.5 meter, 0 meter];
+}
+
+solve rigid(yard) with sequential_impulse(dt = 0.004 second);
+```
+
+The `domain rigid2d` block is optional; without one the world takes standard gravity
+and the solver's defaults. Every declared body joins a single world.
+
+### Density is per unit **area**
+
+`kilogram / meter^2`, not `kilogram / meter^3`. This is a 2D world, and giving it an
+implied thickness would make every mass wrong by a factor nobody declared — §14.1 puts
+that kind of conversion in a port rather than hiding it in a solver. A model that
+writes `7850 kilogram / meter^3` is told which dimension was expected and which it
+gave. The familiar 3D densities times a 10 cm slab are usually what a reader means.
+
+### Shapes
+
+| Shape | Arguments |
+|---|---|
+| `circle(radius)` | one length |
+| `box(half_width, half_height)` | half-extents, so `box(1 m, 1 m)` is 2 m square |
+| `polygon([x, y], …)` | 3 to 8 vertices, **counter-clockwise**, convex |
+| `segment(half_length)` | along the body's local x axis; has no area |
+
+A polygon is recentred on its own centroid, because every impulse formula assumes the
+body's transform *is* its centre of mass. Clockwise winding is refused rather than
+silently reversed: it is what a model authored for a y-down coordinate system produces,
+and that model's gravity is about to be wrong too. A segment encloses no area, so
+density gives it no mass — it must be `motion: static;` or carry an explicit `mass:`.
+
+### Body settings
+
+| Setting | Meaning |
+|---|---|
+| `shape` | required |
+| `at` | centre of mass, m |
+| `angle` | radians (dimensionless in SI, so `0.35` and `0.35 radian` are the same) |
+| `material` | a declared material; without one, a sensible default |
+| `motion` | `static` or `dynamic` (the default) |
+| `mass` | an explicit total mass, overriding the density |
+| `velocity`, `spin` | initial linear and angular velocity |
+
+### Joints
+
+| `kind` | Holds | Extra settings |
+|---|---|---|
+| `distance` | two anchors a fixed distance apart — a rod | `length` (defaults to the initial separation) |
+| `rope` | the same, but pulls only | `length` |
+| `pin` | two anchors coincident — a hinge | — |
+| `spring` | a damped force, not a constraint | `stiffness`, `damping`, `length` |
+| `motor` | a target relative angular velocity | `speed`, `torque` (required) |
+
+`anchor_a` and `anchor_b` are in each body's **local** frame, so a joint follows its
+bodies as they move and turn. A motor's `torque` is required: an unbounded budget would
+move any load, which is a servo nobody has.
+
 ## Solving
 
 ```
@@ -201,6 +295,11 @@ solve dynamics(atoms)   with velocity_verlet(dt=0.005 second);
 |---|---|---|
 | `heat`, `diffusion`, `transport` | fields and species | `explicit`, `crank_nicolson`, `backward_euler` |
 | `dynamics` | particle sets | `velocity_verlet`, `semi_implicit_euler`, `explicit_euler` |
+| `rigid` | a rigid world | `sequential_impulse` |
+
+`rigid` offers one method because a sequential-impulse contact solver assumes
+semi-implicit Euler; offering velocity Verlet alongside it would be offering something
+that does not work.
 
 An explicit scheme past its stability limit is **refused at compile time**, with the
 limit and the fix in the message. Clamping silently would produce a run that finishes
@@ -224,13 +323,15 @@ visualize probability_density;         // the domain picks an encoding
 | `E00xx` | lexical: bad character, unterminated comment or string |
 | `E01xx` | syntax: unexpected token, reserved word as a name, bad exponent |
 | `E02xx` | resolution: unknown name, duplicate declaration, unknown setting |
+| `E02xx` | also: unknown keyword value (`E0208`) |
+| `E021x` | geometry: unknown builtin (`E0210`), invalid shape (`E0211`) |
 | `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range |
 | `E09xx` | not implemented yet — the message names the milestone |
 | `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state |
 
 Every rejection carries a source position and either a suggested fix or the rule it
-enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the sixteen
-models in `tests/invalid/`.
+enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the
+twenty-six models in `tests/invalid/`.
 
 ---
 
@@ -245,7 +346,6 @@ numbers.
 |---|---|
 | `reaction` blocks | M3 |
 | `couple … -> …` | M3 |
-| `material` blocks | M2 |
-| `domain rigid2d`, `domain fluid2d` | M2 |
+| `domain fluid2d` | M2 |
 | `domain quantum2d`, `potential`, `wavepacket`, `detector` | M5 |
 | user-defined expressions and force laws (spec §8.3) | M6 |

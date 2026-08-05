@@ -23,7 +23,7 @@ use lattice_ir::{Observations, RenderChannel};
 use lattice_runtime::Simulation;
 use lattice_syntax::SourceFile;
 
-use crate::history::{DriftBasis, History};
+use crate::history::{DriftBasis, History, Series};
 use crate::palette::{Colormap, Mode, Palette, Status};
 use crate::render;
 
@@ -299,7 +299,7 @@ impl ViewerApp {
                 ui.colored_label(palette.text_secondary, "conservation");
                 let mut any = false;
                 for series in self.history.series() {
-                    if !is_conserved_quantity(&series.name) || series.is_constant() {
+                    if !series.is_invariant() || series.is_constant() {
                         continue;
                     }
                     let Some(drift) = self.history.drift_of(series) else { continue };
@@ -322,7 +322,19 @@ impl ViewerApp {
                     render::status_line(ui, palette, &verdict);
                 }
                 if !any {
-                    ui.colored_label(palette.text_muted, "nothing has drifted yet — press play");
+                    // Distinguish "not started" from "this scene has no invariant to
+                    // report". A rigid world with gravity and a floor genuinely has
+                    // none, and saying so beats an empty heading.
+                    let claims_any = self.history.series().iter().any(Series::is_invariant);
+                    ui.colored_label(
+                        palette.text_muted,
+                        if claims_any || self.history.sample_count() < 2 {
+                            "nothing has drifted yet — press play"
+                        } else {
+                            "no conserved quantity here — gravity adds momentum and a static \
+                             body absorbs it, so this domain publishes none"
+                        },
+                    );
                 }
 
                 // The values table. This is the relief channel that makes the plots
@@ -403,14 +415,28 @@ impl ViewerApp {
                 return;
             }
 
+            // Contacts are drawn over the bodies rather than in a panel of their own,
+            // so they must not claim a share of the height — otherwise a rigid scene
+            // gets half the picture it should and nothing says why.
+            let drawn = channels
+                .iter()
+                .filter(|c| !matches!(c, RenderChannel::Contacts { .. }))
+                .count()
+                .max(1);
             let available = ui.available_height();
-            let per_channel = (available / channels.len() as f32).max(160.0);
+            let per_channel = (available / drawn as f32).max(160.0);
+
+            // Contacts belong on top of the bodies they were found between, not in a
+            // panel of their own where a reader would have to align two pictures by eye.
+            let contacts =
+                channels.iter().find(|c| matches!(c, RenderChannel::Contacts { .. }));
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for channel in &channels {
                     draw_channel(
                         ui,
                         channel,
+                        contacts,
                         per_channel,
                         self.colormap,
                         self.mode,
@@ -420,16 +446,21 @@ impl ViewerApp {
                     ui.add_space(10.0);
                 }
 
-                ui.horizontal(|ui| {
-                    ui.colored_label(palette.text_secondary, "colour");
-                    for map in [Colormap::Sequential, Colormap::Diverging] {
-                        ui.radio_value(&mut self.colormap, map, map.label());
-                    }
-                });
-                ui.colored_label(
-                    palette.text_muted,
-                    "cells are drawn unsmoothed, so the grid you see is the grid being solved",
-                );
+                // Colourmap controls belong to fields. A rigid scene has no continuous
+                // encoding to configure, and offering the choice anyway invites a reader
+                // to look for the field it applies to.
+                if channels.iter().any(|c| matches!(c, RenderChannel::Scalar { .. })) {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(palette.text_secondary, "colour");
+                        for map in [Colormap::Sequential, Colormap::Diverging] {
+                            ui.radio_value(&mut self.colormap, map, map.label());
+                        }
+                    });
+                    ui.colored_label(
+                        palette.text_muted,
+                        "cells are drawn unsmoothed, so the grid you see is the grid being solved",
+                    );
+                }
             });
         });
     }
@@ -440,12 +471,20 @@ impl ViewerApp {
 fn draw_channel(
     ui: &mut egui::Ui,
     channel: &RenderChannel<'_>,
+    // The contacts published alongside a body channel, drawn into the same rectangle.
+    contacts: Option<&RenderChannel<'_>>,
     height: f32,
     colormap: Colormap,
     mode: Mode,
     palette: &Palette,
     textures: &mut BTreeMap<String, TextureHandle>,
 ) {
+    // Contacts are drawn over the bodies, so a heading of their own would sit above
+    // nothing.
+    if matches!(channel, RenderChannel::Contacts { .. }) {
+        return;
+    }
+
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.colored_label(palette.text_primary, channel.name());
@@ -519,6 +558,52 @@ fn draw_channel(
                 );
             }
         }
+
+        RenderChannel::Bodies { x, origin, extent, .. } => {
+            let aspect = (extent[0] / extent[1]) as f32;
+            let plot_height = (height - 40.0).max(120.0);
+            let width = (plot_height * aspect).min(ui.available_width() - 8.0);
+            let size = egui::Vec2::new(width, width / aspect);
+
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            ui.painter().rect_filled(rect, 2.0, palette.plane);
+            let view = render::WorldView::new(rect, *origin, *extent);
+            let outside = render::draw_bodies(ui.painter(), view, channel, palette);
+            // Contacts go into the same rectangle, on top. Giving them their own panel
+            // would put a set of points beside the geometry they belong to and leave
+            // the reader to align the two by eye.
+            if let Some(contacts) = contacts {
+                render::draw_contacts(ui.painter(), view, contacts, palette);
+            }
+            ui.painter().rect_stroke(
+                rect,
+                2.0,
+                egui::Stroke::new(1.0, palette.border),
+                egui::StrokeKind::Inside,
+            );
+
+            let mut caption = format!(
+                "{} bodies over {} × {} m",
+                x.len(),
+                render::format_value(extent[0]),
+                render::format_value(extent[1])
+            );
+            if let Some(RenderChannel::Contacts { x: cx, depth, .. }) = contacts {
+                let deepest = depth.iter().copied().fold(0.0, f64::max);
+                caption.push_str(&format!(
+                    ", {} contacts, deepest {} m",
+                    cx.len(),
+                    render::format_value(deepest)
+                ));
+            }
+            if outside > 0 {
+                caption.push_str(&format!(", {outside} outside the view"));
+            }
+            ui.colored_label(palette.text_muted, caption);
+        }
+
+        // Drawn over the bodies rather than on its own, so it never appears here.
+        RenderChannel::Contacts { .. } => {}
 
         RenderChannel::Particles { x, y, origin, extent, .. } => {
             let aspect = (extent[0] / extent[1]) as f32;
@@ -639,16 +724,6 @@ fn unit_label(unit: &str) -> &str {
     }
 }
 
-/// Whether a name refers to something that ought to be conserved.
-fn is_conserved_quantity(name: &str) -> bool {
-    const CONSERVED: &[&str] =
-        &["total_energy", "momentum_x", "momentum_y", "integral", "probability_norm", "mass"];
-    // `momentum_scale` is the yardstick momentum is measured with, not a conserved
-    // quantity — it tracks the thermal motion and is supposed to move.
-    !name.ends_with(crate::history::SCALE_SUFFIX)
-        && CONSERVED.iter().any(|suffix| name.ends_with(suffix))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,17 +739,6 @@ mod tests {
     fn dimensionless_units_render_as_no_label() {
         assert_eq!(unit_label("1"), "");
         assert_eq!(unit_label("J"), "J");
-    }
-
-    #[test]
-    fn conserved_quantities_are_recognized_by_suffix() {
-        assert!(is_conserved_quantity("gas.total_energy"));
-        assert!(is_conserved_quantity("temperature.integral"));
-        assert!(is_conserved_quantity("p.momentum_x"));
-        assert!(!is_conserved_quantity("gas.kinetic_energy"), "kinetic energy alone is not conserved");
-        assert!(!is_conserved_quantity("gas.momentum_scale"), "the yardstick is not the quantity");
-        assert!(!is_conserved_quantity("gas.max_speed"));
-        assert!(!is_conserved_quantity("gas.count"));
     }
 
     #[test]
