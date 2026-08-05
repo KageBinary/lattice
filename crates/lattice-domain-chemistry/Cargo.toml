@@ -1,0 +1,14 @@
+[package]
+name = "lattice-domain-chemistry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reaction networks, kinetics, and reaction-diffusion"
+
+[dependencies]
+lattice-ir.workspace = true
+lattice-domain-grid2d.workspace = true
+
+[lints]
+workspace = true
