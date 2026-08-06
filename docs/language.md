@@ -283,6 +283,149 @@ density gives it no mass — it must be `motion: static;` or carry an explicit `
 bodies as they move and turn. A motor's `torque` is required: an unbounded budget would
 move any load, which is a servo nobody has.
 
+## Chemistry
+
+```
+domain chemistry chamber {
+  grid: vessel;            // every species in a mixture reacts on one grid
+}
+
+species fuel on vessel = left_half(40 mole / meter^2) {
+  formula:     CH4;
+  diffusivity: 2e-5 meter^2 / second;
+  boundary:    insulated;
+}
+
+reaction combustion {
+  reactants:         fuel + 2 oxidiser;
+  products:          product + 2 water;
+  rate:              30 meter^4 / (mole^2 second);
+  activation_energy: 30 kilojoule / mole;
+  enthalpy:          -8.0e2 kilojoule / mole;     // negative is exothermic
+}
+
+solve reactions(chamber) with strang(dt = 0.02 second);
+```
+
+Stoichiometry needed no new syntax. `2 H2 + O2` already parses: `+` is an infix
+operator and `2 H2` is a juxtaposition, which binds tighter — the same rule that makes
+`10 meter / 2 second` a velocity rather than a metre-second.
+
+### Concentrations are per unit **area**
+
+`mole / meter^2`. This is a 2D engine, and a concentration per unit volume would need a
+thickness nobody declared. A second-order rate constant is therefore in `m^2/(mol s)`,
+which is unfamiliar and correct.
+
+### Two things the compiler checks that nothing else would
+
+**Atom and charge balance.** `H2 + O2 -> H2O` integrates perfectly happily and destroys
+47% of the mass it touches; the only symptom is a conservation check failing several
+layers away. When every species states a `formula` the reaction is checked, and the
+diagnostic names the element:
+
+```text
+error[E0212]: reaction `typo` does not balance
+26 |   reaction typo {
+   |            ^^^^ O does not balance: 2 on the left, 1 on the right
+```
+
+A species with no `formula` makes the check impossible, which is a warning rather than
+an error — an abstract `A -> B` model is a legitimate thing to write.
+
+**The rate constant's unit against the reaction's order.** An order-`n` constant is in
+`(m^2/mol)^(n-1)/s`. Rate constants span twenty orders of magnitude, so nothing about
+the *number* says which order was meant. The compiler works the order out from the
+reactants:
+
+```text
+error[E0400]: `rate` for a reaction of order 2 has the wrong dimension
+30 |     rate:      1e3 / second;
+   |                ^^^^^^^^^^^^ expected m^2/s·mol, found frequency (1/s)
+```
+
+### Species settings
+
+| Setting | Meaning |
+|---|---|
+| `formula` | a chemical formula such as `H2O`; gives the molar mass and enables balance checking |
+| `charge` | whole elementary charges |
+| `molar_mass` | overrides what the formula implies — a warning if the two disagree |
+| `diffusivity` | as for any field; zero for an immobile species |
+| `boundary` | as for any field |
+
+### Reaction settings
+
+| Setting | Meaning |
+|---|---|
+| `reactants` | required; a sum of species with optional coefficients |
+| `products` | a sum of species, or omitted for a sink |
+| `rate` | required; in `(m^2/mol)^(order-1)/s` |
+| `reverse_rate` | makes the reaction reversible; the equilibrium constant is the ratio |
+| `activation_energy` | Arrhenius: `k(T) = A exp(-Ea/RT)`, with the declared `rate` as `A` |
+| `enthalpy` | J/mol of extent. **Negative is exothermic** — the chemistry convention |
+
+## Coupling
+
+```
+field temperature on vessel = 300 kelvin {
+  diffusivity:   1.2e-5 meter^2 / second;
+  heat_capacity: 4.0e5 joule / (meter^2 kelvin);
+}
+
+couple chamber.heat_release -> temperature.source conserve energy;
+couple temperature.values   -> chamber.temperature;
+```
+
+An edge connects a port one domain publishes to a port another consumes. `conserve`
+names the quantity that crosses, which puts every transfer in the ledger; leave it out
+for an edge that carries a *parameter* rather than a transfer — a temperature reaching a
+rate constant changes how fast a reaction goes, it does not move energy.
+
+### The conversion is derived, not written
+
+A reaction publishes `W/m^2`; a heat source is in `K/s`. Those are not the same
+quantity, and the factor between them is an areal heat capacity that belongs to neither
+domain — it is a property of the material between them. Wire them straight together and
+the run compiles, executes, looks entirely plausible, and is wrong by that factor.
+
+So the model declares the material property and the compiler does the algebra. A
+coupling with no way to convert says so, and says what is missing:
+
+```text
+error[E0400]: this coupling needs a unit conversion the model has not declared
+36 |   couple mixture.heat_release -> temperature.source conserve energy;
+   |   ^^^ areal power density (kg/s^3) does not convert to K/s
+   = note: the factor between them would have to be in s^2·K/kg
+   = help: for a heat coupling, add `heat_capacity: 4e5 joule / (meter^2 kelvin);`
+```
+
+### Ports
+
+| Port | Domain | Direction | Unit |
+|---|---|---|---|
+| `values` | any field solver | publishes | the field's own unit |
+| `source` | any field solver | consumes | field units per second |
+| `heat_release` | a chemistry mixture | publishes | `W/m^2` |
+| `temperature` | a chemistry mixture | consumes | `K` |
+
+`values`, not `field` — the grammar reserves `field`, and a port a model cannot name is
+a port that does not exist.
+
+### What the ledger reports
+
+```text
+coupling ledger
+  chamber -> temperature      1.774271e5 total energy over 2000 exchanges
+  a staggered coupling always has one exchange in flight, so the last of this has
+  not landed
+```
+
+That last line is not an apology. A staggered coupling (§14.2) advances each domain on
+the latest state it was given, so the final step's transfer is recorded and never
+delivered. The shortfall is first order in the timestep, and the validation suite
+measures it rather than tolerating it.
+
 ## Solving
 
 ```
@@ -296,6 +439,7 @@ solve dynamics(atoms)   with velocity_verlet(dt=0.005 second);
 | `heat`, `diffusion`, `transport` | fields and species | `explicit`, `crank_nicolson`, `backward_euler` |
 | `dynamics` | particle sets | `velocity_verlet`, `semi_implicit_euler`, `explicit_euler` |
 | `rigid` | a rigid world | `sequential_impulse` |
+| `reactions` | a chemistry mixture | `strang` |
 
 `rigid` offers one method because a sequential-impulse contact solver assumes
 semi-implicit Euler; offering velocity Verlet alongside it would be offering something
@@ -324,7 +468,7 @@ visualize probability_density;         // the domain picks an encoding
 | `E01xx` | syntax: unexpected token, reserved word as a name, bad exponent |
 | `E02xx` | resolution: unknown name, duplicate declaration, unknown setting |
 | `E02xx` | also: unknown keyword value (`E0208`) |
-| `E021x` | geometry: unknown builtin (`E0210`), invalid shape (`E0211`) |
+| `E021x` | geometry and chemistry: unknown builtin (`E0210`), invalid shape or formula (`E0211`), unbalanced reaction (`E0212`) |
 | `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range |
 | `E09xx` | not implemented yet — the message names the milestone |
 | `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state |
@@ -344,8 +488,10 @@ numbers.
 
 | Construct | Milestone |
 |---|---|
-| `reaction` blocks | M3 |
-| `couple … -> …` | M3 |
-| `domain fluid2d` | M2 |
+| `domain fluid2d` | M4 |
 | `domain quantum2d`, `potential`, `wavepacket`, `detector` | M5 |
+
+Stochastic kinetics (Gillespie) is not implemented either, but it has no syntax of its
+own — a `solve reactions(…) with gillespie(…)` would be the way in, and it reports an
+unknown method.
 | user-defined expressions and force laws (spec §8.3) | M6 |

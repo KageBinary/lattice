@@ -67,7 +67,7 @@ fn chamber(enthalpy: f64, activation: f64) -> (Vec<Box<dyn Domain>>, Coupler) {
     // goes, it does not move energy.
     coupler.add(CouplingEdge::new(
         "temperature_feedback",
-        PortRef::new(1, "field"),
+        PortRef::new(1, "values"),
         PortRef::new(0, "temperature"),
     ));
     (domains, coupler)
@@ -229,7 +229,7 @@ fn a_misnamed_or_impossible_edge_is_reported() {
     let (mut domains, _) = chamber(-1.0e5, 0.0);
     let mut coupler = Coupler::new();
     coupler.add(CouplingEdge::new("typo", PortRef::new(0, "heat_relase"), PortRef::new(1, "source")));
-    coupler.add(CouplingEdge::new("nowhere", PortRef::new(9, "field"), PortRef::new(1, "source")));
+    coupler.add(CouplingEdge::new("nowhere", PortRef::new(9, "values"), PortRef::new(1, "source")));
     coupler.add(CouplingEdge::new("backwards", PortRef::new(1, "source"), PortRef::new(0, "temperature")));
 
     let report = coupler.exchange(&mut domains, 0, 0.0, 0.01);

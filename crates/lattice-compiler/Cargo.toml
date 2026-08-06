@@ -12,6 +12,8 @@ lattice-syntax.workspace = true
 lattice-ir.workspace = true
 lattice-domain-grid2d.workspace = true
 lattice-domain-rigid2d.workspace = true
+lattice-domain-chemistry.workspace = true
+lattice-coupling.workspace = true
 lattice-domain-particle.workspace = true
 
 [dev-dependencies]

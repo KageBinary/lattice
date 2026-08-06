@@ -58,6 +58,7 @@
 //! before running anything.
 
 pub mod builtins;
+pub mod chemistry;
 pub mod compile;
 pub mod eval;
 pub mod rigid;
@@ -361,10 +362,16 @@ project hot_reaction {
         assert_eq!(compiled.model.observers.len(), 1);
         assert_eq!(compiled.model.visuals.len(), 1);
 
-        // The parts that do not exist name their milestone.
-        assert!(text.contains("reaction networks are not implemented yet"), "{text}");
-        assert!(text.contains("milestone M3"), "{text}");
-        assert!(text.contains("coupling between domains"), "{text}");
+        // As of M3 the reaction and the coupling are both implemented, so what this
+        // model is missing is no longer a milestone — it is two declarations. The
+        // diagnostics say which, and the one that would be easiest to get wrong gets a
+        // note of its own: a reaction is not a domain, so it cannot be coupled from.
+        assert!(text.contains("no `solve reactions` names a mixture"), "{text}");
+        assert!(text.contains("domain chemistry"), "{text}");
+        assert!(
+            text.contains("a reaction is not a domain"),
+            "the couple should explain which thing publishes the port: {text}"
+        );
         // And the grid, fields and species were still parsed and dimension-checked.
         assert!(!text.contains("mole / meter^2` is not"), "the species should type-check: {text}");
     }

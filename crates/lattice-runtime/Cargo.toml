@@ -8,6 +8,7 @@ description = "Clock, timestep negotiation, scheduling, and run artifacts"
 
 [dependencies]
 lattice-ir.workspace = true
+lattice-coupling.workspace = true
 lattice-observe.workspace = true
 
 [lints]

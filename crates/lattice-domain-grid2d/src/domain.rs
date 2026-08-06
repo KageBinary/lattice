@@ -103,9 +103,10 @@ pub struct HeatDomain {
 /// The coupling ports this solver offers (spec §14.1).
 static PORTS: [lattice_ir::PortSpec; 2] = [
     lattice_ir::PortSpec::publishes_field(
-        "field",
+        "values",
         "field units",
-        "the solved field itself, cell by cell",
+        "the solved field itself, cell by cell. Not `field`, which the grammar reserves \
+         — a port a model cannot name is a port that does not exist",
     ),
     lattice_ir::PortSpec::consumes_field(
         "source",
@@ -592,7 +593,7 @@ impl Domain for HeatDomain {
 
     fn read_port(&self, name: &str, out: &mut lattice_ir::PortData) -> bool {
         match (name, out.as_field_mut()) {
-            ("field", Some(buffer)) => {
+            ("values", Some(buffer)) => {
                 buffer.copy_interior_from(&self.field);
                 true
             }

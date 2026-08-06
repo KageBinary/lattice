@@ -23,15 +23,18 @@
 use std::collections::BTreeMap;
 
 use lattice_domain_grid2d::{Diffusivity, HeatDomain, TimeScheme};
+use lattice_domain_chemistry::{ReactingMixture, ReactionNetwork, Species as ChemSpecies};
 use lattice_domain_rigid2d::{Collider, RigidDomain, SolverConfig};
+use lattice_coupling::{Coupler, CouplingEdge, Mapping, PortRef};
 
-use crate::rigid;
+use crate::{chemistry, rigid};
 use lattice_domain_particle::{
     BoundaryBox, HarmonicWell, Integrator, LennardJones, LinearDrag, ParticleBoundary,
     ParticleDomain, ParticleSpec, UniformAcceleration,
 };
 use lattice_ir::{
     BodySpec, BoundarySet, BufferKind, BufferPlan, CompiledModel, Domain, DomainId, DomainSpec,
+    Invariant,
     FidelityProfile, Grid2d, ObserverId, ObserverSpec, Operation, OperationGraph, OperationKind,
     Pcg32, Precision, Side, VisualSpec,
 };
@@ -50,6 +53,9 @@ pub struct Compiled {
     pub model: CompiledModel,
     /// The instantiated solvers, parallel to `model.domains`.
     pub domains: Vec<Box<dyn Domain>>,
+    /// The coupling edges between them, and the ledger that will account for what
+    /// they move (spec §14).
+    pub coupler: Coupler,
 }
 
 impl core::fmt::Debug for Compiled {
@@ -149,7 +155,36 @@ struct Compiler<'a> {
     worlds: BTreeMap<String, RigidWorld>,
     /// True once a `solve rigid(…)` has consumed the bodies.
     bodies_solved: bool,
+    /// The chemistry attributes of each declared species, by name.
+    chemistry: BTreeMap<String, ChemSpecies>,
+    /// Reacting mixtures declared with `domain chemistry <name> { grid: … }`.
+    mixtures: BTreeMap<String, MixtureInfo>,
+    /// Every `reaction` declaration, kept because the network can only be built once
+    /// the species list it indexes into is known — and that belongs to a mixture.
+    ///
+    /// Consumed when a mixture is solved, which is how an unsolved reaction is noticed.
+    reaction_decls: Vec<Decl>,
+    /// Every reaction's name, kept whether or not it was consumed.
+    ///
+    /// A coupling edge naming a reaction is the commonest wrong answer — a reaction is
+    /// the thing that releases the heat — and the diagnostic can only say so if the
+    /// names outlive the declarations.
+    reaction_names: Vec<String>,
+    /// Where each domain ended up in the runtime's list, by name — what a coupling
+    /// edge resolves a path's first segment to.
+    domain_index: BTreeMap<String, usize>,
+    /// The areal heat capacity a field declared, J/(m²·K), for deriving a coupling
+    /// factor.
+    heat_capacity: BTreeMap<String, f64>,
     notes: Vec<String>,
+}
+
+/// A reacting mixture declared with `domain chemistry <name> { … }`.
+#[derive(Clone, PartialEq, Debug)]
+struct MixtureInfo {
+    grid: String,
+    span: Span,
+    solved: bool,
 }
 
 /// Settings for a rigid world, from `domain rigid2d <name> { … }`.
@@ -185,6 +220,12 @@ impl<'a> Compiler<'a> {
             joints: Vec::new(),
             worlds: BTreeMap::new(),
             bodies_solved: false,
+            chemistry: BTreeMap::new(),
+            mixtures: BTreeMap::new(),
+            reaction_decls: Vec::new(),
+            reaction_names: Vec::new(),
+            domain_index: BTreeMap::new(),
+            heat_capacity: BTreeMap::new(),
             notes: Vec::new(),
         }
     }
@@ -215,6 +256,12 @@ impl<'a> Compiler<'a> {
         for domain in project.domains().filter(|d| d.family.text == "rigid2d") {
             self.declare_rigid_world(domain);
         }
+        for domain in project.domains().filter(|d| d.family.text == "chemistry") {
+            self.declare_mixture(domain);
+        }
+        self.reaction_decls = project.declarations_of("reaction").cloned().collect();
+        self.reaction_names =
+            self.reaction_decls.iter().map(|decl| decl.name.text.clone()).collect();
         for decl in project.declarations_of("material") {
             self.declare_material(decl);
         }
@@ -274,7 +321,8 @@ impl<'a> Compiler<'a> {
             notes: core::mem::take(&mut self.notes),
         };
 
-        Compiled { model, domains }
+        let coupler = self.lower_couples(project);
+        Compiled { model, domains, coupler }
     }
 
     // --- project settings ---------------------------------------------------
@@ -594,6 +642,42 @@ impl<'a> Compiler<'a> {
 
         let boundaries = self.field_boundaries(decl, dimension);
 
+        // A material property the solver never reads, kept so a coupling edge can
+        // derive its own conversion rather than taking a number on trust.
+        if let Some(setting) = decl.setting("heat_capacity") {
+            let expected = Dimension::ENERGY
+                .try_div(Dimension::AREA)
+                .and_then(|d| d.try_div(Dimension::TEMPERATURE))
+                .expect("energy per area per kelvin is representable");
+            let evaluator = self.evaluator();
+            if let Some(capacity) =
+                evaluator.require(&setting.value, expected, "`heat_capacity`", &mut self.diagnostics)
+            {
+                if capacity > 0.0 {
+                    self.heat_capacity.insert(decl.name.text.clone(), capacity);
+                } else {
+                    self.error(
+                        Diagnostic::error("a heat capacity must be positive")
+                            .with_code("E0405")
+                            .at(setting.value.span, format!("this is {capacity}"))
+                            .note("a negative one would make heating cool the field"),
+                    );
+                }
+            }
+        }
+
+        if is_species {
+            let evaluator = self.evaluator();
+            let chemistry = chemistry::species(
+                &decl.name.text,
+                &decl.settings,
+                &evaluator,
+                &mut self.diagnostics,
+            );
+            chemistry::check_molar_mass(&chemistry, decl.name.span, &mut self.diagnostics);
+            self.chemistry.insert(decl.name.text.clone(), chemistry);
+        }
+
         self.fields.insert(
             decl.name.text.clone(),
             FieldInfo {
@@ -803,6 +887,14 @@ impl<'a> Compiler<'a> {
             "boundary_right",
             "boundary_bottom",
             "boundary_top",
+            // A material property rather than a solver setting: the heat solver never
+            // reads it. It is here so a coupling edge can derive its own conversion
+            // factor instead of taking a magic number (spec §14.1).
+            "heat_capacity",
+            // Chemistry, meaningful on a `species`.
+            "formula",
+            "charge",
+            "molar_mass",
         ];
         for setting in &decl.settings {
             if !ALLOWED.contains(&setting.key.text.as_str()) {
@@ -820,9 +912,8 @@ impl<'a> Compiler<'a> {
 
     fn reject_unsupported(&mut self, project: &Project) {
         const KNOWN_KINDS: &[&str] =
-            &["grid", "particles", "material", "body", "joint"];
+            &["grid", "particles", "material", "body", "joint", "reaction"];
         const PLANNED: &[(&str, &str, &str)] = &[
-            ("reaction", "M3", "chemical reaction networks"),
             ("potential", "M5", "quantum potentials"),
             ("wavepacket", "M5", "quantum wave packets"),
             ("detector", "M5", "detectors"),
@@ -852,21 +943,9 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        for couple in project.couples() {
-            self.error(
-                Diagnostic::error("coupling between domains is not implemented yet")
-                    .with_code("E0900")
-                    .at(couple.span, "`couple` needs the coupling scheduler")
-                    .note(
-                        "milestone M3. The conservation ledger that will account for these \
-                         transfers already exists in lattice-ir",
-                    ),
-            );
-        }
-
         for domain in project.domains() {
-            // `rigid2d` was handled by `declare_rigid_world`.
-            if domain.family.text == "rigid2d" {
+            // These were handled by their own declaration passes.
+            if matches!(domain.family.text.as_str(), "rigid2d" | "chemistry") {
                 continue;
             }
             let milestone = match domain.family.text.as_str() {
@@ -917,6 +996,23 @@ impl<'a> Compiler<'a> {
             );
         }
 
+        if !self.reaction_decls.is_empty() {
+            let span = self.reaction_decls[0].name.span;
+            let count = self.reaction_decls.len();
+            self.error(
+                Diagnostic::warning(format!(
+                    "{count} reactions are declared but no `solve reactions` names a mixture"
+                ))
+                .with_code("W0306")
+                .at(span, "declared here")
+                .note("nothing will react; the species will only diffuse")
+                .help(
+                    "add `domain chemistry mixture { grid: … }` and \
+                     `solve reactions(mixture) with strang(dt = …);`",
+                ),
+            );
+        }
+
         if !self.bodies.is_empty() && !self.bodies_solved {
             let span = self.bodies[0].span;
             let count = self.bodies.len();
@@ -945,6 +1041,453 @@ impl<'a> Compiler<'a> {
                     .help(format!("add `solve dynamics({name}) with velocity_verlet(dt=…);`")),
             );
         }
+    }
+
+    // --- chemistry -----------------------------------------------------------
+
+    fn declare_mixture(&mut self, decl: &lattice_syntax::DomainDecl) {
+        if let Some(existing) = self.mixtures.get(&decl.name.text) {
+            let previous = existing.span;
+            self.error(
+                Diagnostic::error(format!("mixture `{}` is declared twice", decl.name.text))
+                    .with_code("E0201")
+                    .at(decl.name.span, "redeclared here")
+                    .also(previous, "first declared here"),
+            );
+            return;
+        }
+
+        const ALLOWED: &[&str] = &["grid", "temperature"];
+        for setting in &decl.settings {
+            if !ALLOWED.contains(&setting.key.text.as_str()) {
+                self.error(
+                    Diagnostic::error(format!(
+                        "a chemistry domain has no setting called `{}`",
+                        setting.key.text
+                    ))
+                    .with_code("E0204")
+                    .at(setting.key.span, "unknown setting")
+                    .help(format!("chemistry accepts: {}", ALLOWED.join(", "))),
+                );
+            }
+        }
+
+        let evaluator = self.evaluator();
+        let Some(grid) = decl.setting("grid").and_then(|s| evaluator.as_name(&s.value)) else {
+            self.error(
+                Diagnostic::error(format!("mixture `{}` needs a `grid`", decl.name.text))
+                    .with_code("E0203")
+                    .at(decl.name.span, "missing `grid`")
+                    .note("every species in a mixture reacts cell by cell on one grid")
+                    .help("add `grid: chamber;`"),
+            );
+            return;
+        };
+        if !self.grids.contains_key(grid) {
+            let known: Vec<&str> = self.grids.keys().map(String::as_str).collect();
+            self.error(
+                Diagnostic::error(format!("there is no grid called `{grid}`"))
+                    .with_code("E0202")
+                    .at(decl.setting("grid").unwrap().value.span, "unknown grid")
+                    .help(format!("declared grids: {}", known.join(", "))),
+            );
+            return;
+        }
+
+        self.mixtures.insert(
+            decl.name.text.clone(),
+            MixtureInfo { grid: grid.to_string(), span: decl.name.span, solved: false },
+        );
+    }
+
+    /// Build the reaction network from every `reaction` declaration.
+    ///
+    /// Returned rather than stored, because a network is only meaningful alongside the
+    /// species list it indexes into — and that list is the mixture's.
+    fn build_network(&mut self, grid: &str) -> (ReactionNetwork, Vec<String>) {
+        let mut network = ReactionNetwork::new();
+        let mut names = Vec::new();
+        let mut index_of: BTreeMap<String, usize> = BTreeMap::new();
+
+        // Species join in declaration order, so the report and the concentration
+        // vectors can be read against the source by counting down the file.
+        // `self.fields` is a BTreeMap, so this is already in name order — which is a
+        // total order and therefore reproducible, which is what FR-011 needs.
+        let species: Vec<&FieldInfo> =
+            self.fields.values().filter(|f| f.is_species && f.grid == grid).collect();
+        for field in species {
+            let chemistry = self
+                .chemistry
+                .get(&field.name)
+                .cloned()
+                .unwrap_or_else(|| ChemSpecies::new(field.name.clone()));
+            let index = network
+                .add_species(chemistry.with_diffusion(field.diffusivity.unwrap_or(0.0)));
+            index_of.insert(field.name.clone(), index);
+            names.push(field.name.clone());
+        }
+
+        let evaluator = self.evaluator();
+        let declarations = core::mem::take(&mut self.reaction_decls);
+        for decl in &declarations {
+            self.check_settings(decl, chemistry::REACTION_SETTINGS);
+            if let Some(reaction) =
+                chemistry::reaction(decl, &index_of, &evaluator, &mut self.diagnostics)
+            {
+                network.add_reaction(reaction);
+            }
+        }
+
+        // An unbalanced reaction destroys atoms in every cell, every step, and the only
+        // symptom is a conservation check failing several layers away. When every
+        // species states its composition there is no reason to let it through.
+        for (reaction, balance) in network.imbalances() {
+            let span = declarations
+                .iter()
+                .find(|d| d.name.text == reaction.name)
+                .map_or_else(|| Span::new(0, 0), |d| d.name.span);
+            match balance {
+                lattice_domain_chemistry::Balance::Unknown { .. } => self.error(
+                    Diagnostic::warning(format!(
+                        "reaction `{}` cannot be checked for balance",
+                        reaction.name
+                    ))
+                    .with_code("W0305")
+                    .at(span, balance.describe())
+                    .note(
+                        "a reaction whose atoms cannot be counted may destroy mass without \
+                         anything noticing until a conservation check fails",
+                    )
+                    .help("give every species a `formula:`"),
+                ),
+                _ => self.error(
+                    Diagnostic::error(format!("reaction `{}` does not balance", reaction.name))
+                        .with_code("E0212")
+                        .at(span, balance.describe())
+                        .note(
+                            "an unbalanced reaction integrates perfectly happily and destroys \
+                             mass every step; the only symptom is a ledger that will not close",
+                        )
+                        .help("check the stoichiometric coefficients"),
+                ),
+            }
+        }
+
+        (network, names)
+    }
+
+    fn lower_reactions(&mut self, solve: &SolveStmt, method: &builtins::Method, out: &mut Lowering) {
+        let Some(target) = solve.targets.first() else { return };
+        let Some(name) = target.value.as_name() else {
+            self.error(
+                Diagnostic::error("a chemistry solver target must be a mixture name")
+                    .with_code("E0401")
+                    .at(target.value.span, "not a name")
+                    .help("write `solve reactions(mixture) with strang(dt = 0.5 second);`"),
+            );
+            return;
+        };
+        match method.name.as_str() {
+            "strang" | "splitting" | "operator_splitting" => {}
+            other => {
+                self.error(
+                    Diagnostic::error(format!("`{other}` is not a method for reactions"))
+                        .with_code("E0207")
+                        .at(method.span, "unknown method")
+                        .help("use `strang(dt = …)`"),
+                );
+                return;
+            }
+        }
+
+        let Some(mixture) = self.mixtures.get(name).cloned() else {
+            let known: Vec<&str> = self.mixtures.keys().map(String::as_str).collect();
+            self.error(
+                Diagnostic::error(format!("there is no mixture called `{name}`"))
+                    .with_code("E0202")
+                    .at(target.value.span, "unknown mixture")
+                    .help(if known.is_empty() {
+                        "declare one with `domain chemistry mixture { grid: chamber; }`".to_string()
+                    } else {
+                        format!("declared mixtures: {}", known.join(", "))
+                    }),
+            );
+            return;
+        };
+        if let Some(entry) = self.mixtures.get_mut(name) {
+            entry.solved = true;
+        }
+
+        let (network, species_names) = self.build_network(&mixture.grid);
+        if network.is_empty() {
+            self.error(
+                Diagnostic::error(format!("mixture `{name}` has no species"))
+                    .with_code("E0203")
+                    .at(mixture.span, "nothing to solve")
+                    .help(format!("declare one with `species A on {} = …;`", mixture.grid)),
+            );
+            return;
+        }
+
+        let grid = self.grids[&mixture.grid].grid;
+        let mut domain = ReactingMixture::new(name.to_string(), grid, network);
+        for (index, species) in species_names.iter().enumerate() {
+            let field = self.fields[species].clone();
+            if let Some(entry) = self.fields.get_mut(species) {
+                entry.solved = true;
+            }
+            domain.set_boundaries(index, field.boundaries);
+            let initializer = field.initializer.clone();
+            if let Some(concentration) = domain.concentration_mut(index) {
+                concentration.init_from_position(&grid, |p| initializer.sample(p, &grid));
+            }
+        }
+
+        let buffer = out.buffers.allocate(
+            name.to_string(),
+            BufferKind::ScalarField { nx: grid.nx(), ny: grid.ny(), halo: 1 },
+        );
+        out.buffers.require_scratch(grid.cell_count());
+
+        let id = DomainId::from_index(out.specs.len() as u32);
+        out.operations.push(
+            Operation::new(format!("prepare {name}"), OperationKind::Prepare)
+                .in_domain(id)
+                .writing(buffer)
+                .costing(0.1),
+        );
+        out.operations.push(
+            Operation::new(format!("advance {name}"), OperationKind::Advance)
+                .in_domain(id)
+                .reading(buffer)
+                .writing(buffer)
+                // A reacting cell costs a Runge-Kutta solve per species, and a diffusing
+                // one costs a linear solve; both scale with the cell count.
+                .costing(grid.cell_count() as f64 * (20.0 + 4.0 * species_names.len() as f64)),
+        );
+
+        let reactions = domain.network().reactions().len();
+        let equations: Vec<String> = domain
+            .network()
+            .reactions()
+            .iter()
+            .map(|reaction| reaction.equation(domain.network().species()))
+            .collect();
+        for (reaction, equation) in domain.network().reactions().iter().zip(&equations) {
+            self.notes.push(format!(
+                "reaction `{}`: {equation}, {}",
+                reaction.name,
+                reaction.rate.describe(reaction.order())
+            ));
+        }
+
+        self.domain_index.insert(name.to_string(), out.specs.len());
+        out.specs.push(DomainSpec {
+            id,
+            name: name.to_string(),
+            family: "chemistry.reaction_diffusion[strang]".to_string(),
+            summary: format!(
+                "{} species on `{}`, {reactions} reactions: {}",
+                species_names.len(),
+                mixture.grid,
+                if equations.is_empty() { "none".to_string() } else { equations.join("; ") }
+            ),
+            buffers: vec![buffer],
+            contract: Some(domain.contract()),
+        });
+        if let Some(dt) = method.timestep {
+            let _ = dt;
+        }
+        out.domains.push(Box::new(domain));
+    }
+
+    /// Resolve every `couple` statement into an edge, deriving its unit conversion.
+    ///
+    /// # Why the compiler computes the factor rather than reading one
+    ///
+    /// A coupling edge's mapping is where two domains' units meet, and it is the one
+    /// number in a coupled model that nothing else checks. Writing it by hand means
+    /// writing `0.0000025` in a model file and hoping; six months later nobody knows
+    /// whether it was a heat capacity or a thickness.
+    ///
+    /// The compiler already knows both sides. A reaction publishes `W/m²`; a
+    /// temperature field consumes `K/s`. The ratio of those has the dimensions of a
+    /// reciprocal areal heat capacity, and the field can *declare* that as a material
+    /// property. So the model says what the material is, and the arithmetic that turns
+    /// it into a coupling factor happens where it can be dimension-checked.
+    fn lower_couples(&mut self, project: &Project) -> Coupler {
+        let mut coupler = Coupler::new();
+        for couple in project.couples() {
+            let Some(edge) = self.lower_couple(couple) else { continue };
+            self.notes.push(format!("couple {}", edge.describe()));
+            coupler.add(edge);
+        }
+        coupler
+    }
+
+    fn lower_couple(&mut self, couple: &lattice_syntax::CoupleStmt) -> Option<CouplingEdge> {
+        let source = self.resolve_port(&couple.source, "source")?;
+        let target = self.resolve_port(&couple.target, "target")?;
+
+        let name = format!("{}_to_{}", couple.source.root().text, couple.target.root().text);
+        let mut edge =
+            CouplingEdge::new(name, source.reference.clone(), target.reference.clone());
+
+        // The two units either match, in which case nothing is needed, or they do not,
+        // in which case the model has to have said what converts them.
+        if source.dimension == target.dimension {
+            edge = edge.with_mapping(Mapping::Direct);
+        } else {
+            edge = edge.with_mapping(self.conversion(&source, &target, couple.span)?);
+        }
+
+        if let Some(conserve) = &couple.conserve {
+            match invariant_named(&conserve.text) {
+                Some(quantity) => edge = edge.carrying(quantity),
+                None => self.error(
+                    Diagnostic::error(format!("`{}` is not a conserved quantity", conserve.text))
+                        .with_code("E0208")
+                        .at(conserve.span, "unknown quantity")
+                        .help("one of: energy, mass, momentum_x, momentum_y, charge, amount"),
+                ),
+            }
+        }
+        Some(edge)
+    }
+
+    /// Resolve `domain.port` to an index, a port name, and the dimension it carries.
+    fn resolve_port(&mut self, path: &lattice_syntax::Path, role: &str) -> Option<ResolvedPort> {
+        let root = path.root();
+        let Some(&index) = self.domain_index.get(&root.text) else {
+            let known: Vec<&str> = self.domain_index.keys().map(String::as_str).collect();
+            // A reaction is the commonest wrong answer here, because it is the thing
+            // that releases the heat. It is not a domain: the mixture that contains it
+            // is, and that is what publishes the port.
+            let is_reaction = self.reaction_names.contains(&root.text);
+            let diagnostic = Diagnostic::error(format!(
+                "there is no domain called `{}`",
+                root.text
+            ))
+            .with_code("E0202")
+            .at(root.span, format!("unknown {role} domain"));
+            let diagnostic = if is_reaction {
+                diagnostic
+                    .note(format!(
+                        "`{}` is a reaction, and a reaction is not a domain — the mixture \
+                         containing it is what publishes `heat_release`",
+                        root.text
+                    ))
+                    .help(if known.is_empty() {
+                        "declare one with `domain chemistry mixture { grid: … }` and solve it"
+                            .to_string()
+                    } else {
+                        format!("couple from one of: {}", known.join(", "))
+                    })
+            } else {
+                diagnostic.help(if known.is_empty() {
+                    "a coupling connects two solved domains; nothing is solved yet".to_string()
+                } else {
+                    format!("solved domains: {}", known.join(", "))
+                })
+            };
+            self.error(diagnostic);
+            return None;
+        };
+        let Some(port) = path.tail().first() else {
+            self.error(
+                Diagnostic::error("a coupling endpoint names a domain and a port")
+                    .with_code("E0401")
+                    .at(path.span, "no port named")
+                    .help("write `chamber.heat_release -> temperature.source`"),
+            );
+            return None;
+        };
+
+        // The dimension a port carries. Known for the ports this milestone ships;
+        // anything else is refused rather than guessed, because a guess here is a
+        // silent factor in a coupled model.
+        let dimension = match port.text.as_str() {
+            "heat_release" => Dimension::POWER.try_div(Dimension::AREA).ok(),
+            "temperature" => Some(Dimension::TEMPERATURE),
+            "values" => self.field_dimension_of(&root.text),
+            "source" => self
+                .field_dimension_of(&root.text)
+                .and_then(|d| d.try_div(Dimension::TIME).ok()),
+            _ => None,
+        };
+        let Some(dimension) = dimension else {
+            self.error(
+                Diagnostic::error(format!("`{}` is not a coupling port", port.text))
+                    .with_code("E0202")
+                    .at(port.span, "unknown port")
+                    .help("available: values, source, heat_release, temperature"),
+            );
+            return None;
+        };
+
+        Some(ResolvedPort {
+            reference: PortRef::new(index, port.text.clone()),
+            dimension,
+            owner: root.text.clone(),
+        })
+    }
+
+    /// The dimension of the field a domain solves, when it solves one.
+    fn field_dimension_of(&self, domain: &str) -> Option<Dimension> {
+        self.fields.get(domain).map(|field| field.dimension)
+    }
+
+    /// Find the declared material property that converts `source` into `target`.
+    fn conversion(
+        &mut self,
+        source: &ResolvedPort,
+        target: &ResolvedPort,
+        span: Span,
+    ) -> Option<Mapping> {
+        let needed = target.dimension.try_div(source.dimension).ok();
+
+        // The only conversion this milestone knows: an areal heat capacity, declared on
+        // the field that receives the heat.
+        if let Some(&capacity) = self.heat_capacity.get(&target.owner)
+            && capacity > 0.0
+        {
+            let reciprocal = Dimension::AREA
+                .try_mul(Dimension::TEMPERATURE)
+                .ok()
+                .and_then(|d| d.try_div(Dimension::ENERGY).ok());
+            if needed.is_some() && needed == reciprocal {
+                return Some(Mapping::scale(
+                    1.0 / capacity,
+                    format!(
+                        "1 / heat_capacity of `{}` ({capacity:.4e} J/(m^2 K))",
+                        target.owner
+                    ),
+                ));
+            }
+        }
+
+        self.error(
+            Diagnostic::error("this coupling needs a unit conversion the model has not declared")
+                .with_code("E0400")
+                .at(span, format!(
+                    "{} does not convert to {}",
+                    source.dimension.describe(),
+                    target.dimension.describe()
+                ))
+                .note(format!(
+                    "the factor between them would have to be in {}",
+                    needed.map_or_else(
+                        || "a dimension outside the representable range".to_string(),
+                        |d| d.describe()
+                    )
+                ))
+                .help(format!(
+                    "for a heat coupling, add `heat_capacity: 4e5 joule / (meter^2 kelvin);` \
+                     to `{}`",
+                    target.owner
+                )),
+        );
+        None
     }
 
     // --- rigid bodies --------------------------------------------------------
@@ -1086,9 +1629,9 @@ impl<'a> Compiler<'a> {
                 }
             }
             "rigid" | "bodies" | "contacts" => self.lower_rigid(solve, &method, out),
+            "reactions" | "kinetics" | "chemistry" => self.lower_reactions(solve, &method, out),
             other => {
                 let planned = match other {
-                    "reactions" | "kinetics" => Some("M3"),
                     "flow" | "fluid" => Some("M2"),
                     "schrodinger" | "quantum" => Some("M5"),
                     _ => None,
@@ -1103,7 +1646,10 @@ impl<'a> Compiler<'a> {
                         Diagnostic::error(format!("`{other}` is not a known solver"))
                             .with_code("E0206")
                             .at(solve.solver.span, "unknown solver")
-                            .help("available now: heat, diffusion, transport, dynamics, rigid"),
+                            .help(
+                                "available now: heat, diffusion, transport, dynamics, \
+                                 rigid, reactions",
+                            ),
                     ),
                 }
             }
@@ -1237,6 +1783,7 @@ impl<'a> Compiler<'a> {
                 .costing(grid.cell_count() as f64 * if scheme.is_implicit() { 20.0 } else { 1.0 }),
         );
 
+        self.domain_index.insert(field.name.clone(), out.specs.len());
         out.specs.push(DomainSpec {
             id,
             name: field.name.clone(),
@@ -1382,6 +1929,7 @@ impl<'a> Compiler<'a> {
         } else {
             set.forces.iter().map(ForceSpec::describe).collect::<Vec<_>>().join("; ")
         };
+        self.domain_index.insert(set.name.clone(), out.specs.len());
         out.specs.push(DomainSpec {
             id,
             name: set.name.clone(),
@@ -1590,6 +2138,7 @@ impl<'a> Compiler<'a> {
             self.notes.push(format!("joint `{}`: {}", plan.name, plan.describe()));
         }
 
+        self.domain_index.insert(name.to_string(), out.specs.len());
         out.specs.push(DomainSpec {
             id,
             name: name.to_string(),
@@ -1733,6 +2282,29 @@ fn describe_boundaries(set: &BoundarySet) -> String {
         .map(|(name, boundary)| format!("{name} {}", boundary.kind_name()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// A coupling endpoint, resolved.
+#[derive(Clone, PartialEq, Debug)]
+struct ResolvedPort {
+    reference: PortRef,
+    dimension: Dimension,
+    /// The domain the port belongs to, for a diagnostic and for looking up the material
+    /// property that converts it.
+    owner: String,
+}
+
+/// The conserved quantity a `conserve` clause names.
+fn invariant_named(name: &str) -> Option<Invariant> {
+    Some(match name {
+        "energy" => Invariant::Energy,
+        "mass" => Invariant::Mass,
+        "momentum_x" => Invariant::MomentumX,
+        "momentum_y" => Invariant::MomentumY,
+        "charge" => Invariant::Charge,
+        "amount" | "moles" => Invariant::Amount,
+        _ => return None,
+    })
 }
 
 /// The current world distance between a joint's two anchor points.

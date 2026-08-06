@@ -153,32 +153,82 @@ Delivered:
   that ratio is enormous — the period came out eight times too fast. Inverting the 2×2
   fixed it in one iteration.
 
-## M3 — Chemistry (next)
+## M3 — Chemistry ✅
 
-**Spec exit condition:** reaction networks, reaction-diffusion, heat coupling, ledger.
+**Spec exit condition:** *"flagship exothermic reaction demo passes conservation
+checks."* [`examples/chamber.lattice`](../examples/chamber.lattice) does, and 41 of 41
+validation cases pass.
+
+Delivered:
+
+- **`lattice-domain-chemistry`** — species with formulas, charges, molar masses and
+  diffusion coefficients; reaction networks with **atom and charge balance checking**;
+  mass-action kinetics with reversibility and Arrhenius temperature dependence;
+  reaction-diffusion by Strang splitting over the existing, already-validated diffusion
+  solver.
+- **`lattice-coupling`** — typed ports, coupling edges with mappings and cadence, the
+  one-way and loose-staggered strategies of §14.2, and the `ConservationLedger` that had
+  existed unused in `lattice-ir` since M0.
+- **The language** — `reaction` declarations (whose stoichiometry needed no new syntax:
+  `2 H2 + O2` already parses, because juxtaposition binds tighter than `+`), chemistry
+  attributes on `species`, `domain chemistry`, `solve reactions(…)`, and `couple`.
+- **Chemistry validation** — §19.2's first-order, reversible, reaction-diffusion and
+  coupled-ledger rows. Gillespie statistics are *absent* rather than skipped, because
+  the stochastic path is not implemented.
+
+833 tests. Clippy clean.
+
+### What M3 taught us
+
+- **A coupling edge's unit conversion should be derived, not written.** A reaction
+  publishes `W/m²`; a heat solver consumes `K/s`. Wire them straight together and the
+  run compiles, executes, looks entirely plausible, and is wrong by an areal heat
+  capacity. So the model declares `heat_capacity` as a *material property of the field*,
+  and the compiler does the dimensional algebra — which means a mis-wired edge is a
+  message naming both units rather than a number nobody can check.
+- **Which side of a mapping the ledger measures is not arbitrary.** Recording the
+  post-mapping value gives a number in the target's units, off from the energy by
+  exactly the factor the mapping applied. The ledger records what left the *source*.
+- **The books should not balance exactly, and that is the point.** A staggered coupling
+  always has one exchange in flight. The validation case asserts that the shortfall is
+  at most one transfer *and* that it is first order in `dt`, which turns "nearly
+  balances" into a statement about why.
+- **Stiffness is not the same as "many steps".** A budget can run out because the
+  network is stiff or because the interval asked for is enormous relative to the
+  timescale, and the two need different fixes. `KineticsReport` reports `exhausted` and
+  `stiffness` separately.
+- **Energy is a state variable.** The heat released was first sampled as an
+  instantaneous power; for a reaction that half-finishes in one step that is wrong by a
+  factor of `e`. Carrying it through the same Runge–Kutta stages as the concentrations
+  makes it fourth-order accurate and costs nothing, because the heat rate falls out of
+  rate evaluations the stages already perform.
+- **`as_slice()` includes the halo.** A perfectly second-order splitting measured as
+  first order, for a whole afternoon, because the test compared whole buffers and the
+  halo holds intermediate boundary state rather than part of the answer.
+
+## M4 — Portable GPU (next)
+
+**Spec exit condition:** *"selected CPU/GPU cross-validation and performance goals."*
 
 Needed:
 
-1. **`lattice-domain-chemistry`** — reaction networks with mass-action kinetics, the
-   Gillespie algorithm, and reaction-diffusion (§11.9, §19.2's Gray–Scott row).
-2. **The coupling scheduler** — `couple` blocks, typed ports, and convergence (§14).
-   The conservation ledger that will account for the transfers already exists in
-   `lattice-ir` and is unused.
-3. **The §20.3 flagship demo** — a reacting chamber: chemistry driving heat driving
-   flow, with the ledger balancing.
-4. **CPU parallelism** — §15.3 asks for parallel iterators over independent operations.
-   The operation graph already computes which those are and reports the ideal speedup;
-   nothing consumes it yet. Deferred from M2 because a single rigid domain has nothing
-   to parallelize *across*; a coupled model does.
+1. **A `wgpu` compute backend** — the operation graph already computes which operations
+   are independent and reports the ideal speedup; nothing consumes that yet.
+2. **Kernel cache and zero-copy rendering** — §15.5's normalized expression hashing, and
+   the viewer drawing from simulation buffers rather than a CPU texture upload.
+3. **CPU/GPU cross-validation** — §19.1 lists it as its own level, and it is the whole
+   reason the scalar CPU path is described as the executable specification.
+4. **CPU parallelism** — §15.3's parallel iterators, deferred twice now. A coupled model
+   finally has independent operations to run across, and `examples/chamber.lattice` is
+   the first model whose graph has a width above one.
 
 ## Later milestones
 
 | Milestone | Result | Blocked on |
 |---|---|---|
-| M4 — Portable GPU | `wgpu` compute, kernel cache, zero-copy rendering | the operation graph, which exists |
 | M5 — Molecular and quantum | LJ MD proper, bonds, `quantum2d` | M2, done |
 | M6 — Extensibility | expression compiler (§8.3), Python API, plugin SDK | M1, done |
-| M7 — Productization | packages, report export, reproducibility artifacts | M3 |
+| M7 — Productization | packages, report export, reproducibility artifacts | M3, done |
 | M8 — External solvers | quantum/FMI adapters with provenance | M7 |
 
 ## Standing constraints

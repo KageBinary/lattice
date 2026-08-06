@@ -1,0 +1,107 @@
+// The flagship demo: a reacting chamber.
+//
+// Spec §20.3: "a 2D chamber containing two diffusing species. A barrier is removed;
+// species mix and react; reaction heat raises local temperature; temperature changes
+// the rate constant."
+//
+// That is a loop, and the loop is the point. Fuel and oxidiser start on opposite
+// sides. Where they meet they react; the reaction releases heat; the heat raises the
+// local temperature; the higher temperature raises the rate constant through
+// Arrhenius; the faster reaction releases more heat. A reaction front is the balance
+// between that feedback and the diffusion carrying heat away.
+//
+// Two coupling edges close it, and neither carries a number the model had to compute:
+//
+//   chamber.heat_release -> temperature.source     W/m^2 becomes K/s
+//   temperature.field    -> chamber.temperature    K, unchanged
+//
+// The first needs a conversion, and the compiler derives it from the areal heat
+// capacity declared on the field — see `heat_capacity` below. Writing that factor by
+// hand is how a coupled model comes to be wrong by a heat capacity while looking
+// entirely plausible.
+//
+// Everything transferred is in the ledger, and `lattice run` reports whether the
+// energy that arrived is the energy that was sent.
+//
+//   lattice run  examples/chamber.lattice
+//   lattice-view examples/chamber.lattice --play
+
+project chamber {
+  dimensions: 2;
+  fidelity: engineering_2d;
+  duration: 40 second;
+
+  grid vessel { size: [96, 48]; extent: [0.4 meter, 0.2 meter]; }
+
+  // Every species reacts cell by cell on one grid.
+  domain chemistry chamber {
+    grid: vessel;
+  }
+
+  // Concentrations are per unit AREA. This is a 2D world, and a concentration per
+  // unit volume would need a thickness nobody declared.
+  species fuel on vessel = left_half(40 mole / meter^2) {
+    formula:     CH4;
+    diffusivity: 2e-5 meter^2 / second;
+    boundary:    insulated;
+  }
+
+  species oxidiser on vessel = right_half(80 mole / meter^2) {
+    formula:     O2;
+    diffusivity: 2e-5 meter^2 / second;
+    boundary:    insulated;
+  }
+
+  species product on vessel = 0 mole / meter^2 {
+    formula:     CO2;
+    diffusivity: 1e-5 meter^2 / second;
+    boundary:    insulated;
+  }
+
+  species water on vessel = 0 mole / meter^2 {
+    formula:     H2O;
+    diffusivity: 3e-5 meter^2 / second;
+    boundary:    insulated;
+  }
+
+  // CH4 + 2 O2 -> CO2 + 2 H2O. Balanced, and the compiler checks it: an unbalanced
+  // reaction integrates perfectly happily and destroys mass every step.
+  //
+  // Mass action in the stoichiometry, so the total order is 1 + 2 = 3 and the rate
+  // constant is in m^4/(mol^2 s). Writing a second-order constant here would be off by
+  // a factor with the dimensions of a concentration, and the number looks plausible
+  // either way — so the compiler works the order out from the reactants and checks it.
+  //
+  // (Real methane combustion is not an elementary step, and this does not pretend to be
+  // one. It is mass action in the overall stoichiometry, which is what a 2D teaching
+  // model can honestly claim.)
+  reaction combustion {
+    reactants:         fuel + 2 oxidiser;
+    products:          product + 2 water;
+    rate:              30 meter^4 / (mole^2 second);
+    activation_energy: 30 kilojoule / mole;
+    enthalpy:          -8.0e2 kilojoule / mole;
+  }
+
+  // The temperature field. `heat_capacity` is a material property the heat solver
+  // never reads — it is here so the coupling edge below can derive its own conversion
+  // factor and have it dimension-checked.
+  field temperature on vessel = 300 kelvin {
+    diffusivity:   1.2e-5 meter^2 / second;
+    heat_capacity: 4.0e5 joule / (meter^2 kelvin);
+    boundary:      insulated;
+  }
+
+  solve reactions(chamber)  with strang(dt = 0.02 second);
+  solve heat(temperature)   with crank_nicolson(dt = 0.02 second);
+
+  // The loop. `conserve energy` puts every transfer in the ledger, so the run reports
+  // whether what arrived is what was sent.
+  couple chamber.heat_release -> temperature.source conserve energy;
+  couple temperature.values   -> chamber.temperature;
+
+  observe temperature every 0.2 second;
+  observe chamber     every 0.2 second;
+
+  visualize temperature as heatmap;
+}

@@ -1654,6 +1654,8 @@ dependencies = [
 name = "lattice-compiler"
 version = "0.1.0"
 dependencies = [
+ "lattice-coupling",
+ "lattice-domain-chemistry",
  "lattice-domain-grid2d",
  "lattice-domain-particle",
  "lattice-domain-rigid2d",
@@ -1721,6 +1723,7 @@ dependencies = [
 name = "lattice-runtime"
 version = "0.1.0"
 dependencies = [
+ "lattice-coupling",
  "lattice-ir",
  "lattice-observe",
 ]
@@ -1740,6 +1743,8 @@ version = "0.1.0"
 name = "lattice-validation"
 version = "0.1.0"
 dependencies = [
+ "lattice-coupling",
+ "lattice-domain-chemistry",
  "lattice-domain-grid2d",
  "lattice-domain-particle",
  "lattice-domain-rigid2d",

@@ -34,6 +34,7 @@
 //! assert!(measured.observed < 1e-9, "{}: {}", measured.metric, measured.observed);
 //! ```
 
+mod chemistry;
 mod contracts;
 mod heat;
 mod particles;
@@ -235,6 +236,7 @@ pub fn all_cases() -> Vec<Case> {
     cases.extend_from_slice(particles::CASES);
     cases.extend_from_slice(heat::CASES);
     cases.extend_from_slice(rigid::CASES);
+    cases.extend_from_slice(chemistry::CASES);
     cases.extend_from_slice(contracts::CASES);
     cases
 }

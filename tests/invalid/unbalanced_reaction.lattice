@@ -1,0 +1,33 @@
+// expect: E0212
+// `A + B -> C` with these formulas destroys an oxygen every time it fires. It would
+// integrate perfectly happily; the only symptom would be a conservation check failing
+// several layers away, in a ledger, long after the typo.
+
+project unbalanced_reaction {
+  grid chamber { size: [16, 16]; extent: [1 meter, 1 meter]; }
+
+  domain chemistry mixture { grid: chamber; }
+
+  species H2 on chamber = left_half(2 mole / meter^2) {
+    formula:     H2;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  species O2 on chamber = right_half(1 mole / meter^2) {
+    formula:     O2;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  species H2O on chamber = 0 mole / meter^2 {
+    formula:     H2O;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  reaction typo {
+    reactants: H2 + O2;
+    products:  H2O;
+    rate:      1 meter^2 / (mole second);
+  }
+
+  solve reactions(mixture) with strang(dt = 0.1 second);
+}

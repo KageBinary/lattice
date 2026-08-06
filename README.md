@@ -13,7 +13,7 @@ A 2D-first multiphysics, chemistry, and quantum simulation runtime.
 
 ---
 
-## Status: milestones M0, M1 and M2 complete
+## Status: milestones M0 through M3 complete
 
 The spec lays out nine milestones, M0 through M8.
 
@@ -22,8 +22,12 @@ The spec lays out nine milestones, M0 through M8.
 - **M1 — Compiled model.** Exit condition: *"same project executes headless and
   interactively."* Both halves: `lattice run` headless, `lattice-view` in a window.
 - **M2 — Mechanics and fields.** Exit condition: *"canonical validation suite passes."*
-  33 of 33 cases, including §19.2's elastic and inelastic collision and constrained
-  motion, which M0 had to leave out because the rigid module did not exist.
+  §19.2's elastic and inelastic collision and constrained motion, which M0 had to leave
+  out because the rigid module did not exist.
+- **M3 — Chemistry.** Exit condition: *"flagship exothermic reaction demo passes
+  conservation checks."* [`examples/chamber.lattice`](examples/chamber.lattice) runs
+  §20.3's reacting chamber and conserves mass and every element to round-off, with the
+  coupling ledger accounting for the energy. 41 of 41 validation cases.
 
 Being specific about that, in the spirit of design principle **P1 — scientific
 honesty over feature count**:
@@ -40,15 +44,21 @@ honesty over feature count**:
 | **Particles** | Explicit Euler, semi-implicit Euler, velocity Verlet; gravity, drag, harmonic wells, Lennard-Jones; uniform cell list | Free fall, oscillator period, energy drift, convergence order, momentum conservation |
 | **Rigid bodies** | Circles, boxes, convex polygons, segments; sweep-and-prune broadphase, SAT narrowphase, friction and restitution; distance, rope, pin, spring and motor joints; sequential-impulse solver with warm starting | Elastic collision exchanges velocities exactly; inelastic loses exactly the predicted energy; pendulum period within 0.008% of analytic; Coulomb friction threshold to the digit |
 | **Heat / diffusion** | Finite-volume `∇·(D∇u)`, explicit / Crank–Nicolson / backward Euler, matrix-free conjugate gradient, Dirichlet / Neumann / Robin / periodic boundaries, variable diffusivity | Analytic heat kernel, manufactured solutions, convergence orders, conservation, series conduction |
+| **Chemistry** | Species with formulas, charges and diffusion; reaction networks with atom and charge balance checking; mass-action kinetics with Arrhenius temperature dependence; reaction-diffusion by Strang splitting | First-order decay to 1e-9 of analytic; equilibrium to the constant it declares; RK4 order 4.05; splitting order 2.00; mass and every element to round-off |
+| **Coupling** | Typed ports with units, coupling edges with compiler-derived unit conversions, cadence, and a conservation ledger | An exothermic reaction's energy arrives where the ledger says it was sent, to within the one exchange a staggered coupling always has in flight |
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 757 tests across 12 crates |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 833 tests across 14 crates |
 | **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, conservation drift and the solver's contract | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
 
-Fluids, waves, electromagnetism, chemistry, molecular dynamics beyond Lennard-Jones,
-the quantum module, the coupling scheduler, GPU execution, and the Python SDK. Those
-are M3–M8. The viewer draws through a CPU texture upload, which is fine at 64×64 and
+Fluids, waves, electromagnetism, molecular dynamics beyond Lennard-Jones, the quantum
+module, GPU execution, and the Python SDK. Those are M4–M8. Stochastic kinetics
+(Gillespie) is not implemented, so its §19.2 row is *absent* from the validation
+report rather than present and skipped. Coupling supports one-way and loose staggered
+strategies; subcycling and fixed-point iteration are not there, because a fixed-point
+coupling needs a checkpoint mechanism this runtime does not have and a half-implemented
+one would claim a convergence it never checked. The viewer draws through a CPU texture upload, which is fine at 64×64 and
 will not be at 768×384; GPU rendering is M4. Rigid-body collision detection is
 discrete, so a fast thin projectile can pass through a thin wall — continuous
 collision detection is what §11.1 lists under "later".
@@ -260,6 +270,8 @@ lattice/
     lattice-domain-particle/  integrators, force laws, neighbour search
     lattice-domain-grid2d/    diffusion operator, boundaries, conjugate gradient
     lattice-domain-rigid2d/   shapes, broadphase, contacts, joints, impulse solver
+    lattice-domain-chemistry/ species, reaction networks, kinetics, reaction-diffusion
+    lattice-coupling/         typed ports, coupling edges, the conservation ledger
     lattice-observe/          JSON, timing profiles, run artifacts
     lattice-validation/       the validation lab
     lattice-cli/              the `lattice` binary

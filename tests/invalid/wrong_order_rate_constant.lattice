@@ -1,0 +1,34 @@
+// expect: E0400
+// A rate constant's unit follows the reaction's total order: this one is second order,
+// so it belongs in m^2/(mol s) rather than 1/s. The two are off by a factor with the
+// dimensions of a concentration, and rate constants span twenty orders of magnitude —
+// so nothing about the number itself says which was meant.
+
+project wrong_order_rate_constant {
+  grid chamber { size: [16, 16]; extent: [1 meter, 1 meter]; }
+
+  domain chemistry mixture { grid: chamber; }
+
+  species A on chamber = left_half(1 mole / meter^2) {
+    formula:     C;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  species B on chamber = right_half(1 mole / meter^2) {
+    formula:     O;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  species AB on chamber = 0 mole / meter^2 {
+    formula:     CO;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  reaction combine {
+    reactants: A + B;
+    products:  AB;
+    rate:      1e3 / second;
+  }
+
+  solve reactions(mixture) with strang(dt = 0.1 second);
+}

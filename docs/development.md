@@ -33,7 +33,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test                      # 757 tests across 12 crates
+$ cargo test                      # 833 tests across 14 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window

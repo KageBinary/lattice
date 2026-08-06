@@ -193,10 +193,18 @@ impl RunOutcome {
 pub struct Simulation {
     model: CompiledModel,
     domains: Vec<Box<dyn Domain>>,
+    /// The coupling edges between the domains, and the ledger of what they moved.
+    ///
+    /// Empty for an uncoupled model, in which case `exchange` is a no-op and costs a
+    /// loop over nothing.
+    coupler: lattice_coupling::Coupler,
     arena: Arena,
     clock: Clock,
     observations: Observations,
     profile: Profile,
+    /// Coupling faults seen so far, so a mis-wired edge is reported once rather than
+    /// once per step.
+    coupling_faults: Vec<String>,
 }
 
 impl core::fmt::Debug for Simulation {
@@ -211,6 +219,27 @@ impl core::fmt::Debug for Simulation {
 
 impl Simulation {
     /// Build a simulation from a compiled model and its instantiated solvers.
+    /// Build a simulation with coupling edges between its domains.
+    pub fn coupled(
+        model: CompiledModel,
+        domains: Vec<Box<dyn Domain>>,
+        coupler: lattice_coupling::Coupler,
+    ) -> Simulation {
+        let mut simulation = Simulation::new(model, domains);
+        simulation.coupler = coupler;
+        simulation
+    }
+
+    /// The coupling ledger, for a report or a conservation check.
+    pub fn ledger(&self) -> &lattice_ir::ConservationLedger {
+        self.coupler.ledger()
+    }
+
+    /// Coupling edges that failed, each reported once.
+    pub fn coupling_faults(&self) -> &[String] {
+        &self.coupling_faults
+    }
+
     pub fn new(model: CompiledModel, domains: Vec<Box<dyn Domain>>) -> Simulation {
         // The buffer plan already decided how much scratch the model needs, which is
         // what keeps NFR-001 true: this is the last allocation before the hot loop.
@@ -218,10 +247,12 @@ impl Simulation {
         Simulation {
             model,
             domains,
+            coupler: lattice_coupling::Coupler::new(),
             arena,
             clock: Clock::default(),
             observations: Observations::new(),
             profile: Profile::new(),
+            coupling_faults: Vec::new(),
         }
     }
 
@@ -314,6 +345,19 @@ impl Simulation {
         for domain in &mut self.domains {
             domain.advance(dt, &mut context);
         }
+
+        // Coupling runs *after* the domains, which makes this a loose staggered scheme
+        // (§14.2): each domain advances on the latest state it was given, and what it
+        // produces reaches its neighbours before the next step. One exchange is always
+        // in flight, which is what the ledger's residual measures.
+        let report = self.coupler.exchange(&mut self.domains, self.clock.step, self.clock.time, dt);
+        for (edge, fault) in &report.faults {
+            let message = format!("coupling edge `{edge}`: {fault}");
+            if !self.coupling_faults.contains(&message) {
+                self.coupling_faults.push(message);
+            }
+        }
+
         self.clock.advance(dt);
     }
 

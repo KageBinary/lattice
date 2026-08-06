@@ -1,0 +1,37 @@
+// expect: E0202
+// A reaction is not a domain. It is the thing that releases the heat, which makes it
+// the natural wrong answer here — but the mixture containing it is what publishes the
+// port, and the diagnostic says so.
+
+project couple_from_a_reaction {
+  grid chamber { size: [16, 16]; extent: [1 meter, 1 meter]; }
+
+  domain chemistry mixture { grid: chamber; }
+
+  species A on chamber = left_half(1 mole / meter^2) {
+    formula:     C;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  species B on chamber = 0 mole / meter^2 {
+    formula:     C;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  reaction burn {
+    reactants: A;
+    products:  B;
+    rate:      1 / second;
+    enthalpy:  -100 kilojoule / mole;
+  }
+
+  field temperature on chamber = 300 kelvin {
+    diffusivity:   1e-5 meter^2 / second;
+    heat_capacity: 4e5 joule / (meter^2 kelvin);
+  }
+
+  solve reactions(mixture)  with strang(dt = 0.1 second);
+  solve heat(temperature)   with crank_nicolson(dt = 0.1 second);
+
+  couple burn.heat_release -> temperature.source conserve energy;
+}

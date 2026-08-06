@@ -12,6 +12,7 @@
 //! conserve, how much memory it will take, and what the compiler had to approximate —
 //! before spending any time running it. A bare "ok" would answer none of that.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -115,7 +116,7 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
         ));
     }
 
-    let mut simulation = Simulation::new(compiled.model, compiled.domains);
+    let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
     let outcome = simulation.run(&config);
 
     if !args.has("quiet") {
@@ -127,6 +128,7 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
         println!();
         println!("{}", outcome.stop.describe());
         println!();
+        print!("{}", coupling_report(&simulation));
         print!("{}", outcome.artifact.summary());
         print!("{}", outcome.artifact.profile.report(None));
     }
@@ -144,6 +146,56 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
 
 fn exit_code(stop: &lattice_runtime::StopReason) -> ExitCode {
     if stop.is_success() { ExitCode::SUCCESS } else { ExitCode::from(CHECK_FAILED) }
+}
+
+/// What the coupling edges moved, and whether any of them failed.
+///
+/// §14.3's whole argument: *"This makes it possible to debug whether a coupled result
+/// is physically inconsistent because of the model, a mapping error, a timestep issue,
+/// or an intentionally open system."* A coupled run's drift is a single number until
+/// the transfers that were supposed to explain it are written down beside it.
+///
+/// Empty for an uncoupled model, which is most of them.
+fn coupling_report(simulation: &Simulation) -> String {
+    let ledger = simulation.ledger();
+    let faults = simulation.coupling_faults();
+    if ledger.is_empty() && faults.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("coupling ledger\n");
+    if ledger.is_empty() {
+        out.push_str("  nothing was transferred\n");
+    } else {
+        // Totals per (quantity, source, target), which is what a reader wants — the
+        // per-step entries are in the run artifact for anyone who needs them.
+        let mut totals: BTreeMap<(String, String, String), (f64, usize)> = BTreeMap::new();
+        for transfer in ledger.transfers() {
+            let key = (
+                transfer.quantity.to_string(),
+                transfer.from.to_string(),
+                transfer.to.to_string(),
+            );
+            let entry = totals.entry(key).or_insert((0.0, 0));
+            entry.0 += transfer.amount;
+            entry.1 += 1;
+        }
+        for ((quantity, from, to), (amount, count)) in totals {
+            out.push_str(&format!(
+                "  {from} -> {to:<24} {amount:>14.6e} {quantity} over {count} exchanges\n"
+            ));
+        }
+        out.push_str(
+            "  a staggered coupling always has one exchange in flight, so the last of \
+             this has not landed\n",
+        );
+    }
+
+    for fault in faults {
+        out.push_str(&format!("  FAULT {fault}\n"));
+    }
+    out.push('\n');
+    out
 }
 
 /// Most observation series to plot, so a scene with many domains stays readable.

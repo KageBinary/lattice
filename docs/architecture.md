@@ -20,7 +20,8 @@ the non-obvious decisions were made that way.
 │ validation   │ │ compiler   │ │ runtime      │ │ domain-*     │ │ observe       │
 │ (the lab)    │ │ resolve,   │ │ clock, dt    │ │ particle,    │ │ JSON, timing, │
 │              │ │ check,     │ │ negotiation, │ │ grid2d,      │ │ artifacts     │
-│              │ │ lower      │ │ stepping     │ │ rigid2d      │ │               │
+│              │ │ lower      │ │ stepping     │ │ rigid2d,     │ │               │
+│              │ │            │ │ + coupling   │ │ chemistry    │ │               │
 └────┬─────────┘ └──┬──────┬──┘ └──────┬───────┘ └─────┬────────┘ └───────┬───────┘
      │              │      │           │               │                  │
      │       ┌──────▼───┐  └───────────┼───────────────┼──────────────────┘
@@ -338,6 +339,56 @@ Those are different points whenever the joint is violated, and two opposite impu
 two different points are a couple — angular momentum created from nothing. Both impulses
 now act at the anchors' midpoint, which is exact when the joint is satisfied and honest
 when it is not.
+
+## Chemistry and coupling: where the units meet
+
+The single most opaque thing in a coupled model is the number that converts one
+domain's units into another's. A reaction publishes heat in `W/m²`; a heat solver
+consumes a source in `K/s`. Wire them straight together and the run compiles, executes,
+looks entirely plausible, and is wrong by an areal heat capacity — four hundred
+thousand, in `examples/chamber.lattice`.
+
+Three decisions follow from that.
+
+**The conversion is a material property, declared where the material is.** The model
+writes `heat_capacity: 4.0e5 joule / (meter^2 kelvin);` on the temperature field. The
+heat solver never reads it. The coupling edge does, and the compiler checks by
+dimensional algebra that it is the right *kind* of quantity to bridge the two ports.
+A model with no way to convert gets a message naming both units and what is missing.
+
+**The ledger records the source side.** After the mapping the value is in the target's
+units, and integrating that gives a number off from the energy by exactly the factor
+the mapping applied. Getting this wrong was the first thing the coupling tests caught.
+
+**The books do not balance exactly, and the residual is meaningful.** A staggered
+coupling always has one exchange in flight: the heat released during the final step is
+recorded and never delivered. `crates/lattice-coupling/tests/exchange.rs` asserts that
+the shortfall is at most one transfer *and* that it is first order in `dt`, which turns
+"nearly balances" into a statement about why.
+
+### Why the reaction module measures its own stiffness
+
+Spec §12.3 says stiff systems belong to *"an established numerical library rather than
+a weak custom method"*. That is a constraint on what this module may pretend to be. A
+half-good BDF would work on the test cases and fail quietly on a real network.
+
+So the reaction integrator is explicit, sub-cycles to the network's own Jacobian —
+bounded by both stability and accuracy — and publishes what it found. `exhausted` says
+the sub-step budget ran out; `stiffness` says whether stiffness was why. They are
+separate fields because they need different fixes: a budget can run out because a
+network is stiff, or simply because the interval asked for is enormous relative to the
+timescale.
+
+### Energy is a state variable, not a sample
+
+The heat a reaction releases was first computed by sampling the instantaneous power at
+the start of a step. For a reaction that half-finishes during that step, that is wrong
+by a factor of `e`. Energy is now carried through the same Runge–Kutta stages as the
+concentrations, with the same weights, which makes it fourth-order accurate and costs
+nothing — the heat rate falls out of rate evaluations the stages already perform.
+
+It is the number the coupling ledger balances, which is why it is worth being exact
+about.
 
 ## Diagnostics and the coupling ledger
 

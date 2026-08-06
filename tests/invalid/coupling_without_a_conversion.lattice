@@ -1,0 +1,37 @@
+// expect: E0400
+// A heat release in W/m^2 wired straight into a source in K/s produces a run that
+// compiles, executes, looks entirely plausible, and is wrong by an areal heat
+// capacity. The factor is a property of the material rather than of either solver, so
+// the model has to declare it — see `heat_capacity` in examples/chamber.lattice.
+
+project coupling_without_a_conversion {
+  grid chamber { size: [16, 16]; extent: [1 meter, 1 meter]; }
+
+  domain chemistry mixture { grid: chamber; }
+
+  species A on chamber = left_half(1 mole / meter^2) {
+    formula:     C;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  species B on chamber = 0 mole / meter^2 {
+    formula:     C;
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  reaction burn {
+    reactants: A;
+    products:  B;
+    rate:      1 / second;
+    enthalpy:  -100 kilojoule / mole;
+  }
+
+  field temperature on chamber = 300 kelvin {
+    diffusivity: 1e-5 meter^2 / second;
+  }
+
+  solve reactions(mixture)  with strang(dt = 0.1 second);
+  solve heat(temperature)   with crank_nicolson(dt = 0.1 second);
+
+  couple mixture.heat_release -> temperature.source conserve energy;
+}

@@ -105,7 +105,7 @@ fn every_example_runs() {
         config.duration = None;
         config.max_steps = Some(20);
 
-        let mut simulation = Simulation::new(compiled.model, compiled.domains);
+        let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
         let outcome = simulation.run(&config);
 
         assert!(
@@ -224,7 +224,8 @@ fn the_fixture_set_covers_every_diagnostic_class() {
         ("E0206", "lowering: unknown solver"),
         ("E0208", "lowering: unknown keyword value"),
         ("E0210", "builtins: unknown function"),
-        ("E0211", "geometry: an invalid shape"),
+        ("E0211", "geometry: an invalid shape or formula"),
+        ("E0212", "chemistry: an unbalanced reaction"),
         ("E0400", "units: dimensional mismatch"),
         ("E0403", "units: affine scale in an expression"),
         ("E0405", "validation: value out of range"),
@@ -330,7 +331,7 @@ fn the_ramp_example_settles_inside_its_yard() {
     config.duration = Some(8.0);
     config.max_steps = None;
 
-    let mut simulation = Simulation::new(compiled.model, compiled.domains);
+    let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
     let outcome = simulation.run(&config);
     assert!(outcome.is_success(), "{}", outcome.stop.describe());
 
