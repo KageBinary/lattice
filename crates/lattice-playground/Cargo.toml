@@ -1,0 +1,22 @@
+[package]
+name = "lattice-playground"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "An interactive sandbox: drop things, pick them up, throw them"
+
+[[bin]]
+name = "lattice-play"
+path = "src/main.rs"
+
+[dependencies]
+lattice-ir.workspace = true
+lattice-viewer.workspace = true
+lattice-domain-rigid2d.workspace = true
+lattice-domain-chemistry.workspace = true
+lattice-domain-grid2d.workspace = true
+eframe = "0.36"
+
+[lints]
+workspace = true

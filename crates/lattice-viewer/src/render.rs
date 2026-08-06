@@ -60,6 +60,70 @@ pub fn field_to_image(
     mode: Mode,
     palette: &Palette,
 ) -> FieldImage {
+    field_to_image_about(field, map, mode, palette, 0.0)
+}
+
+/// The same, with a diverging map anchored on `neutral` rather than on zero.
+///
+/// # Why an anchor is worth a second entry point
+///
+/// A diverging map's whole job is to say which side of *something* a value falls on,
+/// and the grey midpoint is where that something is. Zero is the right anchor for a
+/// signed quantity — a velocity, a charge, a departure from equilibrium.
+///
+/// It is the wrong anchor for a temperature. A plate at 300 K painted with a diverging
+/// map anchored on zero is uniformly one colour, because every value is on the same
+/// side of zero and the interesting variation is a rounding error against 300. Anchored
+/// on ambient, the same field says at a glance which spots are warmer and which are
+/// cooler than the room — which is the question a reader actually has.
+///
+/// Sequential maps ignore `neutral`: they run from the data's own minimum to its
+/// maximum, and have no midpoint to place.
+pub fn field_to_image_about(
+    field: &ScalarField,
+    map: Colormap,
+    mode: Mode,
+    palette: &Palette,
+    neutral: f64,
+) -> FieldImage {
+    field_to_image_inner(field, map, mode, palette, neutral, None)
+}
+
+/// A sequential ramp that starts at `floor` instead of at the data's own minimum.
+///
+/// # Why the default is wrong for some quantities
+///
+/// Normalizing a sequential map between the data's min and max is right for a
+/// temperature: a plate between 300 K and 310 K should use the whole ramp, because the
+/// ten kelvin is the story and zero kelvin is not on the table.
+///
+/// It is wrong for a concentration. A chamber holding nothing has min == max == 0, so
+/// there is no range to normalize and the flat case picks the middle of the ramp — an
+/// empty chamber rendered as a solid mid-tone, which reads as *uniformly full*. That is
+/// the worst kind of chart error: not a picture that is hard to read, but one that
+/// confidently says something false. Flooring the ramp at zero makes empty look empty
+/// and keeps the shading comparable from one frame to the next.
+///
+/// Diverging maps ignore `floor` and keep their anchor, since their midpoint already
+/// carries the meaning a floor would.
+pub fn field_to_image_above(
+    field: &ScalarField,
+    map: Colormap,
+    mode: Mode,
+    palette: &Palette,
+    floor: f64,
+) -> FieldImage {
+    field_to_image_inner(field, map, mode, palette, floor, Some(floor))
+}
+
+fn field_to_image_inner(
+    field: &ScalarField,
+    map: Colormap,
+    mode: Mode,
+    palette: &Palette,
+    neutral: f64,
+    floor: Option<f64>,
+) -> FieldImage {
     let (nx, ny) = (field.nx(), field.ny());
 
     let mut min = f64::INFINITY;
@@ -85,12 +149,18 @@ pub fn field_to_image(
     }
     let mean = if finite > 0 { sum / finite as f64 } else { 0.0 };
 
-    // A diverging map is anchored on zero, not on the data's own midpoint —
+    // A diverging map is anchored on `neutral`, not on the data's own midpoint —
     // otherwise "the neutral colour" would drift with the data and stop meaning
-    // "nothing".
-    let extreme = max.abs().max(min.abs()).max(f64::MIN_POSITIVE);
-    let span = max - min;
-    let flat = span <= 1e-12 * extreme;
+    // anything in particular. The scale is the larger departure from the anchor, so
+    // both arms cover the same range and equal departures read as equally far.
+    let extreme = (max - neutral).abs().max((min - neutral).abs()).max(f64::MIN_POSITIVE);
+    // A floored sequential ramp runs from the floor to the data's largest value, so an
+    // all-zero field is at the bottom of the ramp rather than in the flat case's middle.
+    let (low, span) = match floor {
+        Some(base) => (base, (max - base).max(f64::MIN_POSITIVE)),
+        None => (min, max - min),
+    };
+    let flat = floor.is_none() && span <= 1e-12 * extreme;
 
     let critical = palette.status(Status::Critical);
     let mut pixels = Vec::with_capacity(nx * ny);
@@ -105,9 +175,9 @@ pub fn field_to_image(
             }
             let t = match map {
                 Colormap::Sequential => {
-                    if flat { 0.5 } else { (value - min) / span }
+                    if flat { 0.5 } else { ((value - low) / span).clamp(0.0, 1.0) }
                 }
-                Colormap::Diverging => value / extreme,
+                Colormap::Diverging => (value - neutral) / extreme,
             };
             pixels.push(palette::sample(map, mode, t));
         }
@@ -193,6 +263,28 @@ impl WorldView {
         ))
     }
 
+    /// Screen position back to a world point.
+    ///
+    /// The exact inverse of [`WorldView::project`], including the y flip. A playground
+    /// needs it for every click, and having the two directions in one place is what
+    /// stops them drifting apart — a picked body that is not the one under the cursor
+    /// is a bug nobody can see the cause of.
+    pub fn unproject(&self, screen: Pos2) -> [f64; 2] {
+        let fx = f64::from((screen.x - self.rect.left()) / self.rect.width());
+        let fy = f64::from((self.rect.bottom() - screen.y) / self.rect.height());
+        [self.origin[0] + fx * self.extent[0], self.origin[1] + fy * self.extent[1]]
+    }
+
+    /// The rectangle this view draws into.
+    pub fn rect(&self) -> Rect {
+        self.rect
+    }
+
+    /// The world region this view shows, as `(origin, extent)`.
+    pub fn region(&self) -> ([f64; 2], [f64; 2]) {
+        (self.origin, self.extent)
+    }
+
     /// Screen pixels per world metre, on the x axis.
     pub fn scale(&self) -> f32 {
         if self.extent[0] > 0.0 {
@@ -254,7 +346,9 @@ pub fn draw_bodies(
         // Scenery in neutral grey, movers in a saturated hue: the difference is in
         // lightness as well as chroma, so it survives greyscale and colour vision
         // deficiency without needing a legend.
-        let is_wall = is_static[index];
+        // Defensive: the channel promises these are the same length, and a caller
+        // that got it wrong should draw a body oddly rather than take the process down.
+        let is_wall = is_static.get(index).copied().unwrap_or(false);
         let fill = if is_wall { palette.axis } else { dynamic };
         let stroke = Stroke::new(1.5, if is_wall { palette.border } else { palette.text_primary });
 
@@ -578,6 +672,70 @@ mod tests {
 
     /// A field whose values differ only by round-off must not be stretched across the
     /// whole ramp — that manufactures structure out of floating-point noise.
+    /// A plate at 300 K on a zero-anchored diverging map is one flat colour, because
+    /// every value is on the same side of zero and the variation is a rounding error
+    /// against 300. Anchoring on ambient is what makes it readable.
+    #[test]
+    fn a_diverging_map_can_be_anchored_somewhere_other_than_zero() {
+        let grid = Grid2d::new(3, 1, [3.0, 1.0]);
+        let mut field = ScalarField::new(&grid, 1);
+        field.set(0, 0, 280.0);
+        field.set(1, 0, 300.0);
+        field.set(2, 0, 320.0);
+        let palette = Palette::for_mode(Mode::Dark);
+
+        let anchored = field_to_image_about(&field, Colormap::Diverging, Mode::Dark, &palette, 300.0);
+        let pixels = anchored.image.as_raw();
+        let at = |i: usize| [pixels[i * 4], pixels[i * 4 + 1], pixels[i * 4 + 2]];
+        let (cold, middle, hot) = (at(0), at(1), at(2));
+
+        assert_ne!(cold, hot, "either side of ambient must be distinguishable");
+        assert_ne!(cold, middle);
+        assert_ne!(hot, middle);
+        // The anchor lands on the neutral midpoint, which is the low-chroma grey.
+        let chroma = |c: [u8; 3]| {
+            let m = f64::from(c.iter().copied().max().unwrap());
+            let n = f64::from(c.iter().copied().min().unwrap());
+            m - n
+        };
+        assert!(chroma(middle) < chroma(cold), "{middle:?} against {cold:?}");
+        assert!(chroma(middle) < chroma(hot), "{middle:?} against {hot:?}");
+
+        // And that is the whole point: on the default anchor of zero, 280 K and 320 K sit
+        // at 0.875 and 1.0 of the way up the *same arm* of the ramp, so the plate reads
+        // as one colour with a hint of shading; anchored on 300 they land on opposite
+        // ends with the grey midpoint between them.
+        //
+        // Measured as the largest distance between any two pixels, not as a spread in
+        // total brightness. A diverging map is built to hold lightness roughly equal at
+        // both ends and vary the hue, so summing the channels is very nearly blind to
+        // the one thing this test is about. The claim is comparative rather than a
+        // threshold, which would only record what today's ramp happens to do.
+        let spread = |rendered: &FieldImage| {
+            let pixels: Vec<[f64; 3]> = rendered
+                .image
+                .as_raw()
+                .chunks(4)
+                .map(|p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])
+                .collect();
+            let mut worst: f64 = 0.0;
+            for (index, a) in pixels.iter().enumerate() {
+                for b in &pixels[index + 1..] {
+                    let distance = (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt();
+                    worst = worst.max(distance);
+                }
+            }
+            worst
+        };
+        let zeroed = field_to_image(&field, Colormap::Diverging, Mode::Dark, &palette);
+        let (flat, spanned) = (spread(&zeroed), spread(&anchored));
+        assert!(
+            spanned > flat * 3.0,
+            "anchoring on ambient separated the plate by {spanned:.1} against {flat:.1} on \
+             zero, which is not enough of a difference to be worth the parameter"
+        );
+    }
+
     #[test]
     fn a_flat_field_renders_flat() {
         let field = field_with(8, 8, |i, _| 300.0 + f64::from(i as u32) * 1e-15);
@@ -647,6 +805,29 @@ mod tests {
     }
 
     /// Every verdict must carry words, so meaning never rests on the colour.
+    /// A picked body that is not the one under the cursor is a bug with no visible
+    /// cause, so the two directions of the mapping are checked against each other.
+    #[test]
+    fn projecting_and_unprojecting_are_inverses() {
+        let view = WorldView::new(
+            Rect::from_min_size(Pos2::new(10.0, 20.0), egui::vec2(400.0, 200.0)),
+            [-2.0, 5.0],
+            [8.0, 4.0],
+        );
+        for world in [[-2.0, 5.0], [6.0, 9.0], [0.0, 7.0], [-1.5, 6.25]] {
+            let screen = view.project(world).expect("finite");
+            let back = view.unproject(screen);
+            assert!((back[0] - world[0]).abs() < 1e-9, "{back:?} vs {world:?}");
+            assert!((back[1] - world[1]).abs() < 1e-9, "{back:?} vs {world:?}");
+        }
+
+        // And y really is flipped: the world origin is at the *bottom* left.
+        let bottom_left = view.project([-2.0, 5.0]).unwrap();
+        assert!((bottom_left.y - view.rect().bottom()).abs() < 1e-3, "{bottom_left:?}");
+        let top_right = view.project([6.0, 9.0]).unwrap();
+        assert!((top_right.y - view.rect().top()).abs() < 1e-3, "{top_right:?}");
+    }
+
     #[test]
     fn verdicts_carry_a_label_and_an_icon() {
         for verdict in [stability_verdict(1.5, 1.0), drift_verdict(1e-4)] {

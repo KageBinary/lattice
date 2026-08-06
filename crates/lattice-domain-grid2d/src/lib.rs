@@ -528,6 +528,38 @@ mod validation {
         assert!(heat.last_solve().unwrap().is_converged());
     }
 
+    /// The set of rows a domain publishes has to depend only on how it is configured,
+    /// never on how far it has run. A table that gains two rows after the first step and
+    /// loses them again on a reset reads as a fault, and there isn't one.
+    #[test]
+    fn the_published_rows_do_not_depend_on_how_far_the_run_has_got() {
+        for scheme in [TimeScheme::Explicit, TimeScheme::CrankNicolson, TimeScheme::BackwardEuler] {
+            let grid = Grid2d::new(16, 16, [1.0, 1.0]);
+            let mut domain = HeatDomain::new("plate", grid, Diffusivity::Uniform(1e-4))
+                .with_scheme(scheme)
+                .with_uniform_initial(300.0);
+
+            let mut fresh = lattice_ir::Observations::new();
+            domain.observe(&mut fresh);
+
+            run(&mut domain, 1e-2, 5);
+            let mut stepped = lattice_ir::Observations::new();
+            domain.observe(&mut stepped);
+
+            let before: Vec<&str> = fresh.iter().map(|o| o.name.as_ref()).collect();
+            let after: Vec<&str> = stepped.iter().map(|o| o.name.as_ref()).collect();
+            assert_eq!(before, after, "{scheme:?} changed its rows by running");
+
+            // And an explicit scheme reports no solver at all, rather than a solver that
+            // did zero iterations — there is no linear solve in a forward Euler step.
+            assert_eq!(
+                stepped.value("plate.solver_iterations").is_some(),
+                scheme.is_implicit(),
+                "{scheme:?}"
+            );
+        }
+    }
+
     #[test]
     fn heated_edge_helper_builds_the_expected_boundary_set() {
         let bs = heated_edge(Side::Top, 500.0);

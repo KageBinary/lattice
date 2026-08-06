@@ -222,6 +222,33 @@ Needed:
    finally has independent operations to run across, and `examples/chamber.lattice` is
    the first model whose graph has a width above one.
 
+## Outside the milestones: the playground
+
+`lattice-play` is not in the specification. It exists because the spec describes a
+scientific instrument — write a model, compile it, run it, measure it — and someone who
+opens the project reasonably expects to be able to *touch* the physics before they learn
+a language to describe it. So the playground is a second front door onto the same
+solvers, built by clicking rather than by compiling.
+
+It is not a shortcut around any of the standing constraints. It publishes the same
+observations, its panel applies the same conservation rules, and it added the same kind
+of test the rest of the engine has: fifty tests driving `Playground::pointer` directly,
+plus one conformance exercise every mode has to survive so a fourth cannot be added
+below the bar of the three that exist.
+
+Three engine bugs came out of building it, which is the argument for having built it:
+
+- `RigidDomain::render_channels` published pose arrays at their new length while the
+  per-slot tables were still at the old one, so a body spawned between steps was an
+  out-of-bounds index in the drawing code. Interactive spawning is what found it; no
+  model file can spawn a body mid-run.
+- `HeatDomain::observe` gated its solver rows on whether a step had happened, so a table
+  gained two rows after the first step and lost them again on a reset. The set of rows a
+  domain publishes now depends only on how it is configured.
+- A sequential ramp normalized between the data's own min and max renders an all-zero
+  concentration field as a solid mid-tone — an empty vessel that reads as uniformly full.
+  `field_to_image_above` floors the ramp where the quantity's zero actually is.
+
 ## Later milestones
 
 | Milestone | Result | Blocked on |

@@ -161,6 +161,31 @@ impl RigidDomain {
         &self.colliders
     }
 
+    /// The registered colliders, mutably.
+    ///
+    /// Surfaces live on the collider and colliders are *shared*, so changing one
+    /// changes every body wearing that shape — including the ones already in the scene.
+    /// That is what a control labelled "friction" should do: the whole scene responds,
+    /// not just the next thing added.
+    pub fn colliders_mut(&mut self) -> &mut [Collider] {
+        &mut self.colliders
+    }
+
+    /// Change gravity without rebuilding the world, m/s².
+    pub fn set_gravity(&mut self, gravity: [f64; 2]) {
+        self.gravity = gravity;
+    }
+
+    /// The uniform acceleration applied to every dynamic body, m/s².
+    pub fn gravity(&self) -> [f64; 2] {
+        self.gravity
+    }
+
+    /// The handle of the body in `slot`.
+    pub fn body_at(&self, slot: usize) -> Option<BodyId> {
+        self.bodies.id_at(slot)
+    }
+
     /// Add a body exactly as specified.
     pub fn spawn(&mut self, spec: BodySpec) -> Option<BodyId> {
         self.bodies.spawn(spec)
@@ -191,6 +216,57 @@ impl RigidDomain {
             .map_or(MassProperties::STATIC, |c| c.shape.mass_properties(1.0))
             .with_total_mass(mass);
         self.spawn(BodySpec { mass: properties.mass, inertia: properties.inertia, ..spec })
+    }
+
+    /// Remove a body, and repair every joint that referred to it.
+    ///
+    /// # Why this is not just `store.despawn`
+    ///
+    /// Joints hold *slot indices*, and a despawn moves the last body into the freed
+    /// slot to keep the live set contiguous. Two joints are therefore affected: one
+    /// naming the removed body, which no longer means anything, and one naming the body
+    /// that moved, which now points at the wrong object.
+    ///
+    /// The second is the dangerous one. It does not fail; it silently re-attaches a
+    /// pendulum to whatever else happened to be last in the list, and the symptom is a
+    /// linkage that behaves oddly with no error anywhere. So the moved body's joints are
+    /// remapped and the removed body's are dropped, and the count of dropped ones is
+    /// returned rather than swallowed.
+    ///
+    /// Returns `None` if the handle is stale.
+    pub fn despawn(&mut self, id: BodyId) -> Option<usize> {
+        let removed = self.bodies.slot_of(id)?;
+        let moved = self.bodies.len() - 1;
+        if !self.bodies.despawn(id) {
+            return None;
+        }
+
+        let before = self.joints.len();
+        self.joints.retain(|joint| {
+            let (a, b) = joint.bodies();
+            a != removed && b != removed
+        });
+        if moved != removed {
+            for joint in &mut self.joints {
+                remap_joint(joint, moved, removed);
+            }
+        }
+
+        // Contacts and their warm-start impulses are keyed by slot, and every slot from
+        // here on has just changed meaning. Keeping them would apply last step's forces
+        // to this step's bodies.
+        self.contact_solver.reset();
+        self.joint_solver.reset();
+        self.contacts.clear();
+        Some(before - self.joints.len())
+    }
+
+    /// Remove every body and joint, keeping the registered shapes.
+    pub fn clear_bodies(&mut self) {
+        self.bodies.clear();
+        self.joints.clear();
+        self.contacts.clear();
+        self.reset_solvers();
     }
 
     /// Add a joint. Slots come from [`RigidBodyStore::slot_of`].
@@ -257,13 +333,18 @@ impl RigidDomain {
 }
 
 impl RigidDomain {
-    /// Copy this step's poses and contacts into the flat tables a viewer reads.
+    /// Copy the current poses and contacts into the flat tables a viewer reads.
+    ///
+    /// Called at the end of every step. **Also call it after spawning or removing a
+    /// body outside a step** — an interactive caller that adds one while paused would
+    /// otherwise not see it until the clock moved, and a paused sandbox that ignores
+    /// clicks is a broken sandbox.
     ///
     /// Costs a handful of writes per body and per contact, against a contact list that
     /// was just built from scratch — so it is strictly cheaper than the work that
     /// produced it, and it makes contacts a published quantity rather than something a
     /// debugger has to reach in and find.
-    fn refresh_render_tables(&mut self) {
+    pub fn refresh_render_tables(&mut self) {
         let count = self.bodies.len();
         self.body_outline.clear();
         self.body_static.clear();
@@ -285,6 +366,24 @@ impl RigidDomain {
                 self.contact_ny.push(contact.manifold.normal.y);
                 self.contact_depth.push(point.penetration);
             }
+        }
+    }
+}
+
+/// Point a joint at `to` wherever it pointed at `from`.
+fn remap_joint(joint: &mut Joint, from: usize, to: usize) {
+    let fix = |slot: &mut usize| {
+        if *slot == from {
+            *slot = to;
+        }
+    };
+    match joint {
+        Joint::Distance { a, b, .. }
+        | Joint::Pin { a, b, .. }
+        | Joint::Spring { a, b, .. }
+        | Joint::Motor { a, b, .. } => {
+            fix(a);
+            fix(b);
         }
     }
 }
@@ -513,7 +612,15 @@ impl Domain for RigidDomain {
     }
 
     fn render_channels(&self) -> Vec<lattice_ir::RenderChannel<'_>> {
-        if self.bodies.is_empty() {
+        // Every array in the channel is truncated to one length, so a caller can index
+        // them against each other without checking. The pose arrays come straight from
+        // the store and grow the moment a body is spawned; the per-slot tables are
+        // rebuilt by `refresh_render_tables`. Between those two events they disagree,
+        // and publishing the disagreement would hand a reader a `pos_x` longer than the
+        // `is_static` beside it — an out-of-bounds index in the drawing code, in a
+        // crate that has no way to know it was given something inconsistent.
+        let count = self.bodies.len().min(self.body_outline.len()).min(self.body_static.len());
+        if count == 0 {
             return Vec::new();
         }
         let bounds = self.bounds();
@@ -532,14 +639,14 @@ impl Domain for RigidDomain {
 
         let mut channels = vec![lattice_ir::RenderChannel::Bodies {
             name: &self.name,
-            x: self.bodies.pos_x(),
-            y: self.bodies.pos_y(),
-            cos: self.bodies.rot_cos(),
-            sin: self.bodies.rot_sin(),
-            outline: &self.body_outline,
+            x: &self.bodies.pos_x()[..count],
+            y: &self.bodies.pos_y()[..count],
+            cos: &self.bodies.rot_cos()[..count],
+            sin: &self.bodies.rot_sin()[..count],
+            outline: &self.body_outline[..count],
             vertices: &self.outlines,
             starts: &self.outline_starts,
-            is_static: &self.body_static,
+            is_static: &self.body_static[..count],
             origin,
             extent,
         }];
@@ -1015,6 +1122,128 @@ mod tests {
             // The contact is at the crate's underside, near y = 0.5.
             assert!((y[index] - 0.5).abs() < 0.05, "contact at y = {}", y[index]);
         }
+    }
+
+    /// The dangerous half of a despawn: the body that *moved* is still jointed, and a
+    /// stale index would silently re-attach it to whatever else was last in the list.
+    #[test]
+    fn removing_a_body_repairs_the_joints_that_survive() {
+        let mut world = RigidDomain::new("scene", 4).with_gravity([0.0, 0.0]);
+        let disc = world.register(Collider::new(Shape::circle(0.2).unwrap()));
+
+        let anchor = world.spawn(BodySpec::statik([0.0, 0.0], disc)).unwrap();
+        let doomed = world.spawn_with_mass(BodySpec::at([5.0, 0.0], disc), 1.0).unwrap();
+        let bob = world.spawn_with_mass(BodySpec::at([1.0, 0.0], disc), 1.0).unwrap();
+
+        let (anchor_slot, bob_slot) =
+            (world.slot_of(anchor).unwrap(), world.slot_of(bob).unwrap());
+        world.add_joint(Joint::Pin {
+            a: anchor_slot,
+            b: bob_slot,
+            local_a: Vec2::ZERO,
+            local_b: Vec2::from([-1.0, 0.0]),
+        });
+        assert_eq!(bob_slot, 2, "the bob is last, so removing the middle body moves it");
+
+        let dropped = world.despawn(doomed).expect("a live handle");
+        assert_eq!(dropped, 0, "the joint did not touch the removed body");
+
+        // The bob moved from slot 2 into slot 1, and the joint followed it.
+        let bob_slot = world.slot_of(bob).unwrap();
+        assert_eq!(bob_slot, 1);
+        assert_eq!(world.joints()[0].bodies(), (anchor_slot, bob_slot));
+
+        // And it still swings from where it was pinned rather than flying off.
+        stepped(&mut world, 400);
+        let position = [world.bodies().pos_x()[bob_slot], world.bodies().pos_y()[bob_slot]];
+        let radius = (position[0].powi(2) + position[1].powi(2)).sqrt();
+        assert!((radius - 1.0).abs() < 1e-2, "the pin still holds at {radius} m");
+    }
+
+    /// A joint to a body that no longer exists constrains nothing, so it goes — and
+    /// says how many went, rather than disappearing quietly.
+    #[test]
+    fn removing_a_jointed_body_drops_its_joints_and_counts_them() {
+        let mut world = RigidDomain::new("scene", 4).with_gravity([0.0, 0.0]);
+        let disc = world.register(Collider::new(Shape::circle(0.2).unwrap()));
+        let anchor = world.spawn(BodySpec::statik([0.0, 0.0], disc)).unwrap();
+        let bob = world.spawn_with_mass(BodySpec::at([1.0, 0.0], disc), 1.0).unwrap();
+
+        world.add_joint(Joint::Pin {
+            a: world.slot_of(anchor).unwrap(),
+            b: world.slot_of(bob).unwrap(),
+            local_a: Vec2::ZERO,
+            local_b: Vec2::from([-1.0, 0.0]),
+        });
+        world.add_joint(Joint::Distance {
+            a: world.slot_of(anchor).unwrap(),
+            b: world.slot_of(bob).unwrap(),
+            local_a: Vec2::ZERO,
+            local_b: Vec2::ZERO,
+            rest_length: 1.0,
+            rope: true,
+        });
+
+        assert_eq!(world.despawn(bob), Some(2), "both joints named it");
+        assert!(world.joints().is_empty());
+        assert!(!world.bodies().is_alive(bob));
+
+        // A stale handle is refused rather than removing someone else.
+        assert_eq!(world.despawn(bob), None);
+    }
+
+    #[test]
+    fn clearing_leaves_the_shapes_but_no_bodies() {
+        let mut world = ground_and_crate();
+        assert_eq!(world.bodies().len(), 2);
+        let shapes = world.colliders().len();
+
+        world.clear_bodies();
+        assert_eq!(world.bodies().len(), 0);
+        assert!(world.joints().is_empty());
+        assert_eq!(world.colliders().len(), shapes, "registered shapes are reusable");
+
+        // And it still steps, so a cleared sandbox is not a broken one.
+        stepped(&mut world, 10);
+        assert_eq!(world.last_solve().points, 0);
+    }
+
+    /// An interactive caller spawns between steps, which leaves the pose arrays a body
+    /// longer than the per-slot tables. Publishing that mismatch hands the drawing code
+    /// an out-of-bounds index it has no way to anticipate.
+    #[test]
+    fn a_body_spawned_between_steps_never_makes_the_channel_inconsistent() {
+        let mut world = ground_and_crate();
+        stepped(&mut world, 1);
+
+        // Spawn without stepping — exactly what a click does.
+        let boxy = world.register(Collider::new(Shape::rectangle(0.2, 0.2).unwrap()));
+        world.spawn_with_mass(BodySpec::at([0.0, 4.0], boxy), 1.0);
+
+        let channels = world.render_channels();
+        let bodies = channels
+            .iter()
+            .find(|c| matches!(c, lattice_ir::RenderChannel::Bodies { .. }))
+            .expect("still publishes");
+        let lattice_ir::RenderChannel::Bodies { x, y, cos, sin, outline, is_static, .. } = bodies
+        else {
+            panic!("wrong channel")
+        };
+        assert_eq!(x.len(), y.len());
+        assert_eq!(x.len(), cos.len());
+        assert_eq!(x.len(), sin.len());
+        assert_eq!(x.len(), outline.len());
+        assert_eq!(x.len(), is_static.len(), "the array a naive draw would index past");
+
+        // And a refresh brings the new body in without a step, so a paused sandbox
+        // still shows what was just clicked.
+        world.refresh_render_tables();
+        let channels = world.render_channels();
+        let lattice_ir::RenderChannel::Bodies { x, is_static, .. } = &channels[0] else {
+            panic!("wrong channel")
+        };
+        assert_eq!(x.len(), 3);
+        assert_eq!(is_static.len(), 3);
     }
 
     #[test]

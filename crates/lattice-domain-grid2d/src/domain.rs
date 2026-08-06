@@ -567,16 +567,27 @@ impl Domain for HeatDomain {
         out.record_metric(format!("{prefix}.min"), self.field.min_interior(), self.display_unit.clone());
         out.record_metric(format!("{prefix}.max"), self.field.max_interior(), self.display_unit.clone());
 
-        if let Some(outcome) = self.last_outcome {
+        // Whether these rows exist is decided by the *scheme*, not by whether a step has
+        // happened yet. An explicit scheme has no linear solve, so reporting one would
+        // invent a solver that is not there. An implicit scheme always has one, and
+        // gating on `last_outcome` instead would make two rows appear after the first
+        // step and vanish again on a reset — a reader watching a table gain and lose
+        // rows reasonably concludes something broke, and nothing did.
+        if self.scheme.is_implicit() {
+            let (iterations, residual) = self
+                .last_outcome
+                .map_or((0.0, 0.0), |outcome| {
+                    (outcome.iterations() as f64, outcome.residual())
+                });
             out.record(
                 format!("{prefix}.solver_iterations"),
-                outcome.iterations() as f64,
+                iterations,
                 "1",
                 ObservationKind::Count,
             );
             out.record(
                 format!("{prefix}.solver_residual"),
-                outcome.residual(),
+                residual,
                 self.display_unit.clone(),
                 ObservationKind::Residual,
             );

@@ -1720,6 +1720,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-playground"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "lattice-domain-chemistry",
+ "lattice-domain-grid2d",
+ "lattice-domain-rigid2d",
+ "lattice-ir",
+ "lattice-viewer",
+]
+
+[[package]]
 name = "lattice-runtime"
 version = "0.1.0"
 dependencies = [

@@ -349,6 +349,33 @@ impl RigidBodyStore {
         [self.pos_x[slot] + v[0], self.pos_y[slot] + v[1]]
     }
 
+    /// Transform a world point into a body's local frame.
+    ///
+    /// The inverse of [`RigidBodyStore::to_world_point`]. What a click needs: the
+    /// question "did the cursor land on this body" is asked in the body's own frame,
+    /// where its shape is defined.
+    pub fn to_local_point(&self, slot: usize, world: [f64; 2]) -> [f64; 2] {
+        let (c, s) = (self.rot_cos[slot], self.rot_sin[slot]);
+        let d = [world[0] - self.pos_x[slot], world[1] - self.pos_y[slot]];
+        // The transpose, since a rotation is orthogonal.
+        [c * d[0] + s * d[1], -s * d[0] + c * d[1]]
+    }
+
+    /// The handle of the body currently in `slot`.
+    ///
+    /// The reverse of [`RigidBodyStore::slot_of`], and the one a picker needs: a click
+    /// finds a slot by walking the hot arrays, and everything it wants to *do* with the
+    /// result — hold it, delete it — has to survive the next despawn. A slot does not;
+    /// a handle does.
+    pub fn id_at(&self, slot: usize) -> Option<BodyId> {
+        if slot >= self.len {
+            return None;
+        }
+        let stable = self.stable_of_slot[slot];
+        let entry = self.entries.get(stable as usize)?;
+        Some(BodyId::new(stable, entry.generation))
+    }
+
     // --- Mutation --------------------------------------------------------------
 
     /// Zero every force and torque accumulator.
@@ -815,6 +842,43 @@ mod tests {
             assert_eq!(store.inv_inertia()[0], 0.0, "inertia {mass}");
             assert!(store.is_static(0));
         }
+    }
+
+    /// A click finds a slot; everything it then wants to do has to survive a despawn,
+    /// and a slot does not.
+    #[test]
+    fn a_slot_resolves_back_to_the_handle_that_owns_it() {
+        let mut store = RigidBodyStore::with_capacity(4);
+        let first = store.spawn(BodySpec::at([1.0, 0.0], SHAPE)).unwrap();
+        let second = store.spawn(BodySpec::at([2.0, 0.0], SHAPE)).unwrap();
+
+        assert_eq!(store.id_at(0), Some(first));
+        assert_eq!(store.id_at(1), Some(second));
+        assert_eq!(store.id_at(2), None, "past the live count");
+
+        // After a despawn the survivor has moved, and the slot now names it.
+        store.despawn(first);
+        assert_eq!(store.id_at(0), Some(second));
+        assert_eq!(store.slot_of(second), Some(0));
+        assert_eq!(store.id_at(1), None);
+    }
+
+    /// Hit-testing happens in the body's own frame, where its shape is defined.
+    #[test]
+    fn world_and_local_points_round_trip_through_a_rotated_body() {
+        let mut store = RigidBodyStore::with_capacity(1);
+        store
+            .spawn(BodySpec::at([3.0, -2.0], SHAPE).with_angle(0.7))
+            .unwrap();
+
+        for local in [[0.0, 0.0], [1.0, 0.0], [-0.5, 0.25]] {
+            let world = store.to_world_point(0, local);
+            let back = store.to_local_point(0, world);
+            assert!((back[0] - local[0]).abs() < EPSILON, "{back:?} vs {local:?}");
+            assert!((back[1] - local[1]).abs() < EPSILON, "{back:?} vs {local:?}");
+        }
+        // The centre of mass is the local origin, whatever the rotation.
+        assert_eq!(store.to_local_point(0, [3.0, -2.0]), [0.0, 0.0]);
     }
 
     #[test]

@@ -60,6 +60,38 @@ it on `examples/lj_gas.lattice` and `examples/diffusing_pulse.lattice`, and look
 `debug_assertions` is on, because a timing from an unoptimized build is off by an order
 of magnitude and is the easiest way to publish a misleading number.
 
+## Testing a window without a window
+
+`lattice-view` and `lattice-play` are the only parts of the engine that cannot be tested
+by calling them. The rule that has worked: **drive the logic, not the pixels.**
+
+Everything a mode does in response to the pointer goes through `Playground::pointer`,
+which takes a plain `Pointer` struct and needs no window, no GPU and no event loop. So
+`a_throw_leaves_the_body_moving_at_the_hands_speed` constructs the press and the release
+directly and asserts on the resulting velocity. Fifty tests cover the click paths this
+way, and they run in the ordinary `cargo test`.
+
+Only `draw` needs a real `egui::Painter`, and it is deliberately thin — it reads state
+and emits shapes, with no decisions in it that a test would want to make claims about.
+
+Automated capture of the running window was tried and is not reliable on this machine.
+For the record, so nobody spends the afternoon again:
+
+- `Process.MainWindowHandle` is cached at first look and goes stale once the app has been
+  interacted with. Re-resolve by enumerating the process's own top-level windows.
+- `PrintWindow` renders the whole window including the frame; sizing the bitmap from
+  `GetClientRect` silently crops that many pixels off the bottom, which looks exactly
+  like the app clipping its own controls.
+- `SetForegroundWindow` is refused from a process that is not already in front, so
+  synthetic clicks land on whatever window actually is.
+- In PowerShell, aliases resolve before functions, and `Move` is `Move-Item`. A helper
+  named `Move` renames files instead of moving the pointer — and because the button
+  events still post, the window sees a click with no cursor position behind it and
+  correctly ignores it.
+
+Even with all four fixed, the input that arrives is not reproducible enough to assert on.
+Screenshots are worth taking to *look* at; they are not worth building a suite on.
+
 ## Conventions
 
 ### Tests state what they establish

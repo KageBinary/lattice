@@ -407,6 +407,39 @@ impl Shape {
         }
     }
 
+    /// Whether a body-local point is inside this shape.
+    ///
+    /// `slack` widens the shape outward, in metres. A click needs it: a segment has no
+    /// interior at all, and a small circle is a hard target with a mouse. Zero gives the
+    /// exact geometric test.
+    ///
+    /// Not the same question the narrowphase asks. That one is *are these two shapes
+    /// overlapping and along which axis*, which is a search for a separating direction.
+    /// This is *is this one point inside*, which is a sign test per edge and has no
+    /// direction to report.
+    pub fn contains(&self, local: Vec2, slack: f64) -> bool {
+        if !local.is_finite() {
+            return false;
+        }
+        match self {
+            Shape::Circle { radius } => local.length_squared() <= (radius + slack).powi(2),
+            Shape::Polygon(polygon) => {
+                // Inside a counter-clockwise convex polygon means left of every edge.
+                // With slack, "left of" becomes "no further right than `slack`", which
+                // grows the shape by that much along each edge normal.
+                let vertices = polygon.vertices();
+                (0..vertices.len()).all(|i| {
+                    let (from, to) = (vertices[i], vertices[(i + 1) % vertices.len()]);
+                    (to - from).cross(local - from) >= -slack * (to - from).length()
+                })
+            }
+            Shape::Segment { half_length } => {
+                let along = local.x.clamp(-half_length, *half_length);
+                (local - vec2(along, 0.0)).length() <= slack
+            }
+        }
+    }
+
     /// The world-space bounding box of this shape under `transform`.
     pub fn aabb(&self, transform: Transform) -> Aabb {
         match self {
@@ -720,6 +753,52 @@ mod tests {
 
         let edge = square.best_edge(Vec2::Y);
         assert!((square.normals()[edge].y - 1.0).abs() < EPSILON, "the top edge faces up");
+    }
+
+    /// The test a click runs. Interior, exterior, and the boundary itself.
+    #[test]
+    fn a_point_is_inside_a_shape_or_it_is_not() {
+        let circle = Shape::circle(2.0).unwrap();
+        assert!(circle.contains(Vec2::ZERO, 0.0), "the centre is inside");
+        assert!(circle.contains(vec2(1.999, 0.0), 0.0));
+        assert!(!circle.contains(vec2(2.001, 0.0), 0.0));
+        // Exactly on the rim counts as inside, so a click on the outline picks it up.
+        assert!(circle.contains(vec2(2.0, 0.0), 0.0));
+
+        let boxy = Shape::rectangle(1.0, 0.5).unwrap();
+        assert!(boxy.contains(Vec2::ZERO, 0.0));
+        assert!(boxy.contains(vec2(0.99, 0.49), 0.0), "just inside a corner");
+        assert!(!boxy.contains(vec2(1.01, 0.0), 0.0));
+        assert!(!boxy.contains(vec2(0.0, 0.51), 0.0));
+        // Outside on the diagonal but inside both axis extents of the bounding box.
+        assert!(!boxy.contains(vec2(1.2, 0.6), 0.0));
+    }
+
+    /// A segment has no interior, so an exact test can never pick one. Slack is what
+    /// makes a wall clickable — and what makes a small circle a fair target with a
+    /// mouse.
+    #[test]
+    fn slack_widens_a_shape_so_a_click_can_reach_it() {
+        let segment = Shape::segment(3.0).unwrap();
+        assert!(!segment.contains(vec2(0.0, 0.01), 0.0), "no interior, exactly");
+        assert!(segment.contains(vec2(0.0, 0.01), 0.05), "but reachable with slack");
+        assert!(segment.contains(vec2(3.0, 0.0), 0.05), "including its endpoint");
+        assert!(!segment.contains(vec2(3.2, 0.0), 0.05), "and not beyond it");
+
+        let small = Shape::circle(0.05).unwrap();
+        assert!(!small.contains(vec2(0.1, 0.0), 0.0));
+        assert!(small.contains(vec2(0.1, 0.0), 0.1));
+
+        let boxy = Shape::rectangle(1.0, 1.0).unwrap();
+        assert!(!boxy.contains(vec2(1.05, 0.0), 0.0));
+        assert!(boxy.contains(vec2(1.05, 0.0), 0.1), "slack grows it along the edge normal");
+    }
+
+    #[test]
+    fn a_non_finite_point_is_never_inside() {
+        let boxy = Shape::rectangle(1.0, 1.0).unwrap();
+        assert!(!boxy.contains(vec2(f64::NAN, 0.0), 1e6));
+        assert!(!Shape::circle(1.0).unwrap().contains(vec2(0.0, f64::INFINITY), 0.0));
     }
 
     #[test]

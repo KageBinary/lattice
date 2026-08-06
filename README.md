@@ -252,6 +252,29 @@ flawless run as `✖ not conserved -7.288e1`. The particle domain now publishes
 denominator it used. See [docs/viewer.md](docs/viewer.md), which is mostly a list of
 ways a picture can assert something the data does not say.
 
+### `lattice-play`
+
+The other half of the interface. `lattice-view` opens a model somebody wrote; the
+playground has no model — you build the scene by clicking, on top of the same validated
+solvers.
+
+```powershell
+cargo run --release -p lattice-playground                     # drop, grab and throw
+cargo run --release -p lattice-playground -- --mode reactions # paint two chemicals together
+cargo run --release -p lattice-playground -- --mode heat      # paint hot and cold
+```
+
+Left-drag acts with the selected tool, right-click removes, in every mode. The
+diagnostics panel is still there and still refuses to overclaim: a sandbox with gravity
+and walls has an external force and an infinite sink, so it reports that **nothing** is
+conserved rather than quoting a drift figure for a quantity that was never invariant.
+The heat mode makes the point sharpest — an insulated plate holds its heat integral to
+round-off, and one checkbox opens an edge and takes the claim away.
+
+Painting heat in is not drift, so it is not reported as drift. A mode counts the times
+the reader reached in, and the shell drops the history rather than measuring across a
+disturbance. See [docs/playground.md](docs/playground.md).
+
 ---
 
 ## Repository layout
@@ -277,6 +300,8 @@ lattice/
     lattice-cli/              the `lattice` binary
     lattice-viewer/           the `lattice-view` window: colourmaps, heatmaps,
                               plots, the diagnostics panel
+    lattice-playground/       the `lattice-play` sandbox: mode shell, physics,
+                              reactions and heat
   examples/                   working .lattice models
   tests/invalid/              models that must be rejected, each declaring why
   docs/
@@ -285,6 +310,7 @@ lattice/
     development.md            toolchain setup and conventions
     roadmap.md                what each milestone delivered
     viewer.md                 what the window shows and the rules it draws by
+    playground.md             the sandbox: its modes, and what its panel will claim
     spec/                     the source specification
 ```
 
