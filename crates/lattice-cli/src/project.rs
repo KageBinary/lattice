@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use lattice_compiler::compile_source;
-use lattice_ir::RenderChannel;
+use lattice_ir::{Executor, RenderChannel};
 use lattice_observe::phase;
 use lattice_runtime::{RunConfig, Simulation};
 use lattice_syntax::SourceFile;
@@ -116,11 +116,15 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
         ));
     }
 
-    let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+    let executor = executor_from(args)?;
+    let schedule = executor.label();
+    let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler)
+        .with_executor(executor);
     let outcome = simulation.run(&config);
 
     if !args.has("quiet") {
         println!();
+        println!("execution: {schedule}");
         for channel in simulation.render_channels() {
             print!("{}", render_channel(&channel));
         }
@@ -142,6 +146,29 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
     }
 
     Ok(exit_code(&outcome.stop))
+}
+
+/// Build the executor `--threads` asks for.
+///
+/// Sequential is the default rather than [`Executor::automatic`], which is the opposite
+/// of what a general-purpose tool usually does. The reason is §24.1: the scalar CPU path
+/// is *"the executable specification for accelerated kernels"*, and a run that has not
+/// asked for anything else should be running the specification. `--threads auto` is one
+/// word away for anyone who wants the machine.
+pub fn executor_from(args: &Args) -> Result<Executor, String> {
+    match args.value("threads") {
+        None => Ok(Executor::sequential()),
+        Some("auto") => Ok(Executor::automatic()),
+        Some(raw) => {
+            let threads: usize = raw.parse().map_err(|_| {
+                format!("--threads: `{raw}` is not a thread count; pass a number or `auto`")
+            })?;
+            if threads == 0 {
+                return Err("--threads: 0 threads would run nothing; 1 is sequential".to_string());
+            }
+            Ok(Executor::with_threads(threads))
+        }
+    }
 }
 
 fn exit_code(stop: &lattice_runtime::StopReason) -> ExitCode {

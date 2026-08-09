@@ -23,7 +23,28 @@
 //! mean over-predicts transport across a sharp contrast — a well-known way to get
 //! plausible-looking but wrong answers at material interfaces.
 
-use lattice_ir::{Grid2d, ScalarField, StabilityReason, StableStep};
+use lattice_ir::{Executor, Grain, Grid2d, ScalarField, StabilityReason, StableStep};
+
+/// How much of a grid is worth splitting, in cells.
+///
+/// A grid below 16k cells — a 128² model, say — runs its whole stencil in a few tens of
+/// microseconds, and a dispatch barrier costs a few of those on its own. Below the floor
+/// the partition collapses to one band and the model runs exactly as it did before M4.
+/// Above it, bands are at least 4k cells each so a 160×110 grid is not cut into slivers.
+///
+/// Stated in cells rather than rows because a row is not a fixed amount of work: ten
+/// rows of a 512-wide grid and ten of a 32-wide one differ by a factor of sixteen.
+/// [`Grain::per_row`] converts.
+///
+/// Measured on a 20-thread machine with `lattice bench heat-explicit --threads auto
+/// --compare`, best of three release runs: 3.4x at 256², 4.8x at 512², 4.7x at 1024².
+/// The stencil is memory-bound — six loads and a handful of flops per cell — so those
+/// are a long way below linear and are expected to be. The flattening past 512² is the
+/// working set outgrowing cache, not the partition failing.
+/// Public so a test can ask whether a given grid would actually be split. A
+/// cross-backend case run on a grid below the floor compares the sequential path with
+/// itself and passes for the wrong reason.
+pub const BAND_GRAIN: Grain = Grain::new(16_384, 4_096);
 
 /// How the diffusion coefficient varies over the grid.
 #[derive(Clone, Debug)]
@@ -150,38 +171,63 @@ impl DiffusionOperator {
         self.max_diffusivity
     }
 
-    /// Apply `L[u] = ∇·(D∇u)`, writing into `out`'s interior.
+    /// Apply `L[u] = ∇·(D∇u)`, writing into `out`'s interior, on the calling thread.
     ///
     /// `u`'s halo must already hold the boundary condition — see
     /// [`crate::apply_boundaries`]. `out`'s halo is left untouched.
     pub fn apply(&self, u: &ScalarField, out: &mut ScalarField) {
+        self.apply_with(Executor::shared_sequential(), u, out);
+    }
+
+    /// [`DiffusionOperator::apply`], with the row loop split across `executor`.
+    ///
+    /// Rows are the natural split: cell `(i, j)`'s stencil reads rows `j-1`, `j` and
+    /// `j+1` of `u` and writes only row `j` of `out`, so bands of rows write disjoint
+    /// memory while reading freely across the boundary between them. Nothing is copied
+    /// and no band needs its neighbour's *output*.
+    ///
+    /// Each output cell is computed by the same expression over the same inputs however
+    /// the rows are divided, so this is bit-identical to [`DiffusionOperator::apply`] at
+    /// any thread count — the guarantee `lattice_cpu` documents and
+    /// `parallel_diffusion_is_bit_identical_to_the_scalar_path` checks.
+    pub fn apply_with(&self, executor: &Executor, u: &ScalarField, out: &mut ScalarField) {
         debug_assert_eq!((u.nx(), u.ny()), (self.nx, self.ny), "field size mismatch");
         debug_assert_eq!((out.nx(), out.ny()), (self.nx, self.ny), "output size mismatch");
 
         let (nx, ny) = (self.nx, self.ny);
         let src = u.as_slice();
-        let stride = u.stride();
+        let src_stride = u.stride();
+        let src_origin = u.interior_origin();
 
-        for j in 0..ny {
-            // Row bases into the source field and the two face arrays.
-            let row = u.index(0, j);
-            let fx_row = j * (nx + 1);
-            let fy_row = j * nx;
-            let fy_next = (j + 1) * nx;
+        let out_stride = out.stride();
+        let out_halo = out.halo();
+        debug_assert_eq!(out.ny(), ny);
 
-            for i in 0..nx {
-                let k = row + i;
-                let center = src[k];
+        let grain = BAND_GRAIN.per_row(nx);
 
-                let west = self.face_x[fx_row + i] * (src[k - 1] - center);
-                let east = self.face_x[fx_row + i + 1] * (src[k + 1] - center);
-                let south = self.face_y[fy_row + i] * (src[k - stride] - center);
-                let north = self.face_y[fy_next + i] * (src[k + stride] - center);
+        executor.for_each_row_band_mut(out.row_span_mut(), out_stride, grain, |first, band| {
+            for local in 0..band.len() / out_stride {
+                let j = first + local;
+                // Row bases into the source field and the two face arrays.
+                let row = src_origin + j * src_stride;
+                let fx_row = j * (nx + 1);
+                let fy_row = j * nx;
+                let fy_next = (j + 1) * nx;
+                let dst = local * out_stride + out_halo;
 
-                let value = (east + west) * self.inv_dx2 + (north + south) * self.inv_dy2;
-                out.set(i, j, value);
+                for i in 0..nx {
+                    let k = row + i;
+                    let center = src[k];
+
+                    let west = self.face_x[fx_row + i] * (src[k - 1] - center);
+                    let east = self.face_x[fx_row + i + 1] * (src[k + 1] - center);
+                    let south = self.face_y[fy_row + i] * (src[k - src_stride] - center);
+                    let north = self.face_y[fy_next + i] * (src[k + src_stride] - center);
+
+                    band[dst + i] = (east + west) * self.inv_dx2 + (north + south) * self.inv_dy2;
+                }
             }
-        }
+        });
     }
 
     /// The largest timestep an explicit update remains stable at.
@@ -385,6 +431,54 @@ mod tests {
         let fine = DiffusionOperator::new(&Grid2d::new(100, 100, [1.0, 1.0]), &Diffusivity::Uniform(1.0));
         let ratio = coarse.explicit_stability_limit().max / fine.explicit_stability_limit().max;
         assert!((ratio - 4.0).abs() < 1e-9, "halving h should quarter dt, got {ratio}");
+    }
+
+    /// §19.1's cross-backend level, at its strictest. Between two CPU threads there is
+    /// no tolerance to hide in: the same expression over the same inputs must give the
+    /// same bits, whatever the row bands are. A variable diffusivity is used so the
+    /// face coefficients differ from cell to cell and a mis-indexed band cannot pass by
+    /// symmetry.
+    #[test]
+    fn parallel_diffusion_is_bit_identical_to_the_scalar_path() {
+        let grid = Grid2d::new(61, 37, [1.3, 0.9]);
+        let mut d = ScalarField::new(&grid, 1);
+        d.init_from_position(&grid, |[x, y]| 0.05 + x * x + 0.5 * y);
+        let op = DiffusionOperator::new(&grid, &Diffusivity::Variable(d));
+
+        let mut u = ScalarField::new(&grid, 1);
+        u.init_from_position(&grid, |[x, y]| (11.0 * x).sin() * (7.0 * y).cos() + x);
+        apply_boundaries(&mut u, &BoundarySet::INSULATED, grid.dx(), grid.dy(), HaloMode::Inhomogeneous);
+
+        let mut reference = ScalarField::new(&grid, 1);
+        op.apply(&u, &mut reference);
+
+        for threads in [2usize, 3, 4, 8] {
+            let executor = Executor::with_threads(threads);
+            let mut out = ScalarField::new(&grid, 1);
+            op.apply_with(&executor, &u, &mut out);
+            assert_eq!(
+                out.as_slice().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                reference.as_slice().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{threads} threads changed the stencil result"
+            );
+        }
+    }
+
+    /// A grid short enough that every band collapses to one still has to be right —
+    /// this is the path a small interactive scene takes.
+    #[test]
+    fn a_grid_too_small_to_split_still_gives_the_same_answer() {
+        let grid = Grid2d::new(5, 4, [1.0, 1.0]);
+        let mut u = ScalarField::new(&grid, 1);
+        u.init_from_position(&grid, |[x, y]| x + 2.0 * y);
+        apply_boundaries(&mut u, &BoundarySet::PERIODIC, grid.dx(), grid.dy(), HaloMode::Inhomogeneous);
+        let op = DiffusionOperator::new(&grid, &Diffusivity::Uniform(0.3));
+
+        let mut reference = ScalarField::new(&grid, 1);
+        op.apply(&u, &mut reference);
+        let mut parallel = ScalarField::new(&grid, 1);
+        op.apply_with(&Executor::with_threads(8), &u, &mut parallel);
+        assert_eq!(parallel.as_slice(), reference.as_slice());
     }
 
     #[test]

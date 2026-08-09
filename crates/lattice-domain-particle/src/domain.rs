@@ -489,14 +489,21 @@ impl Domain for ParticleDomain {
         }
     }
 
-    fn advance(&mut self, dt: f64, _ctx: &mut StepContext<'_>) {
+    fn advance(&mut self, dt: f64, ctx: &mut StepContext<'_>) {
         debug_assert!(
             self.initialized,
             "ParticleDomain::advance requires initialize() to have established the force invariant"
         );
         let Self { store, forces, cells, bounds, integrator, .. } = self;
         let scheme = *integrator;
-        scheme.step(dt, store, |s| {
+        // The integrator's per-particle updates are split across threads; the force
+        // laws are not. A pair law applies Newton's third law by scattering into *both*
+        // particles of a pair, so two threads working on different cells can collide on
+        // a shared neighbour. Reformulating it as a gather would fix that and would also
+        // change the summation order, which is the one thing this crate promises not to
+        // do. See `lattice_cpu`, and `docs/execution.md` for what a GPU backend will
+        // have to decide instead.
+        scheme.step_with(ctx.executor, dt, store, |s| {
             // Positions have just changed: wrap or reflect before binning, so the
             // neighbour list and the minimum-image convention agree on where
             // particles are.

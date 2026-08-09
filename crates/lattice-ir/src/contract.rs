@@ -21,6 +21,8 @@
 
 use core::fmt;
 
+use lattice_cpu::Executor;
+
 use crate::arena::Arena;
 use crate::diagnostics::{Invariant, Observations};
 
@@ -361,10 +363,16 @@ impl fmt::Display for ContractGap {
 
 /// Per-step context handed to a domain.
 ///
-/// Carries the clock and the scratch arena. Everything else a solver needs lives in
-/// the solver itself: the runtime deliberately does not hand out a god-object view of
-/// global state, because that is how implicit cross-domain coupling creeps in (P2 —
-/// coupling is declared through typed ports, not hidden access).
+/// Carries the clock, the scratch arena, and the executor a solver should split its
+/// loops with. Everything else a solver needs lives in the solver itself: the runtime
+/// deliberately does not hand out a god-object view of global state, because that is
+/// how implicit cross-domain coupling creeps in (P2 — coupling is declared through
+/// typed ports, not hidden access).
+///
+/// The executor is here rather than owned by each solver because *how many threads to
+/// use* is a property of the run, not of the physics. A solver that captured its own
+/// pool would start threads per domain and would leave a caller no way to ask a coupled
+/// model to run on one.
 #[derive(Debug)]
 pub struct StepContext<'a> {
     /// Simulation time at the start of this step, seconds.
@@ -373,12 +381,24 @@ pub struct StepContext<'a> {
     pub step: u64,
     /// Preallocated per-step scratch space.
     pub arena: &'a mut Arena,
+    /// How to split parallel loops (spec §15.3).
+    pub executor: &'a Executor,
 }
 
 impl<'a> StepContext<'a> {
-    /// A context at time zero.
+    /// A context at time zero that runs everything on the calling thread.
+    ///
+    /// Sequential is the default because it is the reference: §24.1 calls the scalar CPU
+    /// path *"the executable specification for accelerated kernels"*, and a test that
+    /// has not asked for threads should be measuring the specification.
     pub fn new(arena: &'a mut Arena) -> Self {
-        Self { time: 0.0, step: 0, arena }
+        Self { time: 0.0, step: 0, arena, executor: Executor::shared_sequential() }
+    }
+
+    /// The same context, with loops split by `executor`.
+    pub fn with_executor(mut self, executor: &'a Executor) -> Self {
+        self.executor = executor;
+        self
     }
 }
 

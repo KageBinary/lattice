@@ -247,7 +247,7 @@ impl PhysicsPlayground {
             .with_friction(0.5);
         let side = Collider::new(Shape::rectangle(0.15, ARENA[1]).expect("positive"))
             .with_friction(0.5);
-        let floor = self.world.register(wall.clone());
+        let floor = self.world.register(wall);
         let post = self.world.register(side);
 
         self.world.spawn(BodySpec::statik([0.0, -ARENA[1]], floor));
@@ -419,9 +419,12 @@ impl Playground for PhysicsPlayground {
     }
 
     fn step(&mut self, dt: f64) {
-        let mut ctx = StepContext::new(&mut self.arena);
-        self.world.prepare(&mut ctx);
-        drop(ctx);
+        // Scoped, not dropped: the block is what ends the borrow of `self.arena` so
+        // `apply_grab` can take `&mut self` below.
+        {
+            let mut ctx = StepContext::new(&mut self.arena);
+            self.world.prepare(&mut ctx);
+        }
 
         // After `prepare` (which cleared the accumulators and applied gravity) and
         // before `advance`, which is the only window where an external force lands on
@@ -484,16 +487,15 @@ impl Playground for PhysicsPlayground {
             }
         }
 
-        if pointer.released {
-            if let Some(grab) = self.grab.take()
-                && let Some(slot) = self.world.slot_of(grab.body)
-            {
-                // Throw with the *hand's* velocity, not the body's — a spring-held body
-                // lags the cursor, and releasing at its own speed feels weak.
-                let spin = self.world.bodies().omega()[slot];
-                self.world.bodies_mut().set_velocity(grab.body, self.pointer_velocity, spin);
-                self.disturbances += 1;
-            }
+        if pointer.released
+            && let Some(grab) = self.grab.take()
+            && let Some(slot) = self.world.slot_of(grab.body)
+        {
+            // Throw with the *hand's* velocity, not the body's — a spring-held body
+            // lags the cursor, and releasing at its own speed feels weak.
+            let spin = self.world.bodies().omega()[slot];
+            self.world.bodies_mut().set_velocity(grab.body, self.pointer_velocity, spin);
+            self.disturbances += 1;
         }
     }
 

@@ -16,7 +16,7 @@
 //! - Each call sub-cycles at the timestep the network's own Jacobian allows, so a
 //!   caller asking for one second of a fast reaction gets it correctly rather than
 //!   getting nonsense.
-//! - [`MAX_SUBSTEPS`] bounds the work. Hitting it sets [`KineticsReport::stiff`], and
+//! - [`MAX_SUBSTEPS`] bounds the work. Hitting it sets [`KineticsReport::exhausted`], and
 //!   the domain reports that rather than silently spending a minute per step.
 //! - [`Kinetics::stiffness_ratio`] is published, so "this needs an implicit solver" is
 //!   a number a reader can see rather than a conclusion they have to reach.

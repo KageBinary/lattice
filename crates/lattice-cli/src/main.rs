@@ -64,7 +64,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
             project::check(args)
         }
         "run" => {
-            check_flags(args, &["duration", "steps", "timestep", "json", "quiet"])?;
+            check_flags(args, &["duration", "steps", "timestep", "threads", "json", "quiet"])?;
             project::run(args)
         }
         "validate" => cmd_validate(args),
@@ -135,11 +135,19 @@ fn cmd_validate(args: &Args) -> Result<ExitCode, String> {
 }
 
 fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
-    check_flags(args, &["scale", "json", "quiet"])?;
+    check_flags(args, &["scale", "threads", "compare", "json", "quiet"])?;
 
     let scale: usize = args.parsed_or("scale", 1)?;
     if scale == 0 {
         return Err("--scale must be at least 1".to_string());
+    }
+    let executor = project::executor_from(args)?;
+    let compare = args.has("compare");
+    if compare && executor.is_sequential() {
+        return Err(
+            "--compare needs something to compare against: pass --threads <n> or --threads auto"
+                .to_string(),
+        );
     }
 
     let selected = match args.positional.first() {
@@ -153,7 +161,7 @@ fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
         ));
     }
 
-    println!("{}", bench::environment());
+    println!("{}", bench::environment_for(&executor));
     if let Some(warning) = bench::build_warning() {
         println!("\nWARNING: {warning}");
     }
@@ -163,13 +171,33 @@ fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
     let mut results = lattice_observe::Json::array();
     let mut all_valid = true;
 
+    let sequential = lattice_ir::Executor::sequential();
     for benchmark in &selected {
-        let outcome = (benchmark.run)(scale);
+        // The baseline runs first when comparing, so the parallel run is the one with a
+        // warm cache. That biases the speedup *down*, which is the direction a
+        // performance claim should be biased.
+        let baseline = compare.then(|| (benchmark.run)(scale, &sequential));
+        let outcome = (benchmark.run)(scale, &executor);
         all_valid &= outcome.valid();
-        if !args.has("quiet") {
-            print!("{}", bench::report(benchmark, scale, &outcome));
+        if let Some(baseline) = &baseline {
+            all_valid &= baseline.valid();
         }
-        results.push(bench::to_json(benchmark, scale, &outcome));
+
+        if !args.has("quiet") {
+            if let Some(baseline) = &baseline {
+                print!("{}", bench::report(benchmark, scale, &sequential, baseline));
+            }
+            print!("{}", bench::report(benchmark, scale, &executor, &outcome));
+            if let Some(baseline) = &baseline {
+                print!("{}", bench::speedup_report(baseline, &outcome, &executor));
+            }
+        }
+
+        let mut json = bench::to_json(benchmark, scale, &executor, &outcome);
+        if let Some(baseline) = &baseline {
+            json = json.set("sequential_baseline", bench::to_json(benchmark, scale, &sequential, baseline));
+        }
+        results.push(json);
     }
     artifact.set_section("benchmarks", results);
 
@@ -277,6 +305,7 @@ COMMANDS
     --duration <seconds>     override the model's `duration:`
     --steps <n>              stop after this many steps
     --timestep <seconds>     override the negotiated timestep
+    --threads <n|auto>       split solver loops across n threads (default 1)
     --json <path>            write the run artifact
     --quiet                  suppress the visualization
 
@@ -287,6 +316,8 @@ COMMANDS
 
   bench [<pattern>]        run benchmarks, reporting throughput and correctness together
     --scale <n>              problem-size multiplier (default 1)
+    --threads <n|auto>       split solver loops across n threads (default 1)
+    --compare                also run sequentially and report the measured speedup
     --json <path>            write a machine-readable report
     --quiet                  suppress the text report
 
@@ -304,9 +335,11 @@ COMMANDS
 EXAMPLES
   lattice check examples/slab.lattice
   lattice run examples/slab.lattice --json runs/slab.json
+  lattice run examples/chamber.lattice --threads auto
   lattice validate
   lattice validate --filter grid2d --json runs/validation.json
   lattice bench heat --scale 2
+  lattice bench heat-explicit --threads auto --compare
   lattice demo oscillator
   lattice demo heat-gaussian --steps 800 --json runs/heat.json
   lattice inspect contracts

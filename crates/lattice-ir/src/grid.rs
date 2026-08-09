@@ -248,6 +248,27 @@ impl ScalarField {
         &mut self.data
     }
 
+    /// The contiguous span covering every interior row, halo cells included.
+    ///
+    /// Row `j` begins at `j * stride()` within the returned slice, and interior column
+    /// `i` of that row sits at `halo() + i`. The halo *rows* above and below are
+    /// excluded; the halo *columns* at each end of a row are not, because they are
+    /// interleaved with the interior and cannot be removed without copying.
+    ///
+    /// This exists so a stencil can be split into disjoint row bands
+    /// ([`Executor::for_each_row_band_mut`](lattice_cpu::Executor::for_each_row_band_mut))
+    /// while every band still reads its neighbours' rows from the *input* field.
+    pub fn row_span(&self) -> &[f64] {
+        let start = self.halo * self.stride;
+        &self.data[start..start + self.ny * self.stride]
+    }
+
+    /// The interior row span, mutable. See [`ScalarField::row_span`].
+    pub fn row_span_mut(&mut self) -> &mut [f64] {
+        let start = self.halo * self.stride;
+        &mut self.data[start..start + self.ny * self.stride]
+    }
+
     /// One interior row.
     pub fn row(&self, j: usize) -> &[f64] {
         let start = self.index(0, j);
@@ -662,6 +683,45 @@ mod tests {
         // Halo addressing.
         assert_eq!(f.index_signed(-1, 0), 6);
         assert_eq!(f.index_signed(4, 2), 3 * 6 + 5);
+    }
+
+    /// The row span is what lets a stencil be split into disjoint bands, so its
+    /// geometry has to be exact: whole rows, no halo rows at either end, and interior
+    /// column `i` at `halo + i`.
+    #[test]
+    fn the_row_span_covers_the_interior_rows_and_nothing_else() {
+        let g = Grid2d::new(4, 3, [4.0, 3.0]);
+        let mut f = ScalarField::filled(&g, 2, -1.0);
+        for j in 0..3 {
+            for i in 0..4 {
+                f.set(i, j, (10 * j + i) as f64);
+            }
+        }
+
+        let stride = f.stride();
+        assert_eq!(stride, 8, "4 interior + 2 halo each side");
+        let span = f.row_span();
+        assert_eq!(span.len(), 3 * stride, "three interior rows, halo columns included");
+        for j in 0..3 {
+            for i in 0..4 {
+                assert_eq!(span[j * stride + f.halo() + i], (10 * j + i) as f64, "({i},{j})");
+            }
+            // The halo columns are inside the span, and still hold their fill value.
+            assert_eq!(span[j * stride], -1.0);
+        }
+
+        // Writing through the span reaches the interior, and only the interior rows.
+        f.row_span_mut().fill(7.0);
+        assert_eq!(f.get(2, 1), 7.0);
+        assert_eq!(f.as_slice()[f.index_signed(0, -1)], -1.0, "the halo row below is untouched");
+        assert_eq!(f.as_slice()[f.index_signed(0, 3)], -1.0, "and the one above");
+    }
+
+    #[test]
+    fn a_zero_halo_row_span_is_the_whole_buffer() {
+        let g = Grid2d::new(3, 2, [3.0, 2.0]);
+        let f = ScalarField::new(&g, 0);
+        assert_eq!(f.row_span().len(), f.len());
     }
 
     #[test]

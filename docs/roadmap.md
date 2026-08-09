@@ -206,21 +206,124 @@ Delivered:
   first order, for a whole afternoon, because the test compared whole buffers and the
   halo holds intermediate boundary state rather than part of the answer.
 
-## M4 — Portable GPU (next)
+## M4 — Portable GPU (in progress)
 
 **Spec exit condition:** *"selected CPU/GPU cross-validation and performance goals."*
 
-Needed:
+Four things were needed. The fourth is done.
 
 1. **A `wgpu` compute backend** — the operation graph already computes which operations
    are independent and reports the ideal speedup; nothing consumes that yet.
 2. **Kernel cache and zero-copy rendering** — §15.5's normalized expression hashing, and
    the viewer drawing from simulation buffers rather than a CPU texture upload.
-3. **CPU/GPU cross-validation** — §19.1 lists it as its own level, and it is the whole
-   reason the scalar CPU path is described as the executable specification.
-4. **CPU parallelism** — §15.3's parallel iterators, deferred twice now. A coupled model
-   finally has independent operations to run across, and `examples/chamber.lattice` is
-   the first model whose graph has a width above one.
+3. **CPU/GPU cross-validation** — the *level* now exists (§19.1's `cross-backend`, with
+   four passing cases) and the harness is built; the GPU half of it is not.
+4. **CPU parallelism** ✅ — §15.3's parallel iterators, deferred twice before this.
+
+### M4.1 — Parallel CPU execution ✅
+
+Delivered, and documented in [execution.md](execution.md):
+
+- **`lattice-cpu`** — the crate §24 calls `lattice-cpu`. A persistent worker pool with
+  lock-free claiming and a spin-before-park window, and an `Executor` that decides how a
+  loop is split. It holds the only `unsafe` in the workspace, behind two invariants that
+  `dispatch` enforces rather than documents.
+- **Parallel kernels** — the diffusion stencil, the explicit update, the Crank–Nicolson
+  right-hand side and operator application, and all three integrators' per-particle
+  passes. Measured on 20 threads: **4.8× at 512², 3.4× at 256², 1.9× on 262k particles**,
+  and nothing anywhere is slower than it was.
+- **A cross-backend validation level** — §19.1's own row, with four cases asserting that
+  parallel and scalar agree *exactly*: every cell, every particle, the CG iteration
+  count, and FR-011's artifact hash.
+- **`--threads <n|auto>` and `--compare`** — the second runs a benchmark both ways and
+  reports the measured speedup with its efficiency, refusing to report either if a
+  §15.6 correctness condition failed.
+
+936 tests. Clippy clean.
+
+### What M4.1 taught us
+
+- **The promise is worth more than the speed.** *Parallel execution changes the schedule,
+  never the numbers* is a stronger claim than §19.1 asks for between backends, and it
+  costs real performance — Crank–Nicolson gains only 1.6× because its inner products stay
+  sequential. It buys two things worth more: a regression baseline recorded on a
+  sixteen-core machine is comparable with a run on a four-core one, and the tolerance the
+  GPU will eventually need becomes *attributable to the GPU* rather than a number that
+  has always been there.
+- **A grain is two numbers, not one.** "How much work is worth splitting at all" and "how
+  small may a piece get" are different questions. Using one number for both looks tidy
+  and quietly costs: a floor high enough to keep 16k particles sequential, reused as a
+  minimum chunk size, pinned a 262k-particle model to four threads and dropped it from
+  1.90× to 1.34×.
+- **An optimization that is sometimes a pessimization is a regression.** The first
+  working version made `particles-gravity` **2.4× slower** on twenty threads at 16k
+  particles, because six barriers per step cost more than the arithmetic between them.
+  §15.1 says a faster wrong solver is a regression; a slower right one is too. The fix
+  was half pool engineering and half admitting where the crossover is and refusing to
+  split below it.
+- **A cross-backend case can pass for the wrong reason.** Every kernel declines to split a
+  problem below its floor — so a case sized under that floor compares the sequential path
+  with *itself* and passes without testing anything. Raising a floor is an ordinary
+  tuning decision that would silently do this. The case sizes are now pinned to the
+  published grains, with a test that asserts the work is actually split.
+- **A shared counter that resets is a use-after-free waiting for load.** A worker that has
+  just run the last task of one dispatch probes once more for work. If the next dispatch
+  has already published, that probe either runs its task against the *previous* dispatch's
+  freed closure pointer or silently eats an index the new dispatch is waiting for. A
+  monotonic counter with per-job ranges, probed by compare-exchange rather than
+  fetch-add, makes the stale probe land harmlessly out of range.
+- **Timings lie at ±20%.** A "0.94× regression" that justified a design change turned out
+  to be nothing; three repetitions made the curve monotonic and the real crossover
+  obvious. Nothing in the table above is a single measurement.
+
+### Where M4.2 starts
+
+Nothing is half-finished — M4.1 is closed, the suite is green, and the next piece is a
+fresh start rather than a resumption. Written down so it does not have to be re-derived:
+
+**What already exists to build on.**
+
+- `OperationGraph::levels` computes which operations are independent and reports the
+  ideal speedup. **Nothing consumes it.** That is the scheduler-shaped hole a backend
+  slots into, and it has been sitting there since M1.
+- `Executor` / `Grain` / `Partition` are the CPU precedent for "the caller declares the
+  work, the backend decides the schedule". A GPU backend answers the same questions with
+  different numbers; the *shape* should not need reinventing.
+- The cross-backend validation level and its harness are built (`lattice-validation/src/
+  execution.rs`). Adding a GPU row means adding cases, not building a comparison.
+- Every kernel now has a `_with(executor, …)` form beside its default. The same split
+  works for a backend argument.
+
+**The first decision, before any code.** §24 names two crates, not one: `lattice-compute`
+for backend traits, buffers and the kernel cache, and `lattice-wgpu` for the portable
+implementation. Getting that boundary right is the whole exercise — §23 warns that
+*"portable GPU abstractions may leave performance on the table"* and prescribes *"baseline
+wgpu plus a native backend plugin boundary"*, so the trait layer has to be designed
+against a CUDA backend that does not exist. `lattice-cpu` should probably become an
+implementation *behind* `lattice-compute` rather than staying beside it.
+
+**The second decision.** `wgpu` is a few hundred crates, and today only the two
+window-opening crates have any dependencies at all. §24.1 permits it, and the spec makes
+the portable backend the product baseline — but the CLI's dependency-free property is
+worth keeping, so the GPU backend should be optional the way the viewer is.
+
+**Four questions M4.1 answered for the CPU and deferred for the GPU**, each of which
+needs a *different* answer rather than the same one:
+
+| Question | CPU answer | Why the GPU cannot reuse it |
+|---|---|---|
+| How exact is cross-backend agreement? | bit-identical | FMA contraction, transcendental accuracy, reduction order |
+| Reductions | sequential | there is no sequential fallback to retreat to |
+| Lennard-Jones pair forces | left sequential | same — a gather or a colouring becomes mandatory |
+| Precision | `accurate64` throughout | §10.5's `fast32` and `mixed` profiles exist for exactly this |
+
+The tolerance the first GPU case introduces is the most consequential number in the
+milestone. It must be attributable to a named mechanism, not fitted to make a test pass —
+which is the whole reason the CPU pair was kept exact.
+
+**Before starting, reread §23.1's kill criteria**, particularly *"the compiled runtime is
+not materially faster or easier to inspect than a straightforward Python prototype."*
+M4.1 improved the first half and did nothing for the second.
 
 ## Outside the milestones: the playground
 
@@ -267,12 +370,18 @@ From spec §21.1, and they apply to every milestone above:
 > domains should not be added while the current domain lacks a reference test or cannot
 > explain its stability limits.
 
-And the kill criteria of §23.1 are worth rereading before M4, particularly:
+And the kill criteria of §23.1 are worth rereading before the rest of M4, particularly:
 
 > The compiled runtime is not materially faster or easier to inspect than a
 > straightforward Python prototype.
 
 M0's numbers (774M cell-updates/s, 427M particle-updates/s, single-threaded) clear the
-"materially faster" half. The "easier to inspect" half is what `lattice inspect
-contracts` and the measured validation report are for, and it stays an open question
-until someone outside the project uses them.
+"materially faster" half, and M4.1 multiplies the grid figure by another 4.8×. The
+"easier to inspect" half is what `lattice inspect contracts` and the measured validation
+report are for, and it stays an open question until someone outside the project uses them.
+
+§23's *"performance portability — portable GPU abstractions may leave performance on the
+table"* is the risk M4's remaining three items run into, and M4.1 is a small preview of
+it: the parallel CPU backend leaves plenty on the table (5× on twenty threads) and the
+reason is memory bandwidth, which no amount of scheduling recovers. Naming the wall
+matters more than the ratio.

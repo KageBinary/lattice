@@ -1,13 +1,13 @@
 //! The heat / diffusion domain.
 
 use lattice_ir::{
-    Boundary, BoundarySet, Domain, FidelityProfile, Grid2d, Invariant, ObservationKind,
+    Boundary, BoundarySet, Domain, Executor, FidelityProfile, Grid2d, Invariant, ObservationKind,
     Observations, Precision, ResidualHistory, ScalarField, SolveOutcome, SolverContract,
     StableStep, StepContext,
 };
 
 use crate::boundary::{apply_boundaries, HaloMode};
-use crate::operator::{DiffusionOperator, Diffusivity};
+use crate::operator::{DiffusionOperator, Diffusivity, BAND_GRAIN};
 use crate::solver::{conjugate_gradient, CgWorkspace};
 
 /// How the diffusion term is advanced in time.
@@ -337,24 +337,27 @@ impl HeatDomain {
     }
 
     /// Explicit update: one stencil pass, no solve.
-    fn step_explicit(&mut self, dt: f64) {
+    fn step_explicit(&mut self, dt: f64, executor: &Executor) {
         let (dx, dy) = (self.grid.dx(), self.grid.dy());
         let Self { field, work, operator, boundaries, source, .. } = self;
 
         apply_boundaries(field, boundaries, dx, dy, HaloMode::Inhomogeneous);
-        operator.apply(field, work);
+        operator.apply_with(executor, field, work);
 
-        let nx = field.nx();
-        for j in 0..field.ny() {
-            let start = field.index(0, j);
-            let laplacian = work.row(j);
-            let source_row = source.as_ref().map(|s| s.row(j));
-            let target = &mut field.as_mut_slice()[start..start + nx];
-            for i in 0..nx {
-                let s = source_row.map_or(0.0, |r| r[i]);
-                target[i] += dt * (laplacian[i] + s);
+        let (nx, stride, halo) = (field.nx(), field.stride(), field.halo());
+        executor.for_each_row_band_mut(field.row_span_mut(), stride, BAND_GRAIN.per_row(nx), |first, band| {
+            for local in 0..band.len() / stride {
+                let j = first + local;
+                let laplacian = work.row(j);
+                let source_row = source.as_ref().map(|s| s.row(j));
+                let base = local * stride + halo;
+                let target = &mut band[base..base + nx];
+                for i in 0..nx {
+                    let s = source_row.map_or(0.0, |r| r[i]);
+                    target[i] += dt * (laplacian[i] + s);
+                }
             }
-        }
+        });
     }
 
     /// Implicit update: assemble the right-hand side, then solve.
@@ -364,7 +367,14 @@ impl HeatDomain {
     /// needs a *linear* operator. So `c` is measured by applying `L` to a zero field
     /// with the real boundary conditions, moved to the right-hand side, and the
     /// iteration runs against `L_hom` alone.
-    fn step_implicit(&mut self, dt: f64) {
+    ///
+    /// Only the stencil passes and the elementwise assembly are split across threads.
+    /// The conjugate-gradient iteration's inner products stay sequential — a dot product
+    /// split into chunks and added back is a different number from the same dot product
+    /// added in order, and that difference would depend on the machine's core count. It
+    /// would change the iteration count, and through it the answer. See `lattice_cpu`
+    /// for the rule this follows.
+    fn step_implicit(&mut self, dt: f64, executor: &Executor) {
         let theta = self.scheme.theta();
         let (dx, dy) = (self.grid.dx(), self.grid.dy());
         let Self {
@@ -386,27 +396,31 @@ impl HeatDomain {
         // c = L(0) under the declared boundary conditions.
         work.fill_interior(0.0);
         apply_boundaries(work, boundaries, dx, dy, HaloMode::Inhomogeneous);
-        operator.apply(work, bc_constant);
+        operator.apply_with(executor, work, bc_constant);
 
         // L(u^n) under the declared boundary conditions, which is L_hom(u^n) + c.
         apply_boundaries(field, boundaries, dx, dy, HaloMode::Inhomogeneous);
-        operator.apply(field, work);
+        operator.apply_with(executor, field, work);
 
         // rhs = u^n + dt·[(1−θ)·L(u^n) + θ·c + S]
-        let nx = field.nx();
-        for j in 0..field.ny() {
-            let start = rhs.index(0, j);
-            let current = field.row(j);
-            let laplacian = work.row(j);
-            let constant = bc_constant.row(j);
-            let source_row = source.as_ref().map(|s| s.row(j));
-            let target = &mut rhs.as_mut_slice()[start..start + nx];
-            for i in 0..nx {
-                let s = source_row.map_or(0.0, |r| r[i]);
-                target[i] =
-                    current[i] + dt * ((1.0 - theta) * laplacian[i] + theta * constant[i] + s);
+        let (nx, stride, halo) = (rhs.nx(), rhs.stride(), rhs.halo());
+        let current = &*field;
+        executor.for_each_row_band_mut(rhs.row_span_mut(), stride, BAND_GRAIN.per_row(nx), |first, band| {
+            for local in 0..band.len() / stride {
+                let j = first + local;
+                let previous = current.row(j);
+                let laplacian = work.row(j);
+                let constant = bc_constant.row(j);
+                let source_row = source.as_ref().map(|s| s.row(j));
+                let base = local * stride + halo;
+                let target = &mut band[base..base + nx];
+                for i in 0..nx {
+                    let s = source_row.map_or(0.0, |r| r[i]);
+                    target[i] =
+                        previous[i] + dt * ((1.0 - theta) * laplacian[i] + theta * constant[i] + s);
+                }
             }
-        }
+        });
 
         // Solve (I − θ·dt·L_hom)·u^{n+1} = rhs, warm-started from u^n.
         let coefficient = theta * dt;
@@ -415,16 +429,24 @@ impl HeatDomain {
             rhs,
             |input, output| {
                 apply_boundaries(input, boundaries, dx, dy, HaloMode::Homogeneous);
-                operator.apply(input, output);
-                let width = output.nx();
-                for j in 0..output.ny() {
-                    let start = output.index(0, j);
-                    let source_row = input.row(j);
-                    let target = &mut output.as_mut_slice()[start..start + width];
-                    for i in 0..width {
-                        target[i] = source_row[i] - coefficient * target[i];
-                    }
-                }
+                operator.apply_with(executor, input, output);
+                let (width, stride, halo) = (output.nx(), output.stride(), output.halo());
+                let operand = &*input;
+                executor.for_each_row_band_mut(
+                    output.row_span_mut(),
+                    stride,
+                    BAND_GRAIN.per_row(width),
+                    |first, band| {
+                        for local in 0..band.len() / stride {
+                            let source_row = operand.row(first + local);
+                            let base = local * stride + halo;
+                            let target = &mut band[base..base + width];
+                            for i in 0..width {
+                                target[i] = source_row[i] - coefficient * target[i];
+                            }
+                        }
+                    },
+                );
             },
             cg,
             *tolerance,
@@ -547,11 +569,11 @@ impl Domain for HeatDomain {
 
     fn prepare(&mut self, _ctx: &mut StepContext<'_>) {}
 
-    fn advance(&mut self, dt: f64, _ctx: &mut StepContext<'_>) {
+    fn advance(&mut self, dt: f64, ctx: &mut StepContext<'_>) {
         if self.scheme.is_implicit() {
-            self.step_implicit(dt);
+            self.step_implicit(dt, ctx.executor);
         } else {
-            self.step_explicit(dt);
+            self.step_explicit(dt, ctx.executor);
         }
         self.steps += 1;
     }

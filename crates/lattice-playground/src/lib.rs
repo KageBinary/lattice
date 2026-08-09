@@ -162,7 +162,7 @@ mod tests {
                     mode.set_toggle(index, value);
                     mode.step(dt);
                 }
-                assert_eq!(mode.toggles()[index].value, true, "{name}: toggle did not stick");
+                assert!(mode.toggles()[index].value, "{name}: toggle did not stick");
                 mode.set_toggle(index, false);
             }
             mode.set_knob(999, 1.0);

@@ -50,7 +50,7 @@
 //! |---|---|---|
 //! | Evaluate | [`eval`] | what quantity is this expression, and does it type-check? |
 //! | Recognize | [`builtins`] | is this a field initializer, a boundary, a method, a force? |
-//! | Lower | [`compile`] | which solver implements this, with what memory and schedule? |
+//! | Lower | [`compile`](mod@compile) | which solver implements this, with what memory and schedule? |
 //!
 //! Everything they learn ends up in the model report, which is what `lattice check`
 //! prints. Spec §8.4 step 9 asks for exactly that: the compiled model *plus a report

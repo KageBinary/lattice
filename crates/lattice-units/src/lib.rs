@@ -45,7 +45,7 @@
 //! - **Fractional dimensions.** Exponents are integers, so `sqrt(meter)` has no
 //!   representation. [`Dimension::root`] reports this rather than rounding.
 //! - **Guessing at `a/b*c`.** Left-to-right grouping is applied and a
-//!   [`UnitWarning`] is emitted; see [`parse`] for why.
+//!   [`UnitWarning`] is emitted; see [`UnitRegistry::parse_unit`] for why.
 //! - **Affine units in expressions.** `joule/celsius` is rejected, because the
 //!   Celsius offset has no consistent meaning under division.
 

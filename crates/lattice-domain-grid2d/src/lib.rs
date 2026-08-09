@@ -63,7 +63,7 @@ mod solver;
 
 pub use boundary::{apply_boundaries, HaloMode};
 pub use domain::{gaussian, heated_edge, left_half, HeatDomain, TimeScheme};
-pub use operator::{DiffusionOperator, Diffusivity};
+pub use operator::{DiffusionOperator, Diffusivity, BAND_GRAIN};
 pub use solver::{conjugate_gradient, CgWorkspace};
 
 #[cfg(test)]

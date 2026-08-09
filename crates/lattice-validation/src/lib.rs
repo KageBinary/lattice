@@ -36,6 +36,7 @@
 
 mod chemistry;
 mod contracts;
+mod execution;
 mod heat;
 mod particles;
 mod rigid;
@@ -57,6 +58,13 @@ pub enum Level {
     Manufactured,
     /// Do two independent schemes agree?
     CrossScheme,
+    /// Do two backends agree?
+    ///
+    /// §19.1 phrases this as *"do CPU and GPU agree within tolerance?"* and scopes it to
+    /// *"all released kernels"*. The first backend pair to exist is the scalar CPU path
+    /// against the parallel CPU path, and there the answer is stricter than the question:
+    /// they agree exactly, or one of them is wrong.
+    CrossBackend,
     /// Does a coupled model behave and account for its transfers?
     Scenario,
 }
@@ -70,6 +78,7 @@ impl Level {
             Level::Analytic => "analytic",
             Level::Manufactured => "manufactured",
             Level::CrossScheme => "cross-scheme",
+            Level::CrossBackend => "cross-backend",
             Level::Scenario => "scenario",
         }
     }
@@ -82,6 +91,7 @@ impl Level {
             Level::Analytic => "does the solver match a known solution?",
             Level::Manufactured => "does the discretization converge at the expected order?",
             Level::CrossScheme => "do independent schemes agree?",
+            Level::CrossBackend => "do two backends agree?",
             Level::Scenario => "does a coupled model behave and account for transfers?",
         }
     }
@@ -237,6 +247,7 @@ pub fn all_cases() -> Vec<Case> {
     cases.extend_from_slice(heat::CASES);
     cases.extend_from_slice(rigid::CASES);
     cases.extend_from_slice(chemistry::CASES);
+    cases.extend_from_slice(execution::CASES);
     cases.extend_from_slice(contracts::CASES);
     cases
 }

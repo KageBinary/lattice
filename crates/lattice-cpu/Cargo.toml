@@ -1,0 +1,13 @@
+[package]
+name = "lattice-cpu"
+description = "Parallel CPU execution for Project Lattice: a worker pool and deterministic partitions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

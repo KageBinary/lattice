@@ -102,6 +102,10 @@ pub mod rng;
 
 pub use arena::{Arena, Frame};
 pub use bodies::{BodySpec, Motion, RigidBodyStore};
+/// Re-exported so a domain crate can split its loops without naming `lattice-cpu` as a
+/// dependency: the executor arrives through [`StepContext`], so the IR is where a
+/// solver already looks for it.
+pub use lattice_cpu::{Executor, Grain, Partition};
 pub use contract::{
     ContractGap, Domain, FidelityProfile, Precision, SolverContract, StabilityReason, StableStep,
     StepContext,

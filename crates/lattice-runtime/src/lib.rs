@@ -8,7 +8,7 @@
 //!
 //! M1 implements the first of the six time models in that section — **fixed global
 //! step** — but implements the *negotiation* that the others build on. Every domain
-//! publishes a [`StableStep`](lattice_ir::StableStep); the runtime takes the tightest
+//! publishes a [`StableStep`]; the runtime takes the tightest
 //! and names the domain responsible. Subcycling and adaptive stepping (§9.1) reuse
 //! that machinery rather than replacing it.
 //!
@@ -28,9 +28,9 @@
 use std::time::Instant;
 
 use lattice_ir::{
-    Arena, CompiledModel, Domain, Observations, StabilityReason, StableStep, StepContext,
+    Arena, CompiledModel, Domain, Executor, Observations, StabilityReason, StableStep, StepContext,
 };
-use lattice_observe::{phase, Profile, RunArtifact, Throughput};
+use lattice_observe::{phase, Json, Profile, RunArtifact, Throughput};
 
 /// The simulation clock.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -199,6 +199,13 @@ pub struct Simulation {
     /// loop over nothing.
     coupler: lattice_coupling::Coupler,
     arena: Arena,
+    /// How solvers split their loops (spec §15.3).
+    ///
+    /// Owned by the simulation rather than by each domain: the thread count is a
+    /// property of the run. Sequential unless a caller asks otherwise, and the choice
+    /// is recorded in the artifact — parallel execution does not change the numbers
+    /// (see `lattice_cpu`), but a reader should not have to take that on trust.
+    executor: Executor,
     clock: Clock,
     observations: Observations,
     profile: Profile,
@@ -249,11 +256,28 @@ impl Simulation {
             domains,
             coupler: lattice_coupling::Coupler::new(),
             arena,
+            executor: Executor::sequential(),
             clock: Clock::default(),
             observations: Observations::new(),
             profile: Profile::new(),
             coupling_faults: Vec::new(),
         }
+    }
+
+    /// Split every solver's loops across `executor`'s threads.
+    ///
+    /// Consuming rather than borrowing: the executor owns worker threads, and a
+    /// simulation that outlived a borrowed pool would be stepping through a dangling
+    /// configuration. One executor per simulation is also the arrangement that keeps
+    /// the thread count a property of the run.
+    pub fn with_executor(mut self, executor: Executor) -> Simulation {
+        self.executor = executor;
+        self
+    }
+
+    /// How this simulation splits its work.
+    pub fn executor(&self) -> &Executor {
+        &self.executor
     }
 
     /// The compiled model.
@@ -337,8 +361,12 @@ impl Simulation {
     /// [`Simulation::run`] is the normal entry point; this exists for tests and for
     /// callers driving the clock themselves.
     pub fn step(&mut self, dt: f64) {
-        let mut context =
-            StepContext { time: self.clock.time, step: self.clock.step, arena: &mut self.arena };
+        let mut context = StepContext {
+            time: self.clock.time,
+            step: self.clock.step,
+            arena: &mut self.arena,
+            executor: &self.executor,
+        };
         for domain in &mut self.domains {
             domain.prepare(&mut context);
         }
@@ -380,6 +408,19 @@ impl Simulation {
         }
         artifact.set_parameter("fidelity", self.model.fidelity.code());
         artifact.set_parameter("dimensions", u64::from(self.model.dimensions));
+
+        // Recorded as a *section*, not a parameter, which puts it outside the content
+        // hash. §19.3 wants the backend published with every result; FR-011 wants the
+        // same model to hash the same. Both hold at once only because how the work was
+        // divided is not part of the physics — see `lattice_cpu`, and the validation
+        // case `cpu_parallel_matches_scalar` that keeps it true.
+        artifact.set_section(
+            "execution",
+            Json::object()
+                .set("backend", "cpu")
+                .set("schedule", self.executor.label())
+                .set("threads", self.executor.threads()),
+        );
         for note in &self.model.notes {
             artifact.warn(note.clone());
         }

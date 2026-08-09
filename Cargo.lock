@@ -1675,6 +1675,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-cpu"
+version = "0.1.0"
+
+[[package]]
 name = "lattice-domain-chemistry"
 version = "0.1.0"
 dependencies = [
@@ -1709,6 +1713,7 @@ dependencies = [
 name = "lattice-ir"
 version = "0.1.0"
 dependencies = [
+ "lattice-cpu",
  "lattice-units",
 ]
 
@@ -1762,6 +1767,7 @@ dependencies = [
  "lattice-domain-rigid2d",
  "lattice-ir",
  "lattice-observe",
+ "lattice-runtime",
 ]
 
 [[package]]

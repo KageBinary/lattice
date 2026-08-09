@@ -17,7 +17,7 @@
 //! # The conversion is still a material property
 //!
 //! Heat comes out of the reaction in `W/m²` and has to reach the field in `K/s`. The
-//! factor is an areal heat capacity, and it is [`HEAT_CAPACITY`] here rather than
+//! factor is an areal heat capacity, and it is the fixed `HEAT_CAPACITY` here rather than
 //! anything the sandbox derives — a slider would be fun, but a playground where the
 //! heat capacity is adjustable is a playground where "why did that not get hot" has two
 //! answers instead of one.
@@ -287,12 +287,15 @@ impl Playground for ReactionPlayground {
     }
 
     fn step(&mut self, dt: f64) {
-        let mut ctx = StepContext::new(&mut self.arena);
-        self.mixture.prepare(&mut ctx);
-        self.mixture.advance(dt, &mut ctx);
-        self.heat.prepare(&mut ctx);
-        self.heat.advance(dt, &mut ctx);
-        drop(ctx);
+        // Scoped, not dropped: the block is what ends the borrow of `self.arena` so
+        // `exchange` can take `&mut self` below.
+        {
+            let mut ctx = StepContext::new(&mut self.arena);
+            self.mixture.prepare(&mut ctx);
+            self.mixture.advance(dt, &mut ctx);
+            self.heat.prepare(&mut ctx);
+            self.heat.advance(dt, &mut ctx);
+        }
         self.exchange(dt);
     }
 
@@ -356,7 +359,7 @@ impl Playground for ReactionPlayground {
         let rect = view.rect();
         let handle = painter.ctx().load_texture(
             "reaction",
-            rendered.image.clone(),
+            rendered.image,
             egui::TextureOptions::NEAREST,
         );
         painter.image(

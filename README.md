@@ -13,7 +13,7 @@ A 2D-first multiphysics, chemistry, and quantum simulation runtime.
 
 ---
 
-## Status: milestones M0 through M3 complete
+## Status: M0 through M3 complete, M4 started
 
 The spec lays out nine milestones, M0 through M8.
 
@@ -28,6 +28,11 @@ The spec lays out nine milestones, M0 through M8.
   conservation checks."* [`examples/chamber.lattice`](examples/chamber.lattice) runs
   §20.3's reacting chamber and conserves mass and every element to round-off, with the
   coupling ledger accounting for the energy. 41 of 41 validation cases.
+- **M4 — Portable GPU.** Exit condition: *"selected CPU/GPU cross-validation and
+  performance goals."* One of its four parts is done: solvers now split their loops
+  across threads, with the promise that this changes the schedule and never the
+  numbers — parallel and scalar agree bit for bit, and the cross-validation *level*
+  §19.1 asks for exists with four passing cases. The `wgpu` backend does not.
 
 Being specific about that, in the spirit of design principle **P1 — scientific
 honesty over feature count**:
@@ -47,21 +52,33 @@ honesty over feature count**:
 | **Chemistry** | Species with formulas, charges and diffusion; reaction networks with atom and charge balance checking; mass-action kinetics with Arrhenius temperature dependence; reaction-diffusion by Strang splitting | First-order decay to 1e-9 of analytic; equilibrium to the constant it declares; RK4 order 4.05; splitting order 2.00; mass and every element to round-off |
 | **Coupling** | Typed ports with units, coupling edges with compiler-derived unit conversions, cadence, and a conservation ledger | An exothermic reaction's energy arrives where the ledger says it was sent, to within the one exchange a staggered coupling always has in flight |
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 833 tests across 14 crates |
+| **Execution** | A worker pool and an explicit partitioning executor; parallel diffusion stencils and per-particle integration; `--threads` and a `--compare` mode that measures its own speedup | Parallel and scalar agree *bit for bit* — every cell, every particle, the CG iteration count, and the reproducibility hash. 4.8× at 512², 1.9× on 262k particles, and nothing slower than it was |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 936 tests across 16 crates |
 | **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, conservation drift and the solver's contract | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
 
 Fluids, waves, electromagnetism, molecular dynamics beyond Lennard-Jones, the quantum
-module, GPU execution, and the Python SDK. Those are M4–M8. Stochastic kinetics
-(Gillespie) is not implemented, so its §19.2 row is *absent* from the validation
-report rather than present and skipped. Coupling supports one-way and loose staggered
-strategies; subcycling and fixed-point iteration are not there, because a fixed-point
-coupling needs a checkpoint mechanism this runtime does not have and a half-implemented
-one would claim a convergence it never checked. The viewer draws through a CPU texture upload, which is fine at 64×64 and
-will not be at 768×384; GPU rendering is M4. Rigid-body collision detection is
-discrete, so a fast thin projectile can pass through a thin wall — continuous
-collision detection is what §11.1 lists under "later".
+module, GPU execution, and the Python SDK. Those are M4–M8.
+
+CPU parallelism arrived with M4.1, and three things inside it stay sequential *on
+purpose*: all reductions, conjugate gradient's inner products, and Lennard-Jones pair
+forces. The first two because a blocked sum is a different number from a sequential one
+and the difference would vary with the machine's core count; the third because a pair
+law scatters into both particles of a pair, and the gather form that fixes the collision
+also changes the summation order. So the MD workload gets its integrator parallelised
+and not its force loop, which is where its time goes. See
+[docs/execution.md](docs/execution.md).
+
+Stochastic kinetics (Gillespie) is not implemented, so its §19.2 row is *absent* from
+the validation report rather than present and skipped. Coupling supports one-way and
+loose staggered strategies; subcycling and fixed-point iteration are not there, because
+a fixed-point coupling needs a checkpoint mechanism this runtime does not have and a
+half-implemented one would claim a convergence it never checked. The viewer draws
+through a CPU texture upload, which is fine at 64×64 and will not be at 768×384; GPU
+rendering is the rest of M4. Rigid-body collision detection is discrete, so a fast thin
+projectile can pass through a thin wall — continuous collision detection is what §11.1
+lists under "later".
 
 Constructs the language accepts but cannot execute — `reaction`, `couple`,
 `domain quantum2d` — are **compile errors that name the milestone that will implement
@@ -285,6 +302,7 @@ Follows spec §24, with crates added as each milestone lands.
 lattice/
   crates/
     lattice-units/            dimensions, quantities, unit registry and parser
+    lattice-cpu/              the worker pool and the partitioning executor
     lattice-syntax/           lexer, AST, parser, source-positioned diagnostics
     lattice-ir/               typed IDs, SoA storage, grids, arenas, solver contracts,
                               compiled model, operation graph, render channels
@@ -308,6 +326,7 @@ lattice/
     architecture.md           how the code maps onto the specification
     language.md               the .lattice language reference
     development.md            toolchain setup and conventions
+    execution.md              how work is divided across threads, and what that may change
     roadmap.md                what each milestone delivered
     viewer.md                 what the window shows and the rules it draws by
     playground.md             the sandbox: its modes, and what its panel will claim
@@ -316,15 +335,23 @@ lattice/
 
 ## Dependencies
 
-Ten of the eleven crates have none. Everything from units through the compiler to the
-validation lab builds from `std` alone — including, somewhat to my own surprise, the
-whole M1 compiler and its diagnostics.
+Fourteen of the sixteen crates have none. Everything from units through the compiler to
+the validation lab builds from `std` alone — including, somewhat to my own surprise, the
+whole M1 compiler and its diagnostics, and the M4 worker pool.
 
-The exception is `lattice-viewer`, which needs `eframe`/`egui` and `egui_plot` to have
-a window at all. Spec §24.1 permits mature libraries *"where they do not define the
-core semantics"*, and an immediate-mode widget set does not: the colourmaps, the drift
-arithmetic, and every rule in [docs/viewer.md](docs/viewer.md) are ours and are tested
-here. `cargo test` on the other ten crates does not build it.
+The exceptions are `lattice-viewer` and `lattice-playground`, which need `eframe`/`egui`
+and `egui_plot` to have a window at all. Spec §24.1 permits mature libraries *"where they
+do not define the core semantics"*, and an immediate-mode widget set does not: the
+colourmaps, the drift arithmetic, and every rule in [docs/viewer.md](docs/viewer.md) are
+ours and are tested here. `cargo test` on the other fourteen crates does not build them.
+
+`lattice-cpu` could reasonably have been `rayon`, which §24.1 would permit and which
+offers a fixed-partition `par_chunks` that would satisfy the determinism promise in
+[docs/execution.md](docs/execution.md). It is written here for the same reason the rest
+of the workspace is: the partitioning rule is a *stated property of the engine*, it is
+about forty lines, and having it in view — with the grain measurements that set it in
+the same file — is worth more than the pool underneath, which is ordinary. That judgement
+would flip the moment work-stealing or nested parallelism were needed.
 
 Elsewhere the line has held because units, dimensional analysis, the IR, and the
 reproducibility guarantee all *are* core semantics:

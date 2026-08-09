@@ -7,6 +7,7 @@ license.workspace = true
 description = "Simulation IR: typed IDs, structure-of-arrays storage, grids, arenas, and the solver contract"
 
 [dependencies]
+lattice-cpu.workspace = true
 lattice-units.workspace = true
 
 [lints]

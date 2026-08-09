@@ -65,7 +65,7 @@ mod neighbors;
 
 pub use domain::{BoundaryBox, ParticleBoundary, ParticleDomain};
 pub use forces::{ForceLaw, HarmonicWell, LennardJones, LinearDrag, UniformAcceleration};
-pub use integrator::Integrator;
+pub use integrator::{Integrator, PARTICLE_GRAIN};
 pub use neighbors::CellList;
 
 // Re-exported for convenience: constructing a domain always needs these.

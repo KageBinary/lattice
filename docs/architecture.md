@@ -43,16 +43,26 @@ the non-obvious decisions were made that way.
                           │  diagnostics, render    │
                           └────────────┬────────────┘
                                        │
-                          ┌────────────▼────────────┐
-                          │  lattice-units          │
-                          │  dimensions, quantities │
-                          └─────────────────────────┘
+                          ┌────────────┴────────────┐
+                          │                         │
+             ┌────────────▼────────────┐ ┌──────────▼──────────────┐
+             │  lattice-units          │ │  lattice-cpu            │
+             │  dimensions, quantities │ │  worker pool, Executor, │
+             │                         │ │  Grain, Partition       │
+             └─────────────────────────┘ └─────────────────────────┘
 ```
 
 Dependencies point downward only. `lattice-ir` holds no physics; the domain crates
 hold no storage layout decisions; `lattice-runtime` does not depend on the compiler —
 it takes a `CompiledModel` and a `Vec<Box<dyn Domain>>`, and the CLI wires the two
 together.
+
+`lattice-cpu` is at the bottom beside `lattice-units` because it knows nothing about
+simulation: it splits slices and runs closures. It is *below* `lattice-ir` rather than
+beside the domains because `StepContext` carries an `Executor` — a solver is handed the
+schedule the same way it is handed the clock, and for the same reason. Spec §24 names
+this crate `lattice-cpu`; the `lattice-compute` backend traits and `lattice-wgpu` it
+names alongside are M4's remaining work.
 
 `lattice-viewer` sits beside the CLI rather than under it: both are consumers of the
 same compile-then-run path, and neither is on the other's path. Nothing below the
@@ -416,6 +426,29 @@ unique and the hash worthless.
 The RNG is a hand-written PCG32 with pinned test vectors. `rand` promises
 reproducibility within a major version; a checkpoint recorded today must replay in five
 years.
+
+**The thread count is not part of the physics.** A run's execution schedule is recorded
+in the artifact's `execution` *section*, which is outside the content hash, so a model
+run on twenty threads hashes identically to the same model run on one. §19.3 wants the
+backend published with every result and FR-011 wants the same model to hash the same;
+both hold at once only because parallel execution is built to change the schedule and
+never the numbers. That is a promise with teeth and a price — see
+[execution.md](execution.md) for what it costs and what stays sequential to keep it.
+
+## Where the executor lives, and why it is not in the solver
+
+A solver receives an `Executor` through `StepContext` rather than owning one. The
+alternative — each domain constructing its own pool — is worse in two ways that only
+show up in a coupled model: it starts a thread pool per domain, all competing for the
+same cores, and it leaves a caller no way to ask the whole simulation to run on one
+thread. How many threads to use is a property of the *run*, not of the physics, so it
+travels with the clock and the arena.
+
+The partitioning rule sits with the executor and the *grain* sits with the kernel. That
+split matters: the executor knows how many threads there are, and only the kernel knows
+how much work a unit is. A `Grain` is a solver's statement about its own cost, measured
+and recorded next to the constant, in the same spirit as a `SolverContract` being a
+solver's statement about its own error.
 
 ## How complete the §7.2 split is
 

@@ -18,7 +18,7 @@ use lattice_domain_grid2d::{gaussian, Diffusivity, HeatDomain, TimeScheme};
 use lattice_domain_particle::{
     BoundaryBox, Integrator, LennardJones, ParticleDomain, ParticleSpec, UniformAcceleration,
 };
-use lattice_ir::{Arena, BoundarySet, Domain, Grid2d, Pcg32, StepContext};
+use lattice_ir::{Arena, BoundarySet, Domain, Executor, Grid2d, Pcg32, StepContext};
 use lattice_observe::{phase, Json, MemoryReport, Profile, Throughput};
 
 /// One correctness condition checked alongside the timing.
@@ -75,8 +75,8 @@ pub struct Benchmark {
     pub description: &'static str,
     /// The correctness condition, quoted from or modelled on spec §15.6.
     pub correctness: &'static str,
-    /// Run at the given scale factor.
-    pub run: fn(usize) -> BenchOutcome,
+    /// Run at the given scale factor, splitting solver loops across `executor`.
+    pub run: fn(usize, &Executor) -> BenchOutcome,
 }
 
 /// All registered benchmarks.
@@ -123,7 +123,7 @@ pub fn matching(pattern: &str) -> Vec<Benchmark> {
 // Particle benchmarks
 // ---------------------------------------------------------------------------
 
-fn bench_particles_gravity(scale: usize) -> BenchOutcome {
+fn bench_particles_gravity(scale: usize, executor: &Executor) -> BenchOutcome {
     let count = 16_384 * scale;
     let steps = 400;
     let dt = 1e-3;
@@ -150,7 +150,7 @@ fn bench_particles_gravity(scale: usize) -> BenchOutcome {
     let compute_start = Instant::now();
     {
         let mut arena = Arena::with_capacity(0);
-        let mut ctx = StepContext::new(&mut arena);
+        let mut ctx = StepContext::new(&mut arena).with_executor(executor);
         for _ in 0..steps {
             domain.advance(dt, &mut ctx);
         }
@@ -193,7 +193,7 @@ fn bench_particles_gravity(scale: usize) -> BenchOutcome {
     }
 }
 
-fn bench_particles_lj(scale: usize) -> BenchOutcome {
+fn bench_particles_lj(scale: usize, executor: &Executor) -> BenchOutcome {
     let side = 32 * scale;
     let count = side * side;
     let spacing = 1.4;
@@ -239,7 +239,7 @@ fn bench_particles_lj(scale: usize) -> BenchOutcome {
     let compute_start = Instant::now();
     {
         let mut arena = Arena::with_capacity(0);
-        let mut ctx = StepContext::new(&mut arena);
+        let mut ctx = StepContext::new(&mut arena).with_executor(executor);
         for _ in 0..steps {
             domain.advance(dt, &mut ctx);
         }
@@ -290,7 +290,13 @@ fn heat_domain(side: usize, scheme: TimeScheme) -> HeatDomain {
         .with_initial(gaussian([0.5, 0.5], 0.004, 1.0))
 }
 
-fn run_heat(side: usize, scheme: TimeScheme, steps: usize, dt_factor: f64) -> BenchOutcome {
+fn run_heat(
+    side: usize,
+    scheme: TimeScheme,
+    steps: usize,
+    dt_factor: f64,
+    executor: &Executor,
+) -> BenchOutcome {
     let mut profile = Profile::new();
     let mut domain = profile.time(phase::SETUP, || heat_domain(side, scheme));
 
@@ -303,7 +309,7 @@ fn run_heat(side: usize, scheme: TimeScheme, steps: usize, dt_factor: f64) -> Be
     let mut any_diverged = false;
     {
         let mut arena = Arena::with_capacity(0);
-        let mut ctx = StepContext::new(&mut arena);
+        let mut ctx = StepContext::new(&mut arena).with_executor(executor);
         for _ in 0..steps {
             domain.advance(dt, &mut ctx);
             if let Some(outcome) = domain.last_solve() {
@@ -346,14 +352,14 @@ fn run_heat(side: usize, scheme: TimeScheme, steps: usize, dt_factor: f64) -> Be
     }
 }
 
-fn bench_heat_explicit(scale: usize) -> BenchOutcome {
+fn bench_heat_explicit(scale: usize, executor: &Executor) -> BenchOutcome {
     // 0.8 of the stability limit: the largest step the scheme actually admits.
-    run_heat(256 * scale, TimeScheme::Explicit, 400, 0.8)
+    run_heat(256 * scale, TimeScheme::Explicit, 400, 0.8, executor)
 }
 
-fn bench_heat_implicit(scale: usize) -> BenchOutcome {
+fn bench_heat_implicit(scale: usize, executor: &Executor) -> BenchOutcome {
     // Ten times the explicit limit, which is the whole reason to pay for a solve.
-    run_heat(256 * scale, TimeScheme::CrankNicolson, 100, 10.0)
+    run_heat(256 * scale, TimeScheme::CrankNicolson, 100, 10.0, executor)
 }
 
 // ---------------------------------------------------------------------------
@@ -361,9 +367,14 @@ fn bench_heat_implicit(scale: usize) -> BenchOutcome {
 // ---------------------------------------------------------------------------
 
 /// Render one benchmark's result as text.
-pub fn report(benchmark: &Benchmark, scale: usize, outcome: &BenchOutcome) -> String {
+pub fn report(
+    benchmark: &Benchmark,
+    scale: usize,
+    executor: &Executor,
+    outcome: &BenchOutcome,
+) -> String {
     let mut out = String::new();
-    out.push_str(&format!("\n{} (scale {scale})\n", benchmark.name));
+    out.push_str(&format!("\n{} (scale {scale}, {})\n", benchmark.name, executor.label()));
     out.push_str(&format!("  {}\n", benchmark.description));
     out.push_str(&format!("  correctness condition: {}\n\n", benchmark.correctness));
 
@@ -393,7 +404,12 @@ pub fn report(benchmark: &Benchmark, scale: usize, outcome: &BenchOutcome) -> St
 }
 
 /// Machine-readable form.
-pub fn to_json(benchmark: &Benchmark, scale: usize, outcome: &BenchOutcome) -> Json {
+pub fn to_json(
+    benchmark: &Benchmark,
+    scale: usize,
+    executor: &Executor,
+    outcome: &BenchOutcome,
+) -> Json {
     let mut checks = Json::array();
     for check in &outcome.checks {
         checks.push(
@@ -409,11 +425,50 @@ pub fn to_json(benchmark: &Benchmark, scale: usize, outcome: &BenchOutcome) -> J
         .set("description", benchmark.description)
         .set("correctness_condition", benchmark.correctness)
         .set("scale", scale)
+        .set("schedule", executor.label())
+        .set("threads", executor.threads())
         .set("valid", outcome.valid())
         .set("throughput", outcome.throughput.to_json())
         .set("phases", outcome.profile.to_json())
         .set("memory_bytes", outcome.memory.to_json())
         .set("checks", checks)
+}
+
+/// What splitting the work bought, measured rather than assumed.
+///
+/// Two numbers, because they answer different questions. **Speedup** is what the wall
+/// clock did. **Efficiency** is speedup per thread, and it is the one that says whether
+/// the kernel is compute-bound: a streaming stencil saturates memory bandwidth long
+/// before it saturates cores, so an efficiency well under one is the expected result
+/// there and not a defect to chase.
+///
+/// The correctness conditions are re-checked on both runs, so a speedup is never
+/// reported for a configuration that stopped being right (§15.1).
+pub fn speedup_report(
+    baseline: &BenchOutcome,
+    parallel: &BenchOutcome,
+    executor: &Executor,
+) -> String {
+    let sequential_seconds = baseline.throughput.wall_clock.as_secs_f64();
+    let parallel_seconds = parallel.throughput.wall_clock.as_secs_f64();
+    if parallel_seconds <= 0.0 || sequential_seconds <= 0.0 {
+        return "  speedup: not measurable, the run was too short to time\n".to_string();
+    }
+
+    let speedup = sequential_seconds / parallel_seconds;
+    let threads = executor.threads();
+    let efficiency = 100.0 * speedup / threads as f64;
+    let mut out = format!(
+        "\n  speedup {speedup:.2}x on {threads} threads \
+         ({efficiency:.0}% of linear; {sequential_seconds:.3} s -> {parallel_seconds:.3} s)\n"
+    );
+    if !(baseline.valid() && parallel.valid()) {
+        out.push_str(
+            "  RESULT INVALID: one of the two runs failed a correctness condition, so \
+             this ratio is not a speedup (spec §15.1).\n",
+        );
+    }
+    out
 }
 
 /// The build-configuration warning that must accompany any published number.
@@ -432,13 +487,23 @@ pub fn build_warning() -> Option<String> {
 }
 
 /// A one-line summary of the environment a benchmark ran in.
-pub fn environment() -> String {
+///
+/// §19.3 asks for the backend to be published with the number, and the thread count is
+/// part of the backend as soon as there is more than one of them. A throughput figure
+/// with no schedule beside it cannot be compared with anything.
+pub fn environment_for(executor: &Executor) -> String {
     format!(
-        "engine {}  target {}  profile {}  precision accurate64  backend cpu-scalar",
+        "engine {}  target {}  profile {}  precision accurate64  backend {}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::ARCH,
         if cfg!(debug_assertions) { "debug" } else { "release" },
+        executor.label(),
     )
+}
+
+/// [`environment_for`] the sequential executor, for `--version`.
+pub fn environment() -> String {
+    environment_for(&Executor::sequential())
 }
 
 #[cfg(test)]
@@ -450,25 +515,44 @@ mod tests {
     /// scale 8 either.
     #[test]
     fn every_benchmark_runs_and_holds_its_correctness_conditions() {
+        let executor = Executor::sequential();
         for benchmark in all() {
-            let outcome = (benchmark.run)(1);
+            let outcome = (benchmark.run)(1, &executor);
             assert!(
                 outcome.valid(),
                 "{} failed its correctness conditions:\n{}",
                 benchmark.name,
-                report(benchmark, 1, &outcome)
+                report(benchmark, 1, &executor, &outcome)
             );
             assert!(outcome.throughput.steps > 0);
             assert!(outcome.memory.total() > 0, "{} reported no memory", benchmark.name);
         }
     }
 
+    /// §15.1: *"a faster wrong solver is a regression."* Every benchmark must still hold
+    /// its correctness conditions when the work is split across threads — otherwise the
+    /// speedup it reports is measuring a different, broken program.
+    #[test]
+    fn every_benchmark_still_holds_its_conditions_on_four_threads() {
+        let executor = Executor::with_threads(4);
+        for benchmark in all() {
+            let outcome = (benchmark.run)(1, &executor);
+            assert!(
+                outcome.valid(),
+                "{} failed on four threads:\n{}",
+                benchmark.name,
+                report(benchmark, 1, &executor, &outcome)
+            );
+        }
+    }
+
     #[test]
     fn a_failing_check_invalidates_the_result() {
-        let mut outcome = (all()[0].run)(1);
+        let executor = Executor::sequential();
+        let mut outcome = (all()[0].run)(1, &executor);
         outcome.checks.push(Check::new("deliberate failure", 1.0, 0.0));
         assert!(!outcome.valid());
-        assert!(report(&all()[0], 1, &outcome).contains("RESULT INVALID"));
+        assert!(report(&all()[0], 1, &executor, &outcome).contains("RESULT INVALID"));
     }
 
     #[test]
@@ -486,14 +570,18 @@ mod tests {
     }
 
     #[test]
-    fn json_output_carries_the_correctness_conditions() {
+    fn json_output_carries_the_correctness_conditions_and_the_schedule() {
         let benchmark = &all()[0];
-        let outcome = (benchmark.run)(1);
-        let json = to_json(benchmark, 1, &outcome);
+        let executor = Executor::with_threads(3);
+        let outcome = (benchmark.run)(1, &executor);
+        let json = to_json(benchmark, 1, &executor, &outcome);
         assert!(json.get("correctness_condition").is_some());
         assert_eq!(json.get("valid"), Some(&Json::Bool(true)));
         assert!(json.get("checks").is_some());
         assert!(json.get("throughput").is_some());
+        // §19.3: a published number without its backend cannot be compared.
+        assert_eq!(json.get("threads"), Some(&Json::Int(3)));
+        assert!(format!("{:?}", json.get("schedule")).contains("cpu-parallel"));
     }
 
     #[test]
@@ -502,5 +590,6 @@ mod tests {
         // must be present. In a release build it must be absent.
         assert_eq!(build_warning().is_some(), cfg!(debug_assertions));
         assert!(environment().contains("cpu-scalar"));
+        assert!(environment_for(&Executor::with_threads(4)).contains("4 threads"));
     }
 }

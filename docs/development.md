@@ -2,8 +2,8 @@
 
 ## Toolchain
 
-Rust 1.85 or newer (edition 2024). No other tools are needed — the workspace has zero
-external dependencies.
+Rust 1.85 or newer (edition 2024). No other tools are needed. Fourteen of the sixteen
+crates have no external dependencies at all; only the two that open a window do.
 
 ### Windows: use the GNU toolchain unless you have MSVC C++ build tools
 
@@ -33,7 +33,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test                      # 833 tests across 14 crates
+$ cargo test                      # 936 tests across 16 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
@@ -43,11 +43,11 @@ Tests run at `opt-level = 2` (see the root `Cargo.toml`). The validation suite r
 convergence studies over thousands of steps; at `opt-level = 0` they take minutes
 instead of a second.
 
-`lattice-viewer` is the only crate with external dependencies, and a cold build of its
-GPU stack takes several minutes. Nothing else depends on it, so building or testing any
-other crate by name never pays for it. Changing anything a domain *publishes* —
-`Observations`, `RenderChannel` — does reach it, so run the whole workspace before
-committing.
+`lattice-viewer` and `lattice-playground` are the only crates with external
+dependencies, and a cold build of their GPU stack takes several minutes. Nothing else
+depends on either, so building or testing any other crate by name never pays for it.
+Changing anything a domain *publishes* — `Observations`, `RenderChannel` — does reach
+them, so run the whole workspace before committing.
 
 **A green test suite does not mean the window is right.** Every defect found in the
 viewer so far was found by screenshotting the running program, not by a test: round-off
@@ -59,6 +59,30 @@ it on `examples/lj_gas.lattice` and `examples/diffusing_pulse.lattice`, and look
 **Always benchmark a release build.** `lattice bench` prints a loud warning when
 `debug_assertions` is on, because a timing from an unoptimized build is off by an order
 of magnitude and is the easiest way to publish a misleading number.
+
+## Adding a parallel kernel
+
+Read [execution.md](execution.md) first — particularly the promise, which is that
+parallel execution changes the schedule and never the numbers. Three rules follow, and
+all three have already been broken once:
+
+- **Write the arithmetic at the call site.** `dt * (m⁻¹F)` and `(dt · m⁻¹) · F` are
+  different numbers. A shared `axpy` helper that normalised them would be tidier and
+  would silently change two integrators' results.
+- **Declare a `Grain`, and measure it.** `Grain { floor, chunk }` says how much work is
+  worth a barrier and how small a piece may get. They are different numbers; see
+  execution.md for what conflating them cost. Measure with `lattice bench <name>
+  --threads auto --compare`, best of three — the noise floor is around ±20%, and a
+  "regression" that justified a redesign here turned out to be nothing.
+- **No reductions.** A sum split into chunks is not the sum added in order, and the
+  difference would vary with the machine's core count. If a kernel needs one, it stays
+  sequential and says so.
+
+Then add a case to `crates/lattice-validation/src/execution.rs`, sized **above** the
+grain's floor. A cross-backend case on a problem too small to be split compares the
+sequential path with itself and passes without testing anything;
+`the_cases_actually_split_their_work` is the guard against that, and it needs the new
+grain added to it.
 
 ## Testing a window without a window
 

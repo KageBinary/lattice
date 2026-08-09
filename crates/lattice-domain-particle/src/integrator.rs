@@ -27,7 +27,7 @@
 //! standard practice and costs the *velocity-dependent terms* their second-order
 //! accuracy; position-dependent terms are unaffected. The domain contract states this.
 
-use lattice_ir::ParticleStore;
+use lattice_ir::{Executor, Grain, ParticleStore};
 
 /// A time-integration scheme for particle dynamics.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -104,8 +104,32 @@ impl Integrator {
     ///
     /// On entry the accumulators must hold the forces for the current positions; on
     /// return they hold the forces for the new positions.
-    pub fn step<F>(self, dt: f64, store: &mut ParticleStore, mut eval_forces: F)
+    pub fn step<F>(self, dt: f64, store: &mut ParticleStore, eval_forces: F)
     where
+        F: FnMut(&mut ParticleStore),
+    {
+        self.step_with(Executor::shared_sequential(), dt, store, eval_forces);
+    }
+
+    /// [`Integrator::step`], with the per-particle loops split across `executor`.
+    ///
+    /// Every update here writes particle `i` from particle `i` alone, so bands of
+    /// particles are independent and the arithmetic for each one is untouched — this is
+    /// bit-identical to [`Integrator::step`] at any thread count. Where a pass reads
+    /// what an earlier pass wrote (velocity Verlet's drift reads the half-kicked
+    /// velocity), the passes are separate dispatches, and a dispatch is a barrier.
+    ///
+    /// The parenthesisation below is deliberate and load-bearing: `dt * (im * f)` and
+    /// `(dt * im) * f` are different numbers, so each expression is written exactly as
+    /// the single-threaded loop wrote it. `bit_identical_to_the_sequential_step` is what
+    /// keeps that true.
+    pub fn step_with<F>(
+        self,
+        executor: &Executor,
+        dt: f64,
+        store: &mut ParticleStore,
+        mut eval_forces: F,
+    ) where
         F: FnMut(&mut ParticleStore),
     {
         match self {
@@ -113,14 +137,13 @@ impl Integrator {
                 let d = store.dynamics();
                 // Both updates read the *old* state, so position must be advanced
                 // with the old velocity before velocity is touched.
-                for i in 0..d.len() {
-                    d.pos_x[i] += dt * d.vel_x[i];
-                    d.pos_y[i] += dt * d.vel_y[i];
-                }
-                for i in 0..d.len() {
-                    d.vel_x[i] += dt * d.inv_mass[i] * d.force_x[i];
-                    d.vel_y[i] += dt * d.inv_mass[i] * d.force_y[i];
-                }
+                let (vel_x, vel_y) = (&*d.vel_x, &*d.vel_y);
+                banded(executor, d.pos_x, |i, x| *x += dt * vel_x[i]);
+                banded(executor, d.pos_y, |i, y| *y += dt * vel_y[i]);
+
+                let (inv_mass, force_x, force_y) = (d.inv_mass, &*d.force_x, &*d.force_y);
+                banded(executor, d.vel_x, |i, v| *v += dt * inv_mass[i] * force_x[i]);
+                banded(executor, d.vel_y, |i, v| *v += dt * inv_mass[i] * force_y[i]);
                 eval_forces(store);
             }
 
@@ -128,13 +151,15 @@ impl Integrator {
                 let d = store.dynamics();
                 // Velocity first, then position with the *new* velocity. That single
                 // reordering is what makes this symplectic.
-                for i in 0..d.len() {
-                    let a_x = d.inv_mass[i] * d.force_x[i];
-                    let a_y = d.inv_mass[i] * d.force_y[i];
-                    d.vel_x[i] += dt * a_x;
-                    d.vel_y[i] += dt * a_y;
-                    d.pos_x[i] += dt * d.vel_x[i];
-                    d.pos_y[i] += dt * d.vel_y[i];
+                {
+                    let (inv_mass, force_x, force_y) = (d.inv_mass, &*d.force_x, &*d.force_y);
+                    banded(executor, d.vel_x, |i, v| *v += dt * (inv_mass[i] * force_x[i]));
+                    banded(executor, d.vel_y, |i, v| *v += dt * (inv_mass[i] * force_y[i]));
+                }
+                {
+                    let (vel_x, vel_y) = (&*d.vel_x, &*d.vel_y);
+                    banded(executor, d.pos_x, |i, x| *x += dt * vel_x[i]);
+                    banded(executor, d.pos_y, |i, y| *y += dt * vel_y[i]);
                 }
                 eval_forces(store);
             }
@@ -144,26 +169,71 @@ impl Integrator {
                 {
                     let d = store.dynamics();
                     // Half kick, using a(t), then full drift.
-                    for i in 0..d.len() {
-                        d.vel_x[i] += half * d.inv_mass[i] * d.force_x[i];
-                        d.vel_y[i] += half * d.inv_mass[i] * d.force_y[i];
-                        d.pos_x[i] += dt * d.vel_x[i];
-                        d.pos_y[i] += dt * d.vel_y[i];
+                    {
+                        let (inv_mass, force_x, force_y) = (d.inv_mass, &*d.force_x, &*d.force_y);
+                        banded(executor, d.vel_x, |i, v| *v += half * inv_mass[i] * force_x[i]);
+                        banded(executor, d.vel_y, |i, v| *v += half * inv_mass[i] * force_y[i]);
                     }
+                    let (vel_x, vel_y) = (&*d.vel_x, &*d.vel_y);
+                    banded(executor, d.pos_x, |i, x| *x += dt * vel_x[i]);
+                    banded(executor, d.pos_y, |i, y| *y += dt * vel_y[i]);
                 }
                 // Forces at the new positions.
                 eval_forces(store);
                 {
                     let d = store.dynamics();
                     // Second half kick, using a(t+dt).
-                    for i in 0..d.len() {
-                        d.vel_x[i] += half * d.inv_mass[i] * d.force_x[i];
-                        d.vel_y[i] += half * d.inv_mass[i] * d.force_y[i];
-                    }
+                    let (inv_mass, force_x, force_y) = (d.inv_mass, &*d.force_x, &*d.force_y);
+                    banded(executor, d.vel_x, |i, v| *v += half * inv_mass[i] * force_x[i]);
+                    banded(executor, d.vel_y, |i, v| *v += half * inv_mass[i] * force_y[i]);
                 }
             }
         }
     }
+}
+
+/// How many particles are worth splitting, and how finely.
+///
+/// The floor is high, and it is high because it was measured rather than guessed.
+///
+/// The per-particle work is one multiply and one add against streamed memory, and a
+/// velocity-Verlet step splits into six such passes. Each pass is a barrier: every
+/// worker has to be reached and every worker has to report back, which costs a few
+/// microseconds no matter how little work is inside. On the 20-thread machine this was
+/// tuned on, `lattice bench particles-gravity --threads auto --compare` measured — best
+/// of three release runs, with the floor lifted so the small sizes were actually split:
+///
+/// | particles | 16k | 33k | 65k | 131k | 262k | 524k |
+/// |---|---|---|---|---|---|---|
+/// | speedup | 0.42x | 0.65x | **1.19x** | 1.55x | 1.90x | 1.92x |
+///
+/// — a *slowdown* until about 65k, and a 2.4x one at the low end. Splitting a
+/// 16k-particle model would therefore make `--threads auto` a pessimization on the most
+/// common particle scene, and §15.1 is unambiguous: a faster wrong answer is a
+/// regression, and so is a slower right one dressed as an optimization. Below the floor
+/// the partition collapses to one chunk and the model runs exactly as it did before M4.
+///
+/// The chunk size is *not* the floor. See [`Grain`] — using one number for both would
+/// keep a 262k-particle model on four threads to protect a 16k one.
+/// Public so a test can ask whether a given population would actually be split. A
+/// cross-backend case run below the floor compares the sequential path with itself and
+/// passes for the wrong reason.
+pub const PARTICLE_GRAIN: Grain = Grain::new(65_536, 8_192);
+
+/// Run `f(index, slot)` over every element of `target`, split across `executor`.
+///
+/// The per-element expression stays at the call site rather than being folded into a
+/// generic `axpy`, because the *association* of the multiplications differs between
+/// schemes and a helper that quietly normalised it would change results by round-off.
+fn banded<F>(executor: &Executor, target: &mut [f64], f: F)
+where
+    F: Fn(usize, &mut f64) + Sync,
+{
+    executor.for_each_chunk_mut(target, PARTICLE_GRAIN, |start, chunk| {
+        for (offset, slot) in chunk.iter_mut().enumerate() {
+            f(start + offset, slot);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -194,6 +264,73 @@ mod tests {
         let v = store.vel_x()[0];
         let m = store.mass()[0];
         0.5 * m * v * v + 0.5 * k * x * x
+    }
+
+    /// The claim `lattice_cpu` makes, checked where it is easiest to break: three
+    /// schemes, several thread counts, and enough particles and steps that a
+    /// mis-parenthesised update would have separated the trajectories long before the
+    /// end. Bits, not tolerances — between two CPU threads there is nothing a tolerance
+    /// would be excusing.
+    #[test]
+    fn a_parallel_step_is_bit_identical_to_the_sequential_step() {
+        let build = || {
+            let mut store = ParticleStore::with_capacity(4000);
+            for index in 0..4000 {
+                let t = index as f64 * 0.001;
+                store
+                    .spawn(
+                        ParticleSpec::at([t.sin(), t.cos() * 2.0])
+                            .with_velocity([t.cos(), -t.sin()])
+                            .with_mass(0.5 + t),
+                    )
+                    .unwrap();
+            }
+            store
+        };
+
+        for scheme in
+            [Integrator::ExplicitEuler, Integrator::SemiImplicitEuler, Integrator::VelocityVerlet]
+        {
+            let run = |executor: &Executor| {
+                let mut store = build();
+                let mut forces = oscillator(3.0);
+                forces(&mut store);
+                for _ in 0..50 {
+                    scheme.step_with(executor, 0.003, &mut store, &mut forces);
+                }
+                let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                (bits(store.pos_x()), bits(store.pos_y()), bits(store.vel_x()))
+            };
+
+            let reference = run(Executor::shared_sequential());
+            for threads in [2usize, 3, 8] {
+                assert_eq!(
+                    run(&Executor::with_threads(threads)),
+                    reference,
+                    "{scheme:?} diverged on {threads} threads"
+                );
+            }
+        }
+    }
+
+    /// A population too small to split must still take the same path.
+    #[test]
+    fn a_single_particle_is_unaffected_by_the_executor() {
+        let mut sequential = single_particle(1.0, 0.0, 2.0);
+        let mut parallel = single_particle(1.0, 0.0, 2.0);
+        let scheme = Integrator::VelocityVerlet;
+        let executor = Executor::with_threads(8);
+
+        let mut a = oscillator(5.0);
+        let mut b = oscillator(5.0);
+        a(&mut sequential);
+        b(&mut parallel);
+        for _ in 0..100 {
+            scheme.step(0.01, &mut sequential, &mut a);
+            scheme.step_with(&executor, 0.01, &mut parallel, &mut b);
+        }
+        assert_eq!(parallel.pos_x()[0].to_bits(), sequential.pos_x()[0].to_bits());
+        assert_eq!(parallel.vel_x()[0].to_bits(), sequential.vel_x()[0].to_bits());
     }
 
     #[test]

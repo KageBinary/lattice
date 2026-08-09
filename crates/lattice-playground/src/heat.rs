@@ -226,7 +226,7 @@ impl Playground for HeatPlayground {
         let rect = view.rect();
         let handle = painter.ctx().load_texture(
             "plate",
-            rendered.image.clone(),
+            rendered.image,
             egui::TextureOptions::NEAREST,
         );
         painter.image(
