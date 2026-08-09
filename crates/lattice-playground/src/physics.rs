@@ -36,7 +36,7 @@ use lattice_ir::{Arena, BodyId, BodySpec, Domain, Observations, ShapeId, StepCon
 use lattice_viewer::render::WorldView;
 use lattice_viewer::{render, Palette, Status};
 
-use crate::mode::{Knob, Playground, Pointer, Toggle, Tool};
+use crate::mode::{Field, Inspection, Knob, Playground, Pointer, Toggle, Tool};
 
 /// How fast a grabbed body chases the cursor, rad/s.
 ///
@@ -130,6 +130,12 @@ pub struct PhysicsPlayground {
     friction: f64,
     restitution: f64,
     grab: Option<Grab>,
+    /// The body the inspector is showing, if any.
+    ///
+    /// A [`BodyId`] rather than a slot, because slots move: `despawn` fills the hole by
+    /// swapping the last body into it, so a stored slot would silently start describing a
+    /// different object. A stale handle simply fails to resolve and the selection clears.
+    selection: Option<BodyId>,
     /// The pointer's world velocity, kept so a release can throw with it.
     pointer_velocity: [f64; 2],
     /// Where the cursor is, for drawing the spawn preview.
@@ -170,6 +176,7 @@ impl PhysicsPlayground {
             friction: 0.4,
             restitution: 0.2,
             grab: None,
+            selection: None,
             pointer_velocity: [0.0, 0.0],
             hover: None,
             show_contacts: false,
@@ -192,6 +199,13 @@ impl PhysicsPlayground {
         self.world = world();
         self.palette.clear();
         self.grab = None;
+        // Not merely tidiness. A `BodyId` is only unique within one store, and this
+        // installs a *fresh* one whose generation counters restart at zero — so a handle
+        // held from before the reset resolves cleanly against a completely different
+        // body, and the inspector would go on showing numbers for an object that no
+        // longer exists. Generation checking catches use-after-free within a store; it
+        // cannot catch a handle outliving the store itself.
+        self.selection = None;
         self.spawned = 0;
         self.build_arena();
         if seeded {
@@ -448,6 +462,9 @@ impl Playground for PhysicsPlayground {
                 // quietly empties itself, which reads as a broken simulation.
                 if self.world.slot_of(body).is_some_and(|slot| slot >= self.walls()) {
                     self.world.despawn(body);
+                    if self.selection == Some(body) {
+                        self.selection = None;
+                    }
                     self.spawned = self.spawned.saturating_sub(1);
                     self.disturbances += 1;
                     self.world.refresh_render_tables();
@@ -459,6 +476,12 @@ impl Playground for PhysicsPlayground {
         if pointer.pressed {
             match self.pick(pointer.world) {
                 Some(body) => {
+                    // Selecting is not a separate tool. Touching a thing is already how
+                    // you say which thing you mean, and a sandbox that made you switch
+                    // modes to read a number would be asking you to plan before poking.
+                    // Static bodies select too — "this is scenery, mass is infinite" is
+                    // an answer worth being able to get.
+                    self.selection = Some(body);
                     let slot = self.world.slot_of(body).expect("just picked");
                     // A static body has infinite mass and cannot be dragged; grabbing
                     // one would apply a force that does nothing and feel broken.
@@ -473,11 +496,12 @@ impl Playground for PhysicsPlayground {
                     let size = self.size;
                     let selected = self.selected;
                     let shape = self.collider_for(selected, size);
-                    if self
-                        .world
-                        .spawn_with_density(BodySpec::at(pointer.world, shape), 800.0)
-                        .is_some()
+                    if let Some(body) =
+                        self.world.spawn_with_density(BodySpec::at(pointer.world, shape), 800.0)
                     {
+                        // Select what was just made, so its numbers are on screen without
+                        // a second click.
+                        self.selection = Some(body);
                         self.spawned += 1;
                         self.disturbances += 1;
                         // So a click lands visibly even while paused.
@@ -497,6 +521,138 @@ impl Playground for PhysicsPlayground {
             self.world.bodies_mut().set_velocity(grab.body, self.pointer_velocity, spin);
             self.disturbances += 1;
         }
+    }
+
+    fn inspection(&self) -> Option<Inspection> {
+        let body = self.selection?;
+        let slot = self.world.slot_of(body)?;
+        let bodies = self.world.bodies();
+
+        let shape_name = self
+            .world
+            .colliders()
+            .get(bodies.shape()[slot].index())
+            .map_or("body", |collider| match &collider.shape {
+                Shape::Circle { .. } => "ball",
+                Shape::Polygon(polygon) if polygon.vertices().len() == 4 => "box",
+                Shape::Polygon(_) => "polygon",
+                Shape::Segment { .. } => "segment",
+            });
+        let title = format!("{shape_name} · body {slot}");
+
+        if bodies.is_static(slot) {
+            // Scenery. Everything is shown and nothing is editable: making a wall dynamic
+            // by typing into a mass box would drop the floor out of the world, and the
+            // inertia it would need is not recoverable from what is stored.
+            return Some(Inspection {
+                title,
+                subtitle: "static — infinite mass, part of the scene".to_string(),
+                fields: vec![
+                    Field::derived("mass", f64::INFINITY, "kg"),
+                    Field::derived("position x", bodies.pos_x()[slot], "m"),
+                    Field::derived("position y", bodies.pos_y()[slot], "m"),
+                    Field::derived("angle", bodies.rot_sin()[slot].atan2(bodies.rot_cos()[slot]), "rad"),
+                ],
+            });
+        }
+
+        let mass = bodies.mass()[slot];
+        let (vx, vy) = (bodies.vel_x()[slot], bodies.vel_y()[slot]);
+        let omega = bodies.omega()[slot];
+        let inertia = bodies.inertia()[slot];
+        let speed = vx.hypot(vy);
+        let angle = bodies.rot_sin()[slot].atan2(bodies.rot_cos()[slot]);
+        let kinetic = 0.5 * mass * speed * speed + 0.5 * inertia * omega * omega;
+
+        Some(Inspection {
+            title,
+            subtitle: format!("dynamic · {:.3} kg", mass),
+            fields: vec![
+                Field::new("mass", mass, 0.001, 500.0, "kg")
+                    .with_hint("rotational inertia scales with this, so the shape keeps its \
+                                mass distribution"),
+                Field::new("velocity x", vx, -50.0, 50.0, "m/s"),
+                Field::new("velocity y", vy, -50.0, 50.0, "m/s"),
+                Field::new("momentum x", mass * vx, -500.0, 500.0, "kg·m/s")
+                    .with_hint("sets velocity to p/m, leaving the mass alone"),
+                Field::new("momentum y", mass * vy, -500.0, 500.0, "kg·m/s")
+                    .with_hint("sets velocity to p/m, leaving the mass alone"),
+                Field::new("angular velocity", omega, -50.0, 50.0, "rad/s"),
+                Field::new("inertia", inertia, 1e-6, 500.0, "kg·m²")
+                    .with_hint("independent of mass — a flywheel and a disc of the same \
+                                mass are different objects"),
+                Field::new("position x", bodies.pos_x()[slot], -20.0, 20.0, "m"),
+                Field::new("position y", bodies.pos_y()[slot], -20.0, 20.0, "m"),
+                Field::new("angle", angle, -core::f64::consts::PI, core::f64::consts::PI, "rad"),
+                Field::derived("speed", speed, "m/s"),
+                Field::derived("kinetic energy", kinetic, "J"),
+            ],
+        })
+    }
+
+    fn set_field(&mut self, index: usize, value: f64) {
+        let Some(body) = self.selection else { return };
+        let Some(slot) = self.world.slot_of(body) else { return };
+        if self.world.bodies().is_static(slot) || !value.is_finite() {
+            return;
+        }
+
+        let bodies = self.world.bodies();
+        let mass = bodies.mass()[slot];
+        let (vx, vy) = (bodies.vel_x()[slot], bodies.vel_y()[slot]);
+        let omega = bodies.omega()[slot];
+        let position = [bodies.pos_x()[slot], bodies.pos_y()[slot]];
+        let angle = bodies.rot_sin()[slot].atan2(bodies.rot_cos()[slot]);
+
+        // Reaching in and setting a body's state is exactly what `disturbances` is for:
+        // the panel must not report the reader's own hand as solver drift.
+        self.disturbances += 1;
+        let store = self.world.bodies_mut();
+
+        match index {
+            0 => {
+                store.set_mass(body, value.max(1e-6));
+            }
+            1 => {
+                store.set_velocity(body, [value, vy], omega);
+            }
+            2 => {
+                store.set_velocity(body, [vx, value], omega);
+            }
+            // Momentum is not stored, so it is expressed through the velocity that
+            // produces it. Dividing by a mass that cannot be zero here — a static body
+            // returned above, and `set_mass` floors a dynamic one at 1e-6.
+            3 => {
+                store.set_velocity(body, [value / mass, vy], omega);
+            }
+            4 => {
+                store.set_velocity(body, [vx, value / mass], omega);
+            }
+            5 => {
+                store.set_velocity(body, [vx, vy], value);
+            }
+            6 => {
+                store.set_inertia(body, value.max(1e-9));
+            }
+            7 => {
+                store.set_pose(body, [value, position[1]], angle);
+            }
+            8 => {
+                store.set_pose(body, [position[0], value], angle);
+            }
+            9 => {
+                store.set_pose(body, position, value);
+            }
+            // 10 and 11 are derived and the shell does not offer them for editing.
+            _ => {}
+        }
+
+        // So an edit made while paused is visible before the next step.
+        self.world.refresh_render_tables();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
     }
 
     fn pointer_left(&mut self) {
@@ -632,6 +788,183 @@ mod tests {
     fn click(playground: &mut PhysicsPlayground, world: [f64; 2]) {
         playground.pointer(press(world), 0);
         playground.pointer(release(world, [0.0, 0.0]), 0);
+    }
+
+    /// The index of a named field in the current selection.
+    fn field_index(playground: &PhysicsPlayground, name: &str) -> usize {
+        playground
+            .inspection()
+            .expect("something is selected")
+            .fields
+            .iter()
+            .position(|field| field.name == name)
+            .unwrap_or_else(|| panic!("no field named {name}"))
+    }
+
+    fn field_value(playground: &PhysicsPlayground, name: &str) -> f64 {
+        let index = field_index(playground, name);
+        playground.inspection().expect("selected").fields[index].value
+    }
+
+    /// Set a field by name, which is what a reader does — the shell passes an index, but a
+    /// test that hard-coded one would pass while pointing at the wrong property.
+    fn set_field_named(playground: &mut PhysicsPlayground, name: &str, value: f64) {
+        let index = field_index(playground, name);
+        playground.set_field(index, value);
+    }
+
+    #[test]
+    fn spawning_selects_what_was_just_made() {
+        let mut playground = empty();
+        assert!(playground.inspection().is_none(), "nothing is selected to begin with");
+
+        click(&mut playground, [0.0, 1.0]);
+        let inspection = playground.inspection().expect("the new body is selected");
+        assert!(inspection.title.contains("box"), "{}", inspection.title);
+        assert!(inspection.subtitle.contains("dynamic"), "{}", inspection.subtitle);
+    }
+
+    #[test]
+    fn clicking_an_existing_body_selects_it_instead_of_spawning() {
+        let mut playground = empty();
+        click(&mut playground, [0.0, 1.0]);
+        let before = loose(&playground).len();
+
+        // Press on the body that is already there.
+        playground.pointer(press([0.0, 1.0]), 0);
+        playground.pointer(release([0.0, 1.0], [0.0, 0.0]), 0);
+
+        assert_eq!(loose(&playground).len(), before, "a second body was spawned on top");
+        assert!(playground.inspection().is_some());
+    }
+
+    /// Slots move when a body is removed, so a selection has to survive by handle.
+    #[test]
+    fn deleting_the_selected_body_clears_the_selection() {
+        let mut playground = empty();
+        click(&mut playground, [0.0, 1.0]);
+        assert!(playground.inspection().is_some());
+
+        playground.pointer(Pointer { secondary: true, ..press([0.0, 1.0]) }, 0);
+        assert!(playground.inspection().is_none(), "the inspector outlived the body");
+    }
+
+    /// The headline request: set an exact mass and an exact momentum.
+    #[test]
+    fn mass_and_momentum_can_be_set_exactly() {
+        let mut playground = empty();
+        click(&mut playground, [0.0, 1.0]);
+
+        set_field_named(&mut playground, "mass", 3.0);
+        assert!((field_value(&playground, "mass") - 3.0).abs() < 1e-12);
+
+        set_field_named(&mut playground, "momentum x", 6.0);
+        assert!(
+            (field_value(&playground, "momentum x") - 6.0).abs() < 1e-9,
+            "momentum came back as {}",
+            field_value(&playground, "momentum x")
+        );
+        // p = mv, so 6 kg·m/s on 3 kg is 2 m/s.
+        assert!(
+            (field_value(&playground, "velocity x") - 2.0).abs() < 1e-9,
+            "velocity is {}",
+            field_value(&playground, "velocity x")
+        );
+    }
+
+    /// Mass and inertia are not independent for a fixed shape, and a mass edit that left
+    /// inertia alone would give a body that translates like a feather and spins like a
+    /// boulder — reachable by typing, and not recoverable by eye.
+    #[test]
+    fn changing_mass_scales_the_rotational_inertia_with_it() {
+        let mut playground = empty();
+        click(&mut playground, [0.0, 1.0]);
+
+        let mass = field_value(&playground, "mass");
+        let inertia = field_value(&playground, "inertia");
+        assert!(inertia > 0.0, "a box should have a rotational inertia");
+
+        set_field_named(&mut playground, "mass", mass * 4.0);
+        let scaled = field_value(&playground, "inertia");
+        assert!(
+            (scaled / inertia - 4.0).abs() < 1e-9,
+            "inertia went from {inertia} to {scaled}, expected a factor of four"
+        );
+    }
+
+    #[test]
+    fn inertia_can_be_set_without_touching_the_mass() {
+        let mut playground = empty();
+        click(&mut playground, [0.0, 1.0]);
+        let mass = field_value(&playground, "mass");
+
+        set_field_named(&mut playground, "inertia", 0.25);
+        assert!((field_value(&playground, "inertia") - 0.25).abs() < 1e-12);
+        assert!((field_value(&playground, "mass") - mass).abs() < 1e-12, "mass moved");
+    }
+
+    /// Editing state by hand moves the quantities the panel is watching. That is the
+    /// reader's own hand, not solver drift, and the shell re-baselines on this counter.
+    #[test]
+    fn editing_a_field_counts_as_a_disturbance() {
+        let mut playground = empty();
+        click(&mut playground, [0.0, 1.0]);
+        let before = playground.disturbances();
+
+        set_field_named(&mut playground, "velocity y", 4.0);
+        assert!(playground.disturbances() > before, "an edit went unrecorded");
+    }
+
+    /// A wall is scenery. Offering an editable mass on one invites dropping the floor out
+    /// of the world, and the inertia it would need is not recoverable from what is stored.
+    #[test]
+    fn a_static_body_is_shown_but_not_editable() {
+        let mut playground = empty();
+        // The floor sits at the bottom of the arena.
+        playground.pointer(press([0.0, -ARENA[1]]), 0);
+
+        let inspection = playground.inspection().expect("the floor is selectable");
+        assert!(inspection.subtitle.contains("static"), "{}", inspection.subtitle);
+        assert!(
+            inspection.fields.iter().all(|field| !field.editable),
+            "a wall offered an editable property"
+        );
+
+        // And writing to it anyway changes nothing.
+        let before = loose(&playground).len();
+        playground.set_field(0, 5.0);
+        assert_eq!(loose(&playground).len(), before);
+    }
+
+    #[test]
+    fn derived_fields_follow_the_ones_they_are_derived_from() {
+        let mut playground = empty();
+        click(&mut playground, [0.0, 1.0]);
+
+        set_field_named(&mut playground, "mass", 2.0);
+        set_field_named(&mut playground, "velocity x", 3.0);
+        set_field_named(&mut playground, "velocity y", 4.0);
+        set_field_named(&mut playground, "angular velocity", 0.0);
+
+        assert!((field_value(&playground, "speed") - 5.0).abs() < 1e-9, "3-4-5");
+        // ½mv² = ½·2·25 = 25 J, with no rotation to add to it.
+        assert!(
+            (field_value(&playground, "kinetic energy") - 25.0).abs() < 1e-9,
+            "energy is {}",
+            field_value(&playground, "kinetic energy")
+        );
+    }
+
+    /// A reset throws away every body, so a selection made before it must not survive as a
+    /// handle that happens to match a new one.
+    #[test]
+    fn a_reset_clears_the_selection() {
+        let mut playground = empty();
+        click(&mut playground, [0.0, 1.0]);
+        assert!(playground.inspection().is_some());
+
+        playground.reset();
+        assert!(playground.inspection().is_none(), "a selection survived a reset");
     }
 
     /// Advance for `seconds` at the mode's own step.

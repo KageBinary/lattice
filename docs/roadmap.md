@@ -410,7 +410,7 @@ solvers, built by clicking rather than by compiling.
 
 It is not a shortcut around any of the standing constraints. It publishes the same
 observations, its panel applies the same conservation rules, and it added the same kind
-of test the rest of the engine has: fifty tests driving `Playground::pointer` directly,
+of test the rest of the engine has: sixty tests driving `Playground::pointer` directly,
 plus one conformance exercise every mode has to survive so a fourth cannot be added
 below the bar of the three that exist.
 

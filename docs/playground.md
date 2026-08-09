@@ -42,6 +42,48 @@ Two things are worth getting right in a new mode:
 - **`disturbances`** — bump it whenever the reader's pointer adds or removes a conserved
   quantity. See below.
 
+## The inspector
+
+Click a body and the panel shows what it is: mass, velocity, momentum, angular velocity,
+inertia, pose, and — derived from those — speed and kinetic energy. Everything but the
+derived pair can be edited while the scene runs.
+
+**Selecting is not a tool.** Touching a thing is already how you say which thing you mean,
+and a sandbox that made you switch modes to read a number would be asking you to plan
+before poking. Clicking a body selects it; spawning one selects what was just made, so a
+new block's numbers are on screen without a second click.
+
+**Fields are drag-and-type boxes, not sliders.** The two are not interchangeable. A slider
+is for sweeping a range to see what happens, which is what the scene-wide knobs above are
+for. The inspector exists to set a value *exactly* — 3 kg, not 2.97 kg because that is
+where the pixel landed.
+
+Three rules the fields follow, each of which is a decision rather than an accident:
+
+- **Mass and inertia move together.** Inertia is `∫r²dm`, so for a fixed shape it is
+  proportional to mass. Editing mass alone would give a body that translates like a feather
+  and spins like a boulder — reachable by typing, and not recoverable by eye. Inertia is
+  separately editable for when that *is* what you want, because a flywheel and a disc of
+  the same mass are genuinely different objects.
+- **Momentum is a way of writing velocity.** It is not stored; setting it to `p` sets the
+  velocity to `p/m` and leaves the mass alone. The alternative — changing mass to suit a
+  requested momentum — would make one box silently move another.
+- **Static bodies are shown and not editable.** A wall reads "static — infinite mass" with
+  every field greyed. Making one dynamic by typing into a mass box would drop the floor out
+  of the world, and the inertia it would then need is not recoverable from what is stored.
+
+An edit counts as a [disturbance](#what-the-panel-will-and-will-not-claim), because reaching
+in and setting a velocity moves the quantities the panel is watching. That is the reader's
+hand, not solver drift.
+
+The selection is a `BodyId`, never a slot. Slots move — `despawn` fills the hole by swapping
+the last body into it — so a stored slot would quietly start describing a different object.
+Generation checking catches a handle outliving its body; it does **not** catch a handle
+outliving the whole store, so `reset` clears the selection explicitly. A fresh store
+restarts its generation counters at zero, and without that line a handle held across a reset
+resolves cleanly against an unrelated new body. `a_reset_clears_the_selection` found that
+one.
+
 ## What the panel will and will not claim
 
 Same rules as the model viewer. The panel reports what a domain *declared* as an
@@ -119,10 +161,16 @@ cursor by roughly one time constant, and releasing at its own speed feels weak.
 ## Known gaps
 
 - No keyboard shortcuts. Space for pause and `R` for reset are the obvious two.
+- **Only the physics mode has an inspector.** `inspection` defaults to `None` on the trait,
+  so heat and reactions simply do not offer one. A cell of the heat field and a species in
+  the vessel are both selectable things with editable properties, and neither is wired up.
+- **Friction and restitution are still scene-wide, not per body.** They live on the
+  collider, and colliders are shared by shape and size, so a per-body surface needs a
+  private collider per body and an exemption from `refresh_surfaces`. Worth doing; not done.
 - The reaction mode's heat capacity is a constant, not a slider. Deliberate for now: a
   playground where the heat capacity is adjustable is one where "why did that not get
   hot" has two answers instead of one.
 - No way to save or load a scene. Everything is built by clicking, every time.
-- The interaction is covered by 50 unit tests driving `Playground::pointer` directly.
+- The interaction is covered by 60 unit tests driving `Playground::pointer` directly.
   Automated *end-to-end* capture of the real window is not reliable on this machine — see
   the note in `docs/development.md`.

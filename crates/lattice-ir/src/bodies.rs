@@ -443,6 +443,66 @@ impl RigidBodyStore {
         true
     }
 
+    /// Change a body's mass, scaling its rotational inertia with it.
+    ///
+    /// Inertia is `∫r²dm`, so for a fixed shape and uniform density it is proportional to
+    /// mass. Setting mass alone would leave a body that translates like a feather and spins
+    /// like a boulder — physically possible, but never what someone dragging a mass slider
+    /// meant, and impossible to get back to by eye. Scaling keeps the shape's mass
+    /// distribution and changes only how much of it there is.
+    ///
+    /// A `mass` of zero or less makes the body **static**: infinite mass, immovable. That
+    /// is the same convention [`BodySpec`] uses, and it is why the reciprocals are stored
+    /// rather than recomputed — a solver dividing by mass in its inner loop must not
+    /// branch on this.
+    ///
+    /// Returns false if the handle is stale. A body whose rotation was fixed at spawn
+    /// keeps its fixed rotation.
+    pub fn set_mass(&mut self, id: BodyId, mass: f64) -> bool {
+        let Some(slot) = self.slot_of(id) else { return false };
+        if !mass.is_finite() {
+            return false;
+        }
+
+        let previous = self.mass[slot];
+        let fixed_rotation = self.inv_inertia[slot] == 0.0 && self.inertia[slot] > 0.0;
+
+        let inertia = if previous > 0.0 && mass > 0.0 {
+            self.inertia[slot] * (mass / previous)
+        } else if mass > 0.0 {
+            // Coming back from static, where the stored inertia is zero and the ratio
+            // above would keep it there. Nothing here knows the shape, so the caller gets
+            // a body that translates and does not spin until it re-derives an inertia.
+            0.0
+        } else {
+            0.0
+        };
+
+        let mass = mass.max(0.0);
+        self.mass[slot] = mass;
+        self.inertia[slot] = inertia;
+        self.inv_mass[slot] = reciprocal_or_zero(mass);
+        self.inv_inertia[slot] =
+            if fixed_rotation { 0.0 } else { reciprocal_or_zero(inertia) };
+        true
+    }
+
+    /// Change a body's rotational inertia directly, leaving its mass alone.
+    ///
+    /// Separate from [`set_mass`](Self::set_mass) because the two are independent
+    /// properties once you stop assuming a uniform solid — a flywheel and a disc of the
+    /// same mass are different objects.
+    pub fn set_inertia(&mut self, id: BodyId, inertia: f64) -> bool {
+        let Some(slot) = self.slot_of(id) else { return false };
+        if !inertia.is_finite() {
+            return false;
+        }
+        let inertia = inertia.max(0.0);
+        self.inertia[slot] = inertia;
+        self.inv_inertia[slot] = reciprocal_or_zero(inertia);
+        true
+    }
+
     /// Mutable access to velocities and pose, for an integrator or solver.
     pub fn motion(&mut self) -> Motion<'_> {
         let n = self.len;
@@ -958,6 +1018,74 @@ mod tests {
             store.integrate_positions(1e-3);
         }
         assert!(store.angle_of(BodyId::new(0, 0)).unwrap().abs() < 1e-9, "one full turn");
+    }
+
+    /// Inertia is `∫r²dm`, so for a fixed shape it is proportional to mass. A mass edit
+    /// that left it alone would give a body that translates like a feather and spins like
+    /// a boulder.
+    #[test]
+    fn setting_mass_scales_the_inertia_with_it() {
+        let mut store = store_with(&[BodySpec::at([0.0, 0.0], SHAPE).with_inertia(2.0, 8.0)]);
+        let id = BodyId::new(0, 0);
+
+        assert!(store.set_mass(id, 6.0));
+        assert!((store.mass()[0] - 6.0).abs() < EPSILON);
+        assert!((store.inertia()[0] - 24.0).abs() < EPSILON, "tripled with the mass");
+        assert!((store.inv_mass()[0] - 1.0 / 6.0).abs() < EPSILON);
+        assert!((store.inv_inertia()[0] - 1.0 / 24.0).abs() < EPSILON);
+    }
+
+    /// The two are independent once you stop assuming a uniform solid: a flywheel and a
+    /// disc of the same mass are different objects.
+    #[test]
+    fn inertia_can_be_set_without_disturbing_the_mass() {
+        let mut store = store_with(&[BodySpec::at([0.0, 0.0], SHAPE).with_inertia(2.0, 8.0)]);
+        let id = BodyId::new(0, 0);
+
+        assert!(store.set_inertia(id, 1.0));
+        assert!((store.inertia()[0] - 1.0).abs() < EPSILON);
+        assert!((store.inv_inertia()[0] - 1.0).abs() < EPSILON);
+        assert!((store.mass()[0] - 2.0).abs() < EPSILON, "mass must not move");
+    }
+
+    /// Zero mass is the store's own spelling of "static", and the reciprocals have to
+    /// agree with it — a solver divides by them in its inner loop without branching.
+    #[test]
+    fn a_mass_of_zero_makes_a_body_static_with_consistent_reciprocals() {
+        let mut store = store_with(&[BodySpec::at([0.0, 0.0], SHAPE).with_inertia(2.0, 8.0)]);
+        let id = BodyId::new(0, 0);
+
+        assert!(store.set_mass(id, 0.0));
+        assert!(store.is_static(0));
+        assert_eq!(store.inv_mass()[0], 0.0);
+        assert_eq!(store.inv_inertia()[0], 0.0);
+    }
+
+    #[test]
+    fn a_non_finite_or_stale_edit_is_refused() {
+        let mut store = store_with(&[BodySpec::at([0.0, 0.0], SHAPE).with_inertia(2.0, 8.0)]);
+        let id = BodyId::new(0, 0);
+
+        assert!(!store.set_mass(id, f64::NAN), "NaN mass accepted");
+        assert!(!store.set_inertia(id, f64::INFINITY), "infinite inertia accepted");
+        assert!((store.mass()[0] - 2.0).abs() < EPSILON, "a refused edit still changed it");
+
+        store.despawn(id);
+        assert!(!store.set_mass(id, 1.0), "a stale handle was honoured");
+    }
+
+    /// A body spawned with its rotation fixed keeps it. Otherwise a mass edit would
+    /// quietly hand it back the spin its author disabled.
+    #[test]
+    fn a_fixed_rotation_survives_a_mass_change() {
+        let mut store = store_with(&[BodySpec::at([0.0, 0.0], SHAPE)
+            .with_inertia(2.0, 8.0)
+            .with_fixed_rotation()]);
+        let id = BodyId::new(0, 0);
+        assert_eq!(store.inv_inertia()[0], 0.0, "it starts fixed");
+
+        assert!(store.set_mass(id, 5.0));
+        assert_eq!(store.inv_inertia()[0], 0.0, "the mass edit unfroze the rotation");
     }
 
     #[test]

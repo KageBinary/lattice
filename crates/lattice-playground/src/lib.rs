@@ -183,6 +183,51 @@ mod tests {
             }
             mode.pointer_left();
 
+            // The inspector, if this mode has one. Whatever the clicking above selected,
+            // every field must be self-consistent and every one must survive being written
+            // to at both ends of its range — including the derived ones, which the shell
+            // does not offer but nothing stops a caller from trying.
+            if let Some(inspection) = mode.inspection() {
+                assert!(!inspection.title.is_empty(), "{name}: a selection with no title");
+                assert!(!inspection.fields.is_empty(), "{name}: a selection with no fields");
+                for field in &inspection.fields {
+                    assert!(!field.name.is_empty(), "{name}: an unnamed field");
+                    assert!(field.value.is_finite(), "{name}: field {} is non-finite", field.name);
+                    if field.editable {
+                        assert!(
+                            field.min < field.max,
+                            "{name}: field {} has an empty range",
+                            field.name
+                        );
+                        assert!(
+                            (field.min..=field.max).contains(&field.value),
+                            "{name}: field {} opens at {} outside {}..{}",
+                            field.name,
+                            field.value,
+                            field.min,
+                            field.max
+                        );
+                    }
+                }
+
+                for index in 0..inspection.fields.len() {
+                    let field = mode.inspection().expect("still selected").fields[index].clone();
+                    for value in [field.min, field.max, field.value] {
+                        mode.set_field(index, value);
+                        mode.step(dt);
+                    }
+                }
+                mode.set_field(999, 1.0);
+                mode.set_field(0, f64::NAN);
+                mode.step(dt);
+
+                mode.clear_selection();
+                assert!(
+                    mode.inspection().is_none(),
+                    "{name}: clearing the selection left one behind"
+                );
+            }
+
             for _ in 0..200 {
                 mode.step(dt);
             }

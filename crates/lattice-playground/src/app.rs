@@ -378,10 +378,77 @@ impl PlaygroundApp {
         self.rebaseline_if_disturbed();
     }
 
+    /// The inspector: what is selected, and what can be changed about it.
+    ///
+    /// Editable properties use a drag-and-type box rather than a slider. The two are not
+    /// interchangeable here: a slider is for sweeping a range to see what happens, and this
+    /// panel exists to set a value *exactly* — 3 kg, not 2.97 kg because that is where the
+    /// pixel landed. Sliders remain the right control for the scene-wide knobs above,
+    /// where sweeping is the whole point.
+    fn selection_section(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let Some(inspection) = self.current().inspection() else { return };
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.colored_label(palette.text_secondary, "selection");
+            if ui.small_button("clear").clicked() {
+                self.current_mut().clear_selection();
+            }
+        });
+        ui.colored_label(palette.text_primary, &inspection.title);
+        ui.colored_label(palette.text_muted, &inspection.subtitle);
+
+        let mut edit: Option<(usize, f64)> = None;
+        egui::Grid::new("selection-fields").num_columns(2).striped(true).show(ui, |ui| {
+            for (index, field) in inspection.fields.iter().enumerate() {
+                let label = ui.colored_label(palette.text_secondary, &field.name);
+                if !field.hint.is_empty() {
+                    label.on_hover_text(&field.hint);
+                }
+
+                let unit = if field.unit.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", field.unit)
+                };
+
+                if field.editable {
+                    let mut value = field.value;
+                    // A drag speed proportional to the range, so a mass in kilograms and
+                    // an inertia in kg·m² both move at a usable rate.
+                    let speed = ((field.max - field.min) / 400.0).abs().max(1e-6);
+                    ui.horizontal(|ui| {
+                        let widget = egui::DragValue::new(&mut value)
+                            .speed(speed)
+                            .range(field.min..=field.max);
+                        if ui.add(widget).changed() {
+                            edit = Some((index, value));
+                        }
+                        if !unit.is_empty() {
+                            ui.colored_label(palette.text_muted, unit.trim_start());
+                        }
+                    });
+                } else {
+                    // Derived: shown against the same rule the values table uses, so a
+                    // stopped body reads `0` rather than `1.041e-17`.
+                    let shown = render::format_value_against(field.value, field.value.abs());
+                    ui.colored_label(palette.text_muted, format!("{shown}{unit}"));
+                }
+                ui.end_row();
+            }
+        });
+
+        if let Some((index, value)) = edit {
+            self.current_mut().set_field(index, value);
+        }
+    }
+
     /// The diagnostics panel: what this mode claims and what it measures.
     fn panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         ui.heading("diagnostics");
         ui.colored_label(palette.text_muted, self.current().description());
+
+        self.selection_section(ui, palette);
 
         ui.add_space(8.0);
         ui.colored_label(palette.text_secondary, "clock");

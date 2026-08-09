@@ -110,6 +110,77 @@ impl Toggle {
     }
 }
 
+/// One property of whatever is currently selected.
+///
+/// The per-object counterpart of [`Knob`]. A knob is a setting of the *scene* — gravity,
+/// the size the next spawn will have — and there is one of it. A field belongs to the one
+/// object under the cursor, and there is a different set of them for every selection.
+///
+/// Some are derived rather than stored: a body's speed and kinetic energy follow from its
+/// velocity and mass, so they are shown and not edited. Marking that in the data rather
+/// than by convention means the shell can render them differently without knowing what any
+/// of them mean.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Field {
+    /// The label.
+    pub name: String,
+    /// Current value.
+    pub value: f64,
+    /// SI unit, or `""` for a dimensionless one.
+    pub unit: String,
+    /// Smallest and largest sensible values, for the drag widget's range.
+    pub min: f64,
+    /// See [`Field::min`].
+    pub max: f64,
+    /// False for a quantity computed from the others.
+    pub editable: bool,
+    /// One line shown on hover, for anything whose meaning is not obvious from the name.
+    pub hint: String,
+}
+
+impl Field {
+    /// An editable field.
+    pub fn new(
+        name: impl Into<String>,
+        value: f64,
+        min: f64,
+        max: f64,
+        unit: impl Into<String>,
+    ) -> Field {
+        Field {
+            name: name.into(),
+            value,
+            unit: unit.into(),
+            min,
+            max,
+            editable: true,
+            hint: String::new(),
+        }
+    }
+
+    /// A field computed from the others, shown but not editable.
+    pub fn derived(name: impl Into<String>, value: f64, unit: impl Into<String>) -> Field {
+        Field { editable: false, ..Field::new(name, value, f64::MIN, f64::MAX, unit) }
+    }
+
+    /// Attach the hover text.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Field {
+        self.hint = hint.into();
+        self
+    }
+}
+
+/// What the mode has selected, and what can be changed about it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Inspection {
+    /// A heading naming the selection, e.g. `"box · body 4"`.
+    pub title: String,
+    /// One line on what this object is.
+    pub subtitle: String,
+    /// Its properties, in the order they should be shown.
+    pub fields: Vec<Field>,
+}
+
 /// Where the pointer is, and what it is doing.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Pointer {
@@ -157,6 +228,23 @@ pub trait Playground {
     fn set_toggle(&mut self, index: usize, value: bool) {
         let _ = (index, value);
     }
+
+    /// What is selected right now, if anything, and what can be changed about it.
+    ///
+    /// Read fresh every frame rather than cached, so the numbers move while the simulation
+    /// runs — the point of an inspector on a live scene is watching a value change, not
+    /// taking a snapshot of it.
+    fn inspection(&self) -> Option<Inspection> {
+        None
+    }
+
+    /// Apply a change to field `index` of the current selection.
+    fn set_field(&mut self, index: usize, value: f64) {
+        let _ = (index, value);
+    }
+
+    /// Drop the current selection.
+    fn clear_selection(&mut self) {}
 
     /// The timestep this mode wants, in seconds.
     fn preferred_step(&self) -> f64;
