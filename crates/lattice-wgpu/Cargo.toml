@@ -1,0 +1,20 @@
+[package]
+name = "lattice-wgpu"
+description = "Portable WebGPU compute backend for Project Lattice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# §15.4 makes the portable backend the product baseline, and §24.1 permits mature
+# libraries where they do not define core semantics. `wgpu` is a few hundred crates; it is
+# confined to this crate and `lattice-viewer` so that the CLI, the solvers and the
+# validation suite keep building without it.
+[dependencies]
+lattice-compute.workspace = true
+wgpu = "30"
+pollster = "1.0"
+
+[lints]
+workspace = true

@@ -1666,6 +1666,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-compute"
+version = "0.1.0"
+
+[[package]]
 name = "lattice-coupling"
 version = "0.1.0"
 dependencies = [
@@ -1677,6 +1681,9 @@ dependencies = [
 [[package]]
 name = "lattice-cpu"
 version = "0.1.0"
+dependencies = [
+ "lattice-compute",
+]
 
 [[package]]
 name = "lattice-domain-chemistry"
@@ -1760,6 +1767,7 @@ version = "0.1.0"
 name = "lattice-validation"
 version = "0.1.0"
 dependencies = [
+ "lattice-compute",
  "lattice-coupling",
  "lattice-domain-chemistry",
  "lattice-domain-grid2d",
@@ -1768,6 +1776,7 @@ dependencies = [
  "lattice-ir",
  "lattice-observe",
  "lattice-runtime",
+ "lattice-wgpu",
 ]
 
 [[package]]
@@ -1782,6 +1791,15 @@ dependencies = [
  "lattice-runtime",
  "lattice-syntax",
  "lattice-units",
+]
+
+[[package]]
+name = "lattice-wgpu"
+version = "0.1.0"
+dependencies = [
+ "lattice-compute",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

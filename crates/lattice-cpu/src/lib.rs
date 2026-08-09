@@ -57,8 +57,10 @@
 //! reading before adding one: getting it wrong turns `--threads auto` into a
 //! pessimization, which §15.1 treats as a regression like any other.
 
+mod device;
 mod exec;
 mod pool;
 
+pub use device::{CpuBuffer, CpuDevice};
 pub use exec::{Executor, Grain, Partition};
 pub use pool::ThreadPool;

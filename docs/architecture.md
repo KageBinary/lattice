@@ -48,8 +48,18 @@ the non-obvious decisions were made that way.
              ┌────────────▼────────────┐ ┌──────────▼──────────────┐
              │  lattice-units          │ │  lattice-cpu            │
              │  dimensions, quantities │ │  worker pool, Executor, │
-             │                         │ │  Grain, Partition       │
-             └─────────────────────────┘ └─────────────────────────┘
+             │                         │ │  Grain, Partition,      │
+             │                         │ │  CpuDevice              │
+             └─────────────────────────┘ └──────────┬──────────────┘
+                                                    │
+                                         ┌──────────▼──────────────┐
+                       ┌─────────────────┤  lattice-compute        │
+                       │                 │  Device, Buffer,        │
+             ┌─────────▼───────────────┐ │  Precision, Capabilities│
+             │  lattice-wgpu           │ │  KernelCache, Tolerance │
+             │  GpuDevice, GpuDiffusion│ └─────────────────────────┘
+             │  WGSL kernels           │
+             └─────────────────────────┘
 ```
 
 Dependencies point downward only. `lattice-ir` holds no physics; the domain crates
@@ -60,9 +70,22 @@ together.
 `lattice-cpu` is at the bottom beside `lattice-units` because it knows nothing about
 simulation: it splits slices and runs closures. It is *below* `lattice-ir` rather than
 beside the domains because `StepContext` carries an `Executor` — a solver is handed the
-schedule the same way it is handed the clock, and for the same reason. Spec §24 names
-this crate `lattice-cpu`; the `lattice-compute` backend traits and `lattice-wgpu` it
-names alongside are M4's remaining work.
+schedule the same way it is handed the clock, and for the same reason.
+
+`lattice-compute` is lower still, and has no dependencies at all, because everything in it
+is a *boundary*: `Device`, `Buffer`, `Precision`, `Capabilities`, the kernel cache and the
+cross-backend `Tolerance`. A boundary that needed to import something would be describing
+the thing on one side of it. `lattice-cpu` and `lattice-wgpu` are its two implementations.
+
+Two things about that shape are worth stating, because both were decisions rather than
+defaults. **`Device` is not `Executor` with more implementations** — `Executor` answers
+"how do I split this loop across threads sharing memory", and every part of that question
+is wrong for a GPU. The two coexist; `CpuDevice` uses an `Executor` internally. And
+**`lattice-wgpu` does not depend on `lattice-ir`**, which is why its solver takes plain
+slices rather than a `HeatDomain`: `wgpu` is a few hundred crates, and keeping it off
+every dependency graph that has not asked for it is what §24.1's dependency policy is
+protecting. The GPU validation rows are behind a `gpu` feature for the same reason, so
+`lattice validate` stays dependency-free. See [backends.md](backends.md).
 
 `lattice-viewer` sits beside the CLI rather than under it: both are consumers of the
 same compile-then-run path, and neither is on the other's path. Nothing below the

@@ -171,6 +171,35 @@ impl DiffusionOperator {
         self.max_diffusivity
     }
 
+    /// The `(nx+1) × ny` harmonic-mean diffusivities on x-normal faces.
+    ///
+    /// Exposed so an accelerated backend can upload the coefficients this operator
+    /// computed rather than deriving its own. §24.1 makes the scalar CPU path *"the
+    /// executable specification for accelerated kernels"*, and a GPU that recomputed the
+    /// harmonic means would be a second implementation of a rule the specification
+    /// already fixes — with its own opportunity to get the boundary faces wrong, which is
+    /// precisely where this operator is easiest to get wrong.
+    pub fn face_x(&self) -> &[f64] {
+        &self.face_x
+    }
+
+    /// The `nx × (ny+1)` harmonic-mean diffusivities on y-normal faces.
+    ///
+    /// See [`DiffusionOperator::face_x`] for why this is public.
+    pub fn face_y(&self) -> &[f64] {
+        &self.face_y
+    }
+
+    /// `1 / dx²`, the coefficient the x-flux difference is scaled by.
+    pub fn inv_dx2(&self) -> f64 {
+        self.inv_dx2
+    }
+
+    /// `1 / dy²`, the coefficient the y-flux difference is scaled by.
+    pub fn inv_dy2(&self) -> f64 {
+        self.inv_dy2
+    }
+
     /// Apply `L[u] = ∇·(D∇u)`, writing into `out`'s interior, on the calling thread.
     ///
     /// `u`'s halo must already hold the boundary condition — see
@@ -270,6 +299,39 @@ mod tests {
         let field = ScalarField::new(&grid, 1);
         let op = DiffusionOperator::new(&grid, &Diffusivity::Uniform(d));
         (grid, field, op)
+    }
+
+    /// The stencil reads `(i±1, j)` and `(i, j±1)` and nothing diagonal, so the four
+    /// corner ghost cells cannot affect any output.
+    ///
+    /// Asserted rather than assumed because an accelerated backend is entitled to rely on
+    /// it: `lattice-wgpu`'s halo kernel fills the four edge strips and skips the corners,
+    /// which is only correct while this holds. If the operator ever gains a nine-point
+    /// form, this test fails and names the backend that has to change with it.
+    #[test]
+    fn the_five_point_stencil_never_reads_a_corner_ghost() {
+        let (grid, mut u, op) = setup(6, 4, 1.5);
+        u.init_from_position(&grid, |[x, y]| 300.0 + 10.0 * x + 3.0 * y * y);
+        apply_boundaries(&mut u, &BoundarySet::INSULATED, grid.dx(), grid.dy(), HaloMode::Inhomogeneous);
+
+        let mut baseline = ScalarField::new(&grid, 1);
+        op.apply(&u, &mut baseline);
+
+        // Poison every corner ghost with a value no correct result could survive.
+        let (nx, ny) = (grid.nx() as isize, grid.ny() as isize);
+        for (i, j) in [(-1, -1), (nx, -1), (-1, ny), (nx, ny)] {
+            let index = u.index_signed(i, j);
+            u.as_mut_slice()[index] = 1e9;
+        }
+
+        let mut poisoned = ScalarField::new(&grid, 1);
+        op.apply(&u, &mut poisoned);
+
+        assert_eq!(
+            baseline.as_slice(),
+            poisoned.as_slice(),
+            "a corner ghost reached the output; lattice-wgpu's halo kernel skips corners"
+        );
     }
 
     #[test]

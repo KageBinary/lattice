@@ -10,6 +10,15 @@ description = "Command-line runner: validate, benchmark, demo, and inspect"
 name = "lattice"
 path = "src/main.rs"
 
+# Off by default. §24.1's dependency policy and §15.4's portable baseline pull in opposite
+# directions here: the GPU backend is the product baseline, but it is also a few hundred
+# crates, and `lattice check`/`run`/`validate` have no dependencies at all today. Building
+# with `--features gpu` adds §19.1's GPU cross-backend rows; without it they are absent
+# from `lattice validate` rather than reported as passing.
+[features]
+default = []
+gpu = ["lattice-validation/gpu"]
+
 [dependencies]
 lattice-ir.workspace = true
 lattice-units.workspace = true

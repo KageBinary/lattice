@@ -276,6 +276,16 @@ impl HeatDomain {
         &mut self.field
     }
 
+    /// The stencil operator, including its precomputed face coefficients.
+    ///
+    /// Exposed for cross-backend work: a GPU running this domain's problem uploads
+    /// [`DiffusionOperator::face_x`] and [`DiffusionOperator::face_y`] rather than deriving
+    /// them, so that a disagreement between the two backends is a disagreement about
+    /// *arithmetic* and not about what the coefficients were.
+    pub fn operator(&self) -> &DiffusionOperator {
+        &self.operator
+    }
+
     /// The active time scheme.
     pub fn scheme(&self) -> TimeScheme {
         self.scheme

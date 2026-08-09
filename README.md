@@ -53,13 +53,24 @@ honesty over feature count**:
 | **Coupling** | Typed ports with units, coupling edges with compiler-derived unit conversions, cadence, and a conservation ledger | An exothermic reaction's energy arrives where the ledger says it was sent, to within the one exchange a staggered coupling always has in flight |
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
 | **Execution** | A worker pool and an explicit partitioning executor; parallel diffusion stencils and per-particle integration; `--threads` and a `--compare` mode that measures its own speedup | Parallel and scalar agree *bit for bit* — every cell, every particle, the CG iteration count, and the reproducibility hash. 4.8× at 512², 1.9× on 262k particles, and nothing slower than it was |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 936 tests across 16 crates |
+| **Backends** | A dependency-free backend boundary — devices, buffers, §10.5 precision modes, a kernel cache keyed the way §15.5 asks — with the scalar CPU path and a portable `wgpu` compute backend behind it | The GPU differs from the CPU reference by 4.3 `f32` ulps over 200 steps, using 0.3% of a budget *derived* from `f32` rounding rather than fitted to the result — and agrees to the bit where nothing rounds |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 983 tests across 18 crates |
 | **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, conservation drift and the solver's contract | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
 
 Fluids, waves, electromagnetism, molecular dynamics beyond Lennard-Jones, the quantum
-module, GPU execution, and the Python SDK. Those are M4–M8.
+module, and the Python SDK. Those are M5–M8.
+
+GPU execution has started rather than finished: the portable `wgpu` backend runs explicit
+diffusion device-resident and is cross-validated against the CPU reference, but the
+implicit solve, the particle kernels and zero-copy rendering are not on it. The constraint
+that shapes the rest is that **WGSL has no `f64`** — so §15.4's product baseline cannot run
+§10.5's reference precision, and the cross-backend budget is dominated by that rather than
+by the FMA and reduction-order effects the design expected. See
+[docs/backends.md](docs/backends.md). The backend is off by default, because `wgpu` is a
+few hundred crates and the rest of the CLI has none: `--features gpu` turns
+`lattice validate`'s 45 cases into 48.
 
 CPU parallelism arrived with M4.1, and three things inside it stay sequential *on
 purpose*: all reductions, conjugate gradient's inner products, and Lennard-Jones pair
@@ -302,7 +313,10 @@ Follows spec §24, with crates added as each milestone lands.
 lattice/
   crates/
     lattice-units/            dimensions, quantities, unit registry and parser
-    lattice-cpu/              the worker pool and the partitioning executor
+    lattice-compute/          the backend boundary: devices, buffers, precision modes,
+                              the kernel cache, cross-backend tolerance budgets
+    lattice-cpu/              the worker pool, the partitioning executor, CpuDevice
+    lattice-wgpu/             the portable WebGPU backend and its WGSL kernels
     lattice-syntax/           lexer, AST, parser, source-positioned diagnostics
     lattice-ir/               typed IDs, SoA storage, grids, arenas, solver contracts,
                               compiled model, operation graph, render channels
@@ -327,6 +341,8 @@ lattice/
     language.md               the .lattice language reference
     development.md            toolchain setup and conventions
     execution.md              how work is divided across threads, and what that may change
+    backends.md               who runs the arithmetic, at what precision, and what the
+                              answer is allowed to differ by
     roadmap.md                what each milestone delivered
     viewer.md                 what the window shows and the rules it draws by
     playground.md             the sandbox: its modes, and what its panel will claim

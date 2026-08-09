@@ -274,15 +274,28 @@ because how the work was divided is not part of the physics.
 
 ## What M4 still owes
 
-This document covers item 4 of the four M4 needs in [the roadmap](roadmap.md). The
-`wgpu` compute backend, the kernel cache, and zero-copy rendering are not built. When
-they are, three things here will need revisiting, and they are worth naming now:
+This document covers item 4 of the four M4 needs in [the roadmap](roadmap.md). The three
+things named here as needing revisiting when a GPU arrived are now answered in
+[backends.md](backends.md), and the answers are recorded rather than deleted because two of
+them came out differently than expected:
 
-- The cross-backend cases assert exact equality. The GPU ones will not, and the two must
-  be visibly different kinds of claim rather than one weakened into the other.
-- The pair-force loop and the reductions become live questions again, because a GPU has
-  no sequential fallback to retreat to.
-- `Executor` is a CPU concept. §24 puts backend traits in `lattice-compute`, and that is
-  where a real backend abstraction belongs — the operation graph's parallel levels
-  (`OperationGraph::levels`) are still unconsumed, and they are what a scheduler across
-  *operations* rather than within one would use.
+- **The cross-backend cases assert exact equality; the GPU ones do not.** Both kinds now
+  exist side by side, and they read as different kinds of claim: the cases above compare
+  IEEE bit patterns and carry no tolerance at all, while the GPU rows carry a budget
+  decomposed into named mechanisms with their derivations. The exactness promise above is
+  what makes that budget attributable — every unit of it belongs to the GPU.
+- **The pair-force loop and the reductions are still live, and still deferred.** The first
+  GPU kernel is a stencil precisely because a stencil has no reduction in it. Crank–Nicolson
+  is not on the device for the same reason: CG's inner products are where reduction order
+  stops being a zero term, and a GPU has no sequential fallback to retreat to.
+- **`Executor` stayed a CPU concept, and that turned out to be right.** `lattice-compute`'s
+  `Device` is not `Executor` with more implementations — there is no `&mut [f64]` to hand
+  out when the data is in device memory, and no loop to split when the kernel *is* the loop
+  body. The two coexist; `CpuDevice` uses an `Executor` internally.
+  `OperationGraph::levels` is still unconsumed.
+
+One thing this document did not anticipate. It assumed the GPU's disagreement would be
+spent on FMA contraction, transcendental accuracy and reduction order. Those are real, and
+the first is present — but WGSL has no `f64` at all, so the portable backend runs `fast32`
+against an `accurate64` reference, and *state rounding* dominates every budget by roughly
+eight orders of magnitude. The tolerance question turned out to be a precision question.

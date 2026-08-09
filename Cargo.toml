@@ -13,6 +13,7 @@ description = "Project Lattice — a 2D-first multiphysics, chemistry, and quant
 # Entries are added as each crate lands, so the workspace always builds.
 [workspace.dependencies]
 lattice-units = { path = "crates/lattice-units", version = "0.1.0" }
+lattice-compute = { path = "crates/lattice-compute", version = "0.1.0" }
 lattice-cpu = { path = "crates/lattice-cpu", version = "0.1.0" }
 lattice-ir = { path = "crates/lattice-ir", version = "0.1.0" }
 lattice-syntax = { path = "crates/lattice-syntax", version = "0.1.0" }
@@ -24,6 +25,7 @@ lattice-domain-grid2d = { path = "crates/lattice-domain-grid2d", version = "0.1.
 lattice-domain-rigid2d = { path = "crates/lattice-domain-rigid2d", version = "0.1.0" }
 lattice-domain-chemistry = { path = "crates/lattice-domain-chemistry", version = "0.1.0" }
 lattice-coupling = { path = "crates/lattice-coupling", version = "0.1.0" }
+lattice-wgpu = { path = "crates/lattice-wgpu", version = "0.1.0" }
 lattice-viewer = { path = "crates/lattice-viewer", version = "0.1.0" }
 lattice-playground = { path = "crates/lattice-playground", version = "0.1.0" }
 lattice-validation = { path = "crates/lattice-validation", version = "0.1.0" }

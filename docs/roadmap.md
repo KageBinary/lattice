@@ -210,14 +210,14 @@ Delivered:
 
 **Spec exit condition:** *"selected CPU/GPU cross-validation and performance goals."*
 
-Four things were needed. The fourth is done.
+Four things were needed. Three are done.
 
-1. **A `wgpu` compute backend** — the operation graph already computes which operations
-   are independent and reports the ideal speedup; nothing consumes that yet.
-2. **Kernel cache and zero-copy rendering** — §15.5's normalized expression hashing, and
-   the viewer drawing from simulation buffers rather than a CPU texture upload.
-3. **CPU/GPU cross-validation** — the *level* now exists (§19.1's `cross-backend`, with
-   four passing cases) and the harness is built; the GPU half of it is not.
+1. **A `wgpu` compute backend** ✅ — the portable baseline, running explicit diffusion
+   device-resident. The operation graph's parallel levels are still unconsumed.
+2. **Kernel cache** ✅ / **zero-copy rendering** — §15.5's cache is built and keyed on all
+   four of the inputs that section names; the viewer still uploads a CPU texture.
+3. **CPU/GPU cross-validation** ✅ — three GPU rows at §19.1's `cross-backend` level, with
+   a tolerance derived rather than fitted.
 4. **CPU parallelism** ✅ — §15.3's parallel iterators, deferred twice before this.
 
 ### M4.1 — Parallel CPU execution ✅
@@ -276,54 +276,86 @@ Delivered, and documented in [execution.md](execution.md):
   to be nothing; three repetitions made the curve monotonic and the real crossover
   obvious. Nothing in the table above is a single measurement.
 
-### Where M4.2 starts
+### M4.2 — The portable GPU backend ✅
 
-Nothing is half-finished — M4.1 is closed, the suite is green, and the next piece is a
-fresh start rather than a resumption. Written down so it does not have to be re-derived:
+Delivered, and documented in [backends.md](backends.md):
 
-**What already exists to build on.**
+- **`lattice-compute`** — the crate §24 calls *"backend traits, buffers, kernel cache"*,
+  with no dependencies at all, because everything in it is a boundary. `Device`, `Buffer`,
+  §10.5's `Precision`, `Capabilities`, §15.5's `KernelCache`, and `Tolerance`.
+- **`lattice-wgpu`** — §15.4's portable baseline. `GpuDevice` behind `Device`, and
+  `GpuDiffusion`, an explicit finite-volume run that uploads once, steps on the device, and
+  reads back once. Eight tests of its own properties.
+- **`CpuDevice`** — `lattice-cpu` became an implementation *behind* `lattice-compute` rather
+  than staying beside it, and can store `f32` as well as the reference `f64`.
+- **Three GPU cross-backend rows**, and a `gpu` feature that keeps `wgpu` out of the CLI.
+  `lattice validate` runs 45 cases; `--features gpu` runs 48.
 
-- `OperationGraph::levels` computes which operations are independent and reports the
-  ideal speedup. **Nothing consumes it.** That is the scheduler-shaped hole a backend
-  slots into, and it has been sitting there since M1.
-- `Executor` / `Grain` / `Partition` are the CPU precedent for "the caller declares the
-  work, the backend decides the schedule". A GPU backend answers the same questions with
-  different numbers; the *shape* should not need reinventing.
-- The cross-backend validation level and its harness are built (`lattice-validation/src/
-  execution.rs`). Adding a GPU row means adding cases, not building a comparison.
-- Every kernel now has a `_with(executor, …)` form beside its default. The same split
-  works for a backend argument.
+983 tests. Clippy clean.
 
-**The first decision, before any code.** §24 names two crates, not one: `lattice-compute`
-for backend traits, buffers and the kernel cache, and `lattice-wgpu` for the portable
-implementation. Getting that boundary right is the whole exercise — §23 warns that
-*"portable GPU abstractions may leave performance on the table"* and prescribes *"baseline
-wgpu plus a native backend plugin boundary"*, so the trait layer has to be designed
-against a CUDA backend that does not exist. `lattice-cpu` should probably become an
-implementation *behind* `lattice-compute` rather than staying beside it.
+### What M4.2 taught us
 
-**The second decision.** `wgpu` is a few hundred crates, and today only the two
-window-opening crates have any dependencies at all. §24.1 permits it, and the spec makes
-the portable backend the product baseline — but the CLI's dependency-free property is
-worth keeping, so the GPU backend should be optional the way the viewer is.
+- **The tolerance question was a precision question.** The table below predicted the GPU
+  budget would be spent on FMA contraction, transcendental accuracy and reduction order.
+  All three are real and the first is present — but **WGSL has no `f64` at all**, so the
+  product baseline cannot execute the reference precision even in principle, and state
+  rounding dominates every budget by roughly eight orders of magnitude. §23's *"portable
+  GPU abstractions may leave performance on the table"* understates it for scientific work:
+  what the portable abstraction leaves on the table is precision.
+- **`wgpu::Features::SHADER_F64` exists and is a trap.** It enables 64-bit floats in
+  *SPIR-V* shaders on Vulkan; the portable path compiles *WGSL*, whose validator gates the
+  type behind a capability `wgpu` never grants. This adapter reports the feature. Reading
+  the flag alone would have produced a backend advertising `accurate64` that then failed to
+  compile — so the claim is a test that compiles the shader and fails if it ever succeeds.
+- **`Device` is not `Executor` with more implementations**, and finding that out early
+  saved the design. `Executor` answers "how do I split this loop across threads sharing
+  memory"; there is no `&mut [f64]` to hand out when the data is on a device, and no loop to
+  split when the kernel *is* the loop body. They coexist — `CpuDevice` uses an `Executor`
+  internally — rather than one nesting inside the other.
+- **A budget nobody can decompose is a budget that was fitted.** A cross-backend tolerance
+  is the one number in a validation suite that nothing checks: too loose and it passes
+  forever, hiding every defect smaller than itself. Making `Tolerance` a list of named
+  mechanisms with their derivations, and reporting *fraction of budget used* rather than the
+  raw error, turns it into something a reader can audit. The headline case sits at 0.3%.
+- **The attribution needs two numbers, not one.** 4.3 `f32` ulps of disagreement is
+  consistent with `f32` storage; it is also 2.3×10⁹ `f64` ulps. Reporting both is what makes
+  the mechanism a measurement rather than an assertion — a transposed index would blow the
+  first bound, and a backend not running the precision it claims would fail the second.
+- **A cross-backend suite needs a case where the tolerance is not needed.** On a field with
+  no gradient every flux is a difference of equal numbers, so the two backends agree *to the
+  bit despite different precisions*. If that case ever fails while the budgeted ones pass,
+  the budget is covering a real defect.
 
-**Four questions M4.1 answered for the CPU and deferred for the GPU**, each of which
-needs a *different* answer rather than the same one:
+**Four questions M4.1 answered for the CPU and deferred for the GPU.** Two are now
+answered; two are still open and are what M4.3 runs into.
 
-| Question | CPU answer | Why the GPU cannot reuse it |
+| Question | CPU answer | GPU answer |
 |---|---|---|
-| How exact is cross-backend agreement? | bit-identical | FMA contraction, transcendental accuracy, reduction order |
-| Reductions | sequential | there is no sequential fallback to retreat to |
-| Lennard-Jones pair forces | left sequential | same — a gather or a colouring becomes mandatory |
-| Precision | `accurate64` throughout | §10.5's `fast32` and `mixed` profiles exist for exactly this |
+| How exact is cross-backend agreement? | bit-identical | a derived budget, dominated by `f32` state rounding |
+| Precision | `accurate64` throughout | `fast32` only — WGSL has no `f64` |
+| Reductions | sequential | **open** — no sequential fallback to retreat to |
+| Lennard-Jones pair forces | left sequential | **open** — a gather or a colouring becomes mandatory |
 
-The tolerance the first GPU case introduces is the most consequential number in the
-milestone. It must be attributable to a named mechanism, not fitted to make a test pass —
-which is the whole reason the CPU pair was kept exact.
+### Where M4.3 starts
+
+- **Crank–Nicolson on the device** is the next real piece, and it is where reductions stop
+  being a zero term in the budget. CG's inner products decide when the iteration stops, so
+  a change in reduction order changes the iteration count and through it the answer.
+- **Zero-copy rendering** — the buffers now live on the device; the viewer still uploads a
+  CPU texture.
+- **`OperationGraph::levels` is *still* unconsumed.** It has computed which operations are
+  independent since M1. A backend that schedules across *operations* rather than within one
+  is what would use it, and M4.2 did not become that.
+- **No performance number has been published for the GPU**, deliberately. §19.3 wants the
+  hardware, backend and model published with any claim, and a 192×128 grid stepping for 200
+  steps measures dispatch overhead more than arithmetic. A speedup claim needs `lattice
+  bench` to grow a backend argument first.
 
 **Before starting, reread §23.1's kill criteria**, particularly *"the compiled runtime is
-not materially faster or easier to inspect than a straightforward Python prototype."*
-M4.1 improved the first half and did nothing for the second.
+not materially faster or easier to inspect than a straightforward Python prototype."* M4.1
+improved the first half. M4.2 arguably improved the second — a validation report that
+prints where its tolerance went is an inspectability claim — and did nothing measured for
+the first.
 
 ## Outside the milestones: the playground
 

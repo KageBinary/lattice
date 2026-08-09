@@ -33,7 +33,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test                      # 936 tests across 16 crates
+$ cargo test                      # 983 tests across 18 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
@@ -43,11 +43,29 @@ Tests run at `opt-level = 2` (see the root `Cargo.toml`). The validation suite r
 convergence studies over thousands of steps; at `opt-level = 0` they take minutes
 instead of a second.
 
-`lattice-viewer` and `lattice-playground` are the only crates with external
-dependencies, and a cold build of their GPU stack takes several minutes. Nothing else
-depends on either, so building or testing any other crate by name never pays for it.
-Changing anything a domain *publishes* — `Observations`, `RenderChannel` — does reach
-them, so run the whole workspace before committing.
+`lattice-viewer`, `lattice-playground` and `lattice-wgpu` are the only crates with
+external dependencies, and a cold build of their GPU stack takes several minutes. Nothing
+else depends on any of them by default, so building or testing another crate by name never
+pays for it. Changing anything a domain *publishes* — `Observations`, `RenderChannel` —
+does reach them, so run the whole workspace before committing.
+
+### The GPU backend
+
+Off by default. §19.1's GPU cross-backend rows are *absent* from `lattice validate` without
+the feature — 45 cases rather than 48 — rather than reported as skipped-and-passing.
+
+```console
+$ cargo run -p lattice-wgpu --example probe    # what this machine's adapter offers
+$ cargo test -p lattice-wgpu                   # the backend's own properties
+$ cargo run -p lattice-cli --features gpu -- validate --filter gpu
+```
+
+Every GPU test skips with a printed reason when no adapter opens, so a machine without one
+still passes the suite without silently claiming to have exercised it. Read
+[backends.md](backends.md) before changing anything about precision or tolerance — in
+particular, the portable backend runs `fast32` because **WGSL has no `f64`**, and
+`wgsl_f64_is_rejected_by_the_portable_backend` is written to fail if that ever stops being
+true.
 
 **A green test suite does not mean the window is right.** Every defect found in the
 viewer so far was found by screenshotting the running program, not by a test: round-off

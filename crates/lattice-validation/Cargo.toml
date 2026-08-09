@@ -6,7 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 description = "The validation lab: analytic, manufactured, and property tests with measured error reporting"
 
+# §19.1's cross-backend level covers the GPU, but `wgpu` is a few hundred crates and
+# `lattice-cli` depends on this crate. Off by default keeps `lattice validate` free of
+# them; `--features gpu` adds the GPU rows, and without it they are *absent* from the
+# report rather than silently passing.
+[features]
+default = []
+gpu = ["dep:lattice-compute", "dep:lattice-wgpu"]
+
 [dependencies]
+lattice-compute = { workspace = true, optional = true }
+lattice-wgpu = { workspace = true, optional = true }
 lattice-ir.workspace = true
 lattice-observe.workspace = true
 lattice-domain-particle.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "lattice-compute"
+description = "Backend traits, device buffers, precision modes and the kernel cache for Project Lattice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Nothing. This crate sits below `lattice-cpu` at the bottom of the workspace, and a
+# backend boundary that needed a dependency to describe itself would be describing
+# something other than a boundary.
+[dependencies]
+
+[lints]
+workspace = true
