@@ -833,6 +833,39 @@ mod tests {
         assert!(world.last_solve().penetration < PENETRATION_ALARM);
     }
 
+    /// What a settled body actually does to the numbers a panel is showing.
+    ///
+    /// Diagnostic rather than a bound: it prints the spread of every published quantity
+    /// over 200 steps long after the crate has stopped moving, so "the panel will not sit
+    /// still" can be answered with a measurement instead of an opinion.
+    #[test]
+    fn what_a_resting_crate_does_to_the_published_numbers() {
+        let mut world = ground_and_crate();
+        stepped(&mut world, 2000);
+
+        let mut history: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+        let mut arena = Arena::with_capacity(4096);
+        for _ in 0..200 {
+            let mut ctx = StepContext::new(&mut arena);
+            world.prepare(&mut ctx);
+            world.advance(DT, &mut ctx);
+
+            let mut out = Observations::new();
+            world.observe(&mut out);
+            for entry in out.iter() {
+                history.entry(entry.name.to_string()).or_default().push(entry.value);
+            }
+        }
+
+        println!("\nresting crate, 200 steps after settling:");
+        for (name, values) in &history {
+            let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let changes = values.windows(2).filter(|w| w[0] != w[1]).count();
+            println!("  {name:<28} min {lo:>12.4e}  max {hi:>12.4e}  changed {changes:>3}/199");
+        }
+    }
+
     /// Everything the panel needs, present and dimensionally labelled.
     #[test]
     fn the_domain_publishes_what_a_reader_needs_to_judge_it() {

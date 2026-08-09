@@ -434,7 +434,11 @@ impl PlaygroundApp {
                     palette.status(Status::Critical)
                 };
                 let unit = if series.unit == "1" { "" } else { &series.unit };
-                ui.colored_label(colour, format!("{} {unit}", render::format_value(latest)));
+                let scale = self.history.display_scale_for(series);
+                ui.colored_label(
+                    colour,
+                    format!("{} {unit}", render::format_value_against(latest, scale)),
+                );
                 ui.end_row();
             }
         });

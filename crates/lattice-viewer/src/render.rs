@@ -462,6 +462,24 @@ pub fn color_scale(
 }
 
 /// Format a number for a label: fixed where readable, scientific where not.
+/// [`format_value`], with anything indistinguishable from zero at `scale` shown as `0`.
+///
+/// Use this wherever a *live* reading is printed. `format_value` alone is honest about the
+/// bits and dishonest about the physics: a resting body's net momentum wanders across
+/// `±1e-17`, and printing `-6.939e-18` then `+1.041e-17` a few steps later shows a
+/// motionless object as though every digit of it were unstable. The threshold matches
+/// [`Series::is_negligible_against`](crate::history::Series::is_negligible_against).
+///
+/// A scale of zero or one that is not finite falls through to the plain formatter, because
+/// there is then nothing to judge smallness against and inventing one would hide real
+/// values.
+pub fn format_value_against(value: f64, scale: f64) -> String {
+    if value != 0.0 && scale.is_finite() && scale > 0.0 && value.abs() <= 1e-9 * scale {
+        return "0".to_string();
+    }
+    format_value(value)
+}
+
 pub fn format_value(value: f64) -> String {
     if !value.is_finite() {
         return format!("{value}");

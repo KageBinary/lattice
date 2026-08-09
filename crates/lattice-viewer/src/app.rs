@@ -351,9 +351,14 @@ impl ViewerApp {
                         } else {
                             palette.status(Status::Critical)
                         };
+                        let scale = self.history.display_scale_for(series);
                         ui.colored_label(
                             color,
-                            format!("{} {}", render::format_value(latest), unit_label(&series.unit)),
+                            format!(
+                                "{} {}",
+                                render::format_value_against(latest, scale),
+                                unit_label(&series.unit)
+                            ),
                         );
                         ui.end_row();
                     }

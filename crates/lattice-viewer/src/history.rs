@@ -107,6 +107,19 @@ impl Series {
     /// oscillation as one that doubles — with fifteen-digit axis labels to match.
     /// Beside a series that genuinely moves, that reads as instability where there is
     /// none. Such a series is better reported as a number than drawn as a shape.
+    /// The largest magnitude this series has reached.
+    ///
+    /// The yardstick for "is the current reading distinguishable from zero?" when the
+    /// domain published no scale of its own. A quantity that peaked at 4 N·s and now reads
+    /// 1e-17 has stopped, whatever the digits say.
+    pub fn peak_magnitude(&self) -> f64 {
+        self.points
+            .iter()
+            .map(|point| point[1])
+            .filter(|value| value.is_finite())
+            .fold(0.0f64, |peak, value| peak.max(value.abs()))
+    }
+
     pub fn is_flat_to_roundoff(&self) -> bool {
         let (Some(low), Some(high)) = (
             self.points.iter().map(|p| p[1]).fold(None, min_finite),
@@ -265,6 +278,21 @@ impl History {
         Some(Drift { value: change, basis: DriftBasis::Absolute })
     }
 
+    /// What a reading of `series` should be judged against before it is printed.
+    ///
+    /// The domain's published scale if there is one — `momentum_scale` exists for exactly
+    /// this — and otherwise the largest magnitude the series has reached in this run.
+    ///
+    /// This is what stops a stationary body's panel from flickering. A crate resting on
+    /// the floor has a net momentum that wanders between `-6.9e-18` and `+1.0e-17`: it is
+    /// zero, and every digit *and the sign* change every few steps, so
+    /// `format!("{:.3e}")` renders a motionless object as violent instability. The values
+    /// table had no scale to judge that against, while the plots — which had this same bug
+    /// twice before — already did.
+    pub fn display_scale_for(&self, series: &Series) -> f64 {
+        self.scale_for(&series.name).unwrap_or_else(|| series.peak_magnitude())
+    }
+
     /// Whether a series carries enough variation to be worth drawing as a curve.
     ///
     /// Three ways to fail: never changing, varying only in the last digits of its own
@@ -330,6 +358,95 @@ mod tests {
             out.record_invariant(name.to_string(), Invariant::Energy, *value);
         }
         out
+    }
+
+    /// The numbers a real resting crate publishes, taken from
+    /// `what_a_resting_crate_does_to_the_published_numbers` in `lattice-domain-rigid2d`.
+    ///
+    /// A single body dropped in the sandbox settles completely — kinetic energy `1e-35`,
+    /// speed `1e-18` — and its net momentum then wanders across `±1e-17`, flipping sign
+    /// every few steps. The physics is exactly right; the panel showed it as every digit
+    /// changing constantly, which is what a user reported as "all the numbers fluctuating".
+    #[test]
+    fn a_settled_body_is_judged_against_a_scale_rather_than_its_own_digits() {
+        let mut history = History::default();
+        // The falling phase, which is what sets the scale of the quantity.
+        for (step, momentum) in [(0, 0.0), (1, -2.4), (2, -4.9), (3, -7.3)] {
+            let mut sample = Observations::new();
+            sample.record_metric("scene.momentum_x", momentum, "kg·m/s");
+            sample.record_metric("scene.kinetic_energy", 0.5 * momentum * momentum, "J");
+            history.record(f64::from(step), &sample);
+        }
+        // Landed, and now at rest to round-off.
+        for (step, momentum) in [(4, -6.938_893_903_907_228e-18), (5, 1.040_834_085_586_084e-17)] {
+            let mut sample = Observations::new();
+            sample.record_metric("scene.momentum_x", momentum, "kg·m/s");
+            sample.record_metric("scene.kinetic_energy", 3.957e-35, "J");
+            history.record(f64::from(step), &sample);
+        }
+
+        let momentum = history.get("scene.momentum_x").unwrap();
+        assert_eq!(momentum.peak_magnitude(), 7.3);
+        assert_eq!(history.display_scale_for(momentum), 7.3);
+
+        let latest = momentum.latest().unwrap();
+        assert_eq!(crate::render::format_value(latest), "1.041e-17", "the old behaviour");
+        assert_eq!(
+            crate::render::format_value_against(latest, history.display_scale_for(momentum)),
+            "0",
+            "a resting body must read as stopped"
+        );
+
+        let energy = history.get("scene.kinetic_energy").unwrap();
+        assert_eq!(
+            crate::render::format_value_against(
+                energy.latest().unwrap(),
+                history.display_scale_for(energy)
+            ),
+            "0"
+        );
+    }
+
+    /// The other half of the claim: a genuinely small reading must still be shown.
+    ///
+    /// A quantity that is small for the whole run has a small peak too, so the ratio test
+    /// leaves it alone. Suppressing it would be the same bug in the opposite direction.
+    #[test]
+    fn a_quantity_that_is_simply_small_is_still_printed() {
+        let mut history = History::default();
+        for step in 0..4 {
+            let mut sample = Observations::new();
+            // Penetration: 0.4 mm, constant, and genuinely the value.
+            sample.record_metric("scene.penetration", 4.0e-4, "m");
+            history.record(f64::from(step), &sample);
+        }
+        let series = history.get("scene.penetration").unwrap();
+        assert_eq!(
+            crate::render::format_value_against(
+                series.latest().unwrap(),
+                history.display_scale_for(series)
+            ),
+            "4.000e-4"
+        );
+    }
+
+    /// A published scale outranks the series' own peak, because it is the domain's own
+    /// statement about what "small" means for that quantity.
+    #[test]
+    fn a_published_scale_is_preferred_over_the_observed_peak() {
+        let mut history = History::default();
+        let mut sample = Observations::new();
+        sample.record_metric("gas.momentum_x", 1e-9, "kg·m/s");
+        sample.record_metric("gas.momentum_scale", 200.0, "kg·m/s");
+        history.record(0.0, &sample);
+
+        let series = history.get("gas.momentum_x").unwrap();
+        assert_eq!(series.peak_magnitude(), 1e-9, "its own peak is tiny");
+        assert_eq!(history.display_scale_for(series), 200.0, "the domain knows better");
+        assert_eq!(
+            crate::render::format_value_against(1e-9, history.display_scale_for(series)),
+            "0"
+        );
     }
 
     /// The panel asks the domain what it promised rather than guessing from the name.
