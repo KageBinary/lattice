@@ -1640,6 +1640,7 @@ name = "lattice-cli"
 version = "0.1.0"
 dependencies = [
  "lattice-compiler",
+ "lattice-compute",
  "lattice-domain-grid2d",
  "lattice-domain-particle",
  "lattice-ir",
@@ -1648,6 +1649,7 @@ dependencies = [
  "lattice-syntax",
  "lattice-units",
  "lattice-validation",
+ "lattice-wgpu",
 ]
 
 [[package]]

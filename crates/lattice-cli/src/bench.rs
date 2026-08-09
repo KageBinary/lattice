@@ -33,7 +33,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn new(name: impl Into<String>, observed: f64, limit: f64) -> Self {
+    pub fn new(name: impl Into<String>, observed: f64, limit: f64) -> Self {
         Self { name: name.into(), observed, limit }
     }
 
@@ -66,6 +66,55 @@ impl BenchOutcome {
     }
 }
 
+/// What a benchmark is, independent of which backend runs it.
+///
+/// Split out from [`Benchmark`] so the reporting functions can serve a GPU benchmark too
+/// without either backend's benchmark type having to know about the other's.
+#[derive(Clone, Copy, Debug)]
+pub struct Info {
+    /// Identifier, used for filtering.
+    pub name: &'static str,
+    /// What the scene is.
+    pub description: &'static str,
+    /// The correctness condition, quoted from or modelled on spec §15.6.
+    pub correctness: &'static str,
+}
+
+/// How a run was executed.
+///
+/// §19.3: *"Publish exact hardware, backend, precision, model file, engine revision, and
+/// validation tolerance."* Everything in that sentence that varies between backends lives
+/// here, so that a throughput figure is never printed without the configuration that
+/// produced it.
+#[derive(Clone, Debug)]
+pub struct Executed {
+    /// Backend and its configuration, e.g. `cpu-parallel (20 threads, 4 chunks/thread)`.
+    pub label: String,
+    /// The §10.5 mode the arithmetic ran in.
+    ///
+    /// Not a constant any more. The portable GPU backend runs `fast32` because WGSL has no
+    /// `f64`, so a benchmark that printed `accurate64` beside a GPU number would be
+    /// publishing the wrong precision with the result — exactly what §19.3 exists to stop.
+    pub precision: &'static str,
+    /// Threads, where that is a meaningful count.
+    ///
+    /// `None` for a GPU. "Speedup per thread" is not a quantity anyone can interpret when
+    /// the divisor would be some product of SM count and occupancy, so efficiency is left
+    /// unreported rather than computed against a number chosen to look reasonable.
+    pub threads: Option<usize>,
+}
+
+impl Executed {
+    /// How a CPU run was executed.
+    pub fn cpu(executor: &Executor) -> Executed {
+        Executed {
+            label: executor.label(),
+            precision: "accurate64",
+            threads: Some(executor.threads()),
+        }
+    }
+}
+
 /// A named benchmark.
 #[derive(Clone, Copy)]
 pub struct Benchmark {
@@ -77,6 +126,17 @@ pub struct Benchmark {
     pub correctness: &'static str,
     /// Run at the given scale factor, splitting solver loops across `executor`.
     pub run: fn(usize, &Executor) -> BenchOutcome,
+}
+
+impl Benchmark {
+    /// The backend-independent description.
+    pub fn info(&self) -> Info {
+        Info {
+            name: self.name,
+            description: self.description,
+            correctness: self.correctness,
+        }
+    }
 }
 
 /// All registered benchmarks.
@@ -368,15 +428,15 @@ fn bench_heat_implicit(scale: usize, executor: &Executor) -> BenchOutcome {
 
 /// Render one benchmark's result as text.
 pub fn report(
-    benchmark: &Benchmark,
+    info: Info,
     scale: usize,
-    executor: &Executor,
+    executed: &Executed,
     outcome: &BenchOutcome,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!("\n{} (scale {scale}, {})\n", benchmark.name, executor.label()));
-    out.push_str(&format!("  {}\n", benchmark.description));
-    out.push_str(&format!("  correctness condition: {}\n\n", benchmark.correctness));
+    out.push_str(&format!("\n{} (scale {scale}, {})\n", info.name, executed.label));
+    out.push_str(&format!("  {}\n", info.description));
+    out.push_str(&format!("  correctness condition: {}\n\n", info.correctness));
 
     out.push_str(&outcome.throughput.report());
     out.push('\n');
@@ -405,9 +465,9 @@ pub fn report(
 
 /// Machine-readable form.
 pub fn to_json(
-    benchmark: &Benchmark,
+    info: Info,
     scale: usize,
-    executor: &Executor,
+    executed: &Executed,
     outcome: &BenchOutcome,
 ) -> Json {
     let mut checks = Json::array();
@@ -421,12 +481,13 @@ pub fn to_json(
         );
     }
     Json::object()
-        .set("name", benchmark.name)
-        .set("description", benchmark.description)
-        .set("correctness_condition", benchmark.correctness)
+        .set("name", info.name)
+        .set("description", info.description)
+        .set("correctness_condition", info.correctness)
         .set("scale", scale)
-        .set("schedule", executor.label())
-        .set("threads", executor.threads())
+        .set("schedule", executed.label.clone())
+        .set("precision", executed.precision)
+        .set("threads", executed.threads.unwrap_or(0))
         .set("valid", outcome.valid())
         .set("throughput", outcome.throughput.to_json())
         .set("phases", outcome.profile.to_json())
@@ -445,10 +506,11 @@ pub fn to_json(
 /// The correctness conditions are re-checked on both runs, so a speedup is never
 /// reported for a configuration that stopped being right (§15.1).
 pub fn speedup_report(
-    baseline: &BenchOutcome,
-    parallel: &BenchOutcome,
-    executor: &Executor,
+    baseline: (&Executed, &BenchOutcome),
+    faster: (&Executed, &BenchOutcome),
 ) -> String {
+    let (base_executed, baseline) = baseline;
+    let (fast_executed, parallel) = faster;
     let sequential_seconds = baseline.throughput.wall_clock.as_secs_f64();
     let parallel_seconds = parallel.throughput.wall_clock.as_secs_f64();
     if parallel_seconds <= 0.0 || sequential_seconds <= 0.0 {
@@ -456,12 +518,25 @@ pub fn speedup_report(
     }
 
     let speedup = sequential_seconds / parallel_seconds;
-    let threads = executor.threads();
-    let efficiency = 100.0 * speedup / threads as f64;
+    // Efficiency only where a divisor exists that a reader can interpret. See
+    // `Executed::threads`.
+    let per_thread = match fast_executed.threads {
+        Some(threads) if threads > 1 => {
+            format!("on {threads} threads ({:.0}% of linear; ", 100.0 * speedup / threads as f64)
+        }
+        _ => "(".to_string(),
+    };
     let mut out = format!(
-        "\n  speedup {speedup:.2}x on {threads} threads \
-         ({efficiency:.0}% of linear; {sequential_seconds:.3} s -> {parallel_seconds:.3} s)\n"
+        "\n  speedup {speedup:.2}x {per_thread}{sequential_seconds:.3} s -> \
+         {parallel_seconds:.3} s)\n"
     );
+    if base_executed.precision != fast_executed.precision {
+        out.push_str(&format!(
+            "  NOTE: different precisions ({} vs {}), so this ratio compares two answers \
+             that are not the same answer (§19.3).\n",
+            base_executed.precision, fast_executed.precision
+        ));
+    }
     if !(baseline.valid() && parallel.valid()) {
         out.push_str(
             "  RESULT INVALID: one of the two runs failed a correctness condition, so \
@@ -491,19 +566,20 @@ pub fn build_warning() -> Option<String> {
 /// §19.3 asks for the backend to be published with the number, and the thread count is
 /// part of the backend as soon as there is more than one of them. A throughput figure
 /// with no schedule beside it cannot be compared with anything.
-pub fn environment_for(executor: &Executor) -> String {
+pub fn environment_for(executed: &Executed) -> String {
     format!(
-        "engine {}  target {}  profile {}  precision accurate64  backend {}",
+        "engine {}  target {}  profile {}  precision {}  backend {}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::ARCH,
         if cfg!(debug_assertions) { "debug" } else { "release" },
-        executor.label(),
+        executed.precision,
+        executed.label,
     )
 }
 
 /// [`environment_for`] the sequential executor, for `--version`.
 pub fn environment() -> String {
-    environment_for(&Executor::sequential())
+    environment_for(&Executed::cpu(&Executor::sequential()))
 }
 
 #[cfg(test)]
@@ -522,7 +598,7 @@ mod tests {
                 outcome.valid(),
                 "{} failed its correctness conditions:\n{}",
                 benchmark.name,
-                report(benchmark, 1, &executor, &outcome)
+                report(benchmark.info(), 1, &Executed::cpu(&executor), &outcome)
             );
             assert!(outcome.throughput.steps > 0);
             assert!(outcome.memory.total() > 0, "{} reported no memory", benchmark.name);
@@ -541,7 +617,7 @@ mod tests {
                 outcome.valid(),
                 "{} failed on four threads:\n{}",
                 benchmark.name,
-                report(benchmark, 1, &executor, &outcome)
+                report(benchmark.info(), 1, &Executed::cpu(&executor), &outcome)
             );
         }
     }
@@ -552,7 +628,10 @@ mod tests {
         let mut outcome = (all()[0].run)(1, &executor);
         outcome.checks.push(Check::new("deliberate failure", 1.0, 0.0));
         assert!(!outcome.valid());
-        assert!(report(&all()[0], 1, &executor, &outcome).contains("RESULT INVALID"));
+        assert!(
+            report(all()[0].info(), 1, &Executed::cpu(&executor), &outcome)
+                .contains("RESULT INVALID")
+        );
     }
 
     #[test]
@@ -574,7 +653,7 @@ mod tests {
         let benchmark = &all()[0];
         let executor = Executor::with_threads(3);
         let outcome = (benchmark.run)(1, &executor);
-        let json = to_json(benchmark, 1, &executor, &outcome);
+        let json = to_json(benchmark.info(), 1, &Executed::cpu(&executor), &outcome);
         assert!(json.get("correctness_condition").is_some());
         assert_eq!(json.get("valid"), Some(&Json::Bool(true)));
         assert!(json.get("checks").is_some());
@@ -584,12 +663,45 @@ mod tests {
         assert!(format!("{:?}", json.get("schedule")).contains("cpu-parallel"));
     }
 
+    /// §19.3 wants precision published with the number. It used to be the constant
+    /// `accurate64`, which stopped being true the moment a `fast32` backend existed.
+    #[test]
+    fn the_published_precision_comes_from_the_backend() {
+        let executor = Executor::sequential();
+        let outcome = (all()[0].run)(1, &executor);
+        let json = to_json(all()[0].info(), 1, &Executed::cpu(&executor), &outcome);
+        assert_eq!(json.get("precision"), Some(&Json::String("accurate64".to_string())));
+        assert!(environment_for(&Executed::cpu(&executor)).contains("precision accurate64"));
+    }
+
+    /// A ratio between two different precisions is not a speedup at the same answer, and
+    /// the report has to say so rather than leaving a reader to notice.
+    #[test]
+    fn a_speedup_across_precisions_is_flagged_as_one() {
+        let executor = Executor::sequential();
+        let outcome = (all()[0].run)(1, &executor);
+        let cpu = Executed::cpu(&executor);
+        let gpu = Executed {
+            label: "wgpu (test)".to_string(),
+            precision: "fast32",
+            threads: None,
+        };
+
+        let same = speedup_report((&cpu, &outcome), (&cpu, &outcome));
+        assert!(!same.contains("different precisions"), "{same}");
+
+        let across = speedup_report((&cpu, &outcome), (&gpu, &outcome));
+        assert!(across.contains("different precisions"), "{across}");
+        // Efficiency needs a divisor a reader can interpret, and a GPU has none.
+        assert!(!across.contains("of linear"), "{across}");
+    }
+
     #[test]
     fn a_debug_build_warns_about_its_own_timings() {
         // This test runs under `cargo test`, which is a debug build, so the warning
         // must be present. In a release build it must be absent.
         assert_eq!(build_warning().is_some(), cfg!(debug_assertions));
         assert!(environment().contains("cpu-scalar"));
-        assert!(environment_for(&Executor::with_threads(4)).contains("4 threads"));
+        assert!(environment_for(&Executed::cpu(&Executor::with_threads(4))).contains("4 threads"));
     }
 }

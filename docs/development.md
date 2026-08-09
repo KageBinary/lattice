@@ -2,8 +2,9 @@
 
 ## Toolchain
 
-Rust 1.85 or newer (edition 2024). No other tools are needed. Fourteen of the sixteen
-crates have no external dependencies at all; only the two that open a window do.
+Rust 1.85 or newer (edition 2024). No other tools are needed. Fifteen of the eighteen
+crates have no external dependencies at all: the two that open a window, and the portable
+GPU backend, are the exceptions.
 
 ### Windows: use the GNU toolchain unless you have MSVC C++ build tools
 
@@ -33,7 +34,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test                      # 983 tests across 18 crates
+$ cargo test                      # 985 tests across 18 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
@@ -58,7 +59,18 @@ the feature — 45 cases rather than 48 — rather than reported as skipped-and-
 $ cargo run -p lattice-wgpu --example probe    # what this machine's adapter offers
 $ cargo test -p lattice-wgpu                   # the backend's own properties
 $ cargo run -p lattice-cli --features gpu -- validate --filter gpu
+
+$ cargo build --release -p lattice-cli --features gpu
+$ ./target/release/lattice bench heat-explicit --backend gpu --scale 4
 ```
+
+**Publishing a GPU timing needs more care than a CPU one.** Opening a device costs about
+0.8 s once per process and is printed separately for that reason; the first buffer round
+trip on a fresh device costs ~56 ms against a ~160 µs steady state; and `--compare` runs
+both backends in one process, which is fine for a check and wrong for a published figure.
+Separate processes, best of three, and read [backends.md](backends.md)'s "what the
+measurement got wrong first" before trusting a surprising number — all three mistakes it
+records were reproducible.
 
 Every GPU test skips with a printed reason when no adapter opens, so a machine without one
 still passes the suite without silently claiming to have exercised it. Read

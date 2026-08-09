@@ -217,7 +217,8 @@ Four things were needed. Three are done.
 2. **Kernel cache** ✅ / **zero-copy rendering** — §15.5's cache is built and keyed on all
    four of the inputs that section names; the viewer still uploads a CPU texture.
 3. **CPU/GPU cross-validation** ✅ — three GPU rows at §19.1's `cross-backend` level, with
-   a tolerance derived rather than fitted.
+   a tolerance derived rather than fitted, and `lattice bench --backend gpu` for the
+   performance half.
 4. **CPU parallelism** ✅ — §15.3's parallel iterators, deferred twice before this.
 
 ### M4.1 — Parallel CPU execution ✅
@@ -336,20 +337,62 @@ answered; two are still open and are what M4.3 runs into.
 | Reductions | sequential | **open** — no sequential fallback to retreat to |
 | Lennard-Jones pair forces | left sequential | **open** — a gather or a colouring becomes mandatory |
 
-### Where M4.3 starts
+### M4.3 — `lattice bench --backend gpu` ✅
+
+The GPU was reachable only from the validation suite; now it is a backend the benchmark
+harness can select, which is what a performance claim needed before it could be made.
+
+- **`--backend cpu|gpu`**, with the reporting layer made backend-agnostic: `Executed`
+  carries label, precision and thread count, so §19.3's "publish precision with the number"
+  stopped being the constant `accurate64` the moment a `fast32` backend existed.
+- **Efficiency is not printed for the GPU.** Speedup per thread needs a divisor a reader
+  can interpret, and "SM count × occupancy" is not one.
+- **A cross-precision ratio is flagged in the output**, because a speedup between two
+  different answers is not a speedup.
+- **A derived drift limit.** The §15.6 correctness condition is the same check at a
+  different epsilon: `n·ε/2` for `n` steps, from the one rounding per cell per step that
+  the update performs. At `f64` the CPU's flat `1e-9` is looser than the formula; it is left
+  alone as an established baseline rather than tightened in the same change.
+
+985 tests. Clippy clean.
+
+### What M4.3 taught us
+
+- **The kernel wins by two orders of magnitude and the program loses.** 130× on the stencil
+  at 1024², and the whole GPU *process* is 4.1× slower than the CPU's at 256², because
+  opening a device costs 0.72–0.82 s once. §15.1's "measure end-to-end" is not a
+  formality — it inverts the conclusion at two of the three sizes measured. Both numbers
+  are printed; neither is honest alone.
+- **Half the speedup is precision.** `f32` against `f64` on a bandwidth-bound kernel moves
+  half the bytes before any architectural advantage applies. The harness now says so in the
+  output rather than leaving it to a reader.
+- **A reproducible wrong number is not more trustworthy than a noisy one.** A 500 ms
+  readback at 256² was consistent across six runs, was size-inverted in a way that suggested
+  a real effect, and survived two rounds of plausible hardware hypotheses. It was `647.700
+  µs` being parsed as milliseconds by the measuring script. Consistency measures the
+  measurement, not the thing.
+- **Lazy initialization lands wherever you first touch it.** The first buffer round trip on
+  a fresh device costs ~56 ms against a ~160 µs steady state, and it silently became "the
+  readback is slow". `GpuDevice::open` pays it on purpose now, which is also where §15.1
+  would put it.
+
+### Where M4.4 starts
 
 - **Crank–Nicolson on the device** is the next real piece, and it is where reductions stop
   being a zero term in the budget. CG's inner products decide when the iteration stops, so
   a change in reduction order changes the iteration count and through it the answer.
-- **Zero-copy rendering** — the buffers now live on the device; the viewer still uploads a
-  CPU texture.
+- **Zero-copy rendering** — the buffers live on the device; the viewer still uploads a CPU
+  texture. The measured readback cost (0.4–5.9 ms per frame at these sizes, plus a device
+  open) is what it would remove.
 - **`OperationGraph::levels` is *still* unconsumed.** It has computed which operations are
   independent since M1. A backend that schedules across *operations* rather than within one
-  is what would use it, and M4.2 did not become that.
-- **No performance number has been published for the GPU**, deliberately. §19.3 wants the
-  hardware, backend and model published with any claim, and a 192×128 grid stepping for 200
-  steps measures dispatch overhead more than arithmetic. A speedup claim needs `lattice
-  bench` to grow a backend argument first.
+  is what would use it, and neither M4.2 nor M4.3 became that.
+- **Device open is 0.8 s and nothing has tried to reduce it.** It is plausibly mostly
+  adapter enumeration, and a run that already knows which adapter it wants may not need it.
+  Nobody has profiled it.
+- **The particle benchmarks have no GPU kernels**, so `--backend gpu` runs exactly one
+  benchmark. §15.6's "local particles" and "Lennard-Jones MD" targets are GPU targets, and
+  the pair-force question is still open.
 
 **Before starting, reread §23.1's kill criteria**, particularly *"the compiled runtime is
 not materially faster or easier to inspect than a straightforward Python prototype."* M4.1

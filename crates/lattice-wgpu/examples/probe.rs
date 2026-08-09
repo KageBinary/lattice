@@ -35,6 +35,35 @@ fn main() {
         }
     }
 
+    println!("\n-- readback latency: is it bandwidth or per-call cost? --");
+    // The benchmark harness sees ~25 ms per readback and sees it at every buffer size,
+    // which would make it a fixed sync cost rather than a transfer. Worth knowing which,
+    // because the two have completely different fixes: a faster copy, or fewer copies.
+    for elements in [1_024usize, 65_536, 1_048_576] {
+        let data = vec![1.0f64; elements];
+        let buffer = device.upload(&data, Usage::Readback).unwrap();
+        let mut out = vec![0.0; elements];
+
+        // First call separately: it pays for whatever the driver initializes lazily.
+        let start = std::time::Instant::now();
+        device.read(&buffer, &mut out).unwrap();
+        let first = start.elapsed();
+
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            device.read(&buffer, &mut out).unwrap();
+        }
+        let steady = start.elapsed() / 10;
+
+        println!(
+            "  {:>9} elements ({:>7.1} KiB): first {:>8.3?}, steady {:>8.3?}",
+            elements,
+            (elements * 4) as f64 / 1024.0,
+            first,
+            steady
+        );
+    }
+
     println!("\n-- what f32 storage costs before any arithmetic --");
     let values: Vec<f64> = (0..8).map(|k| 300.0 + f64::from(k) / 3.0).collect();
     let buffer = device.upload(&values, Usage::Resident).unwrap();

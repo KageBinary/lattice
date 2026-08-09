@@ -117,14 +117,37 @@ impl GpuDevice {
 
         require_precision(Backend::Wgpu, &capabilities, precision)?;
 
-        Ok(GpuDevice {
+        let opened = GpuDevice {
             device,
             queue,
             precision,
             capabilities,
             adapter_info,
             shaders: Mutex::new(KernelCache::new()),
-        })
+        };
+        opened.warm_up()?;
+        Ok(opened)
+    }
+
+    /// Force the driver to initialize its transfer path before anyone measures anything.
+    ///
+    /// A freshly opened device is not actually ready to use. The first buffer round trip on
+    /// this machine costs about **56 ms**; every subsequent one of the same size costs
+    /// **160 µs**. That cost is real and someone has to pay it, but attributing it to
+    /// whichever operation happened to go first makes that operation's measurement a lie —
+    /// the benchmark harness initially reported a 25 ms *readback* which was almost entirely
+    /// this, and the same latency would otherwise land in the first validation case and be
+    /// read as GPU slowness.
+    ///
+    /// So it is paid here, where it belongs and where §15.1's "measure end-to-end" already
+    /// accounts for it: opening a device is a setup cost, and this is part of opening a
+    /// device.
+    fn warm_up(&self) -> Result<(), DeviceError> {
+        let mut scratch = self.alloc(1, Usage::Readback)?;
+        self.write(&mut scratch, &[0.0])?;
+        let mut out = [0.0];
+        self.read(&scratch, &mut out)?;
+        Ok(())
     }
 
     /// The shader module for `source`, compiling it if this is the first request.

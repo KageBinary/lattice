@@ -19,6 +19,8 @@
 
 mod args;
 mod bench;
+#[cfg(feature = "gpu")]
+mod bench_gpu;
 mod demo;
 mod inspect;
 mod project;
@@ -135,12 +137,125 @@ fn cmd_validate(args: &Args) -> Result<ExitCode, String> {
 }
 
 fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
-    check_flags(args, &["scale", "threads", "compare", "json", "quiet"])?;
+    check_flags(args, &["scale", "threads", "backend", "compare", "json", "quiet"])?;
 
     let scale: usize = args.parsed_or("scale", 1)?;
     if scale == 0 {
         return Err("--scale must be at least 1".to_string());
     }
+
+    match args.value("backend").unwrap_or("cpu") {
+        "cpu" => cmd_bench_cpu(args, scale),
+        "gpu" => cmd_bench_gpu(args, scale),
+        other => Err(format!("--backend: `{other}` is not a backend; pass `cpu` or `gpu`")),
+    }
+}
+
+/// `lattice bench --backend gpu`.
+///
+/// Behind a feature flag, and absent rather than silently falling back to the CPU when it
+/// is not compiled in: a GPU number produced by the CPU would be the most misleading thing
+/// this harness could print.
+#[cfg(not(feature = "gpu"))]
+fn cmd_bench_gpu(_args: &Args, _scale: usize) -> Result<ExitCode, String> {
+    Err("this binary was built without the GPU backend; rebuild with `--features gpu`"
+        .to_string())
+}
+
+#[cfg(feature = "gpu")]
+fn cmd_bench_gpu(args: &Args, scale: usize) -> Result<ExitCode, String> {
+    if args.value("threads").is_some() {
+        return Err("--threads applies to the CPU backend; the GPU chooses its own schedule"
+            .to_string());
+    }
+
+    // Timed and printed because §15.1 says measure end-to-end, and this is the largest
+    // single cost in a short GPU run — enumerating adapters, creating a device, and
+    // forcing the driver's lazy initialization. It is paid once per process rather than
+    // once per step, which is exactly why it must be shown separately instead of folded
+    // into a throughput figure that would then depend on how long the run happened to be.
+    let open_start = std::time::Instant::now();
+    let device = lattice_wgpu::GpuDevice::open_default()
+        .map_err(|error| format!("could not open a GPU device: {error}"))?;
+    let device_open = open_start.elapsed();
+    let executed = bench_gpu::executed(&device);
+
+    let selected = match args.positional.first() {
+        Some(pattern) => bench_gpu::matching(pattern),
+        None => bench_gpu::all().to_vec(),
+    };
+    if selected.is_empty() {
+        let available: Vec<_> = bench_gpu::all().iter().map(|b| b.name).collect();
+        return Err(format!(
+            "no GPU benchmark matches `{}`; the GPU backend implements: {}",
+            args.positional.first().map(String::as_str).unwrap_or(""),
+            available.join(", ")
+        ));
+    }
+
+    println!("{}", bench::environment_for(&executed));
+    println!(
+        "device open {device_open:.3?} (once per process, not included in the phase tables below)"
+    );
+    if let Some(warning) = bench::build_warning() {
+        println!("\nWARNING: {warning}");
+    }
+
+    let compare = args.has("compare");
+    let sequential = lattice_ir::Executor::sequential();
+    let cpu_executed = bench::Executed::cpu(&sequential);
+
+    let mut artifact = RunArtifact::new("benchmark");
+    artifact.set_parameter("scale", scale);
+    artifact.set_parameter("backend", "gpu");
+    let mut results = lattice_observe::Json::array();
+    let mut all_valid = true;
+    let mut valid_count = 0usize;
+
+    for benchmark in &selected {
+        let info = benchmark.info();
+        // The CPU baseline runs first for the same reason it does on the CPU path: the
+        // measured run gets the warm cache, which biases the ratio down.
+        let baseline = compare
+            .then(|| bench::matching(info.name).first().map(|cpu| (cpu.run)(scale, &sequential)))
+            .flatten();
+        let outcome = (benchmark.run)(scale, &device)
+            .map_err(|error| format!("{} failed on the GPU: {error}", info.name))?;
+
+        all_valid &= outcome.valid();
+        if let Some(baseline) = &baseline {
+            all_valid &= baseline.valid();
+        }
+
+        if !args.has("quiet") {
+            if let Some(baseline) = &baseline {
+                print!("{}", bench::report(info, scale, &cpu_executed, baseline));
+            }
+            print!("{}", bench::report(info, scale, &executed, &outcome));
+            if let Some(baseline) = &baseline {
+                print!(
+                    "{}",
+                    bench::speedup_report((&cpu_executed, baseline), (&executed, &outcome))
+                );
+            }
+        }
+
+        valid_count += usize::from(outcome.valid());
+        let mut json = bench::to_json(info, scale, &executed, &outcome);
+        if let Some(baseline) = &baseline {
+            json = json.set(
+                "cpu_baseline",
+                bench::to_json(info, scale, &cpu_executed, baseline),
+            );
+        }
+        results.push(json);
+    }
+    artifact.set_section("benchmarks", results);
+
+    finish_bench(args, artifact, all_valid, valid_count, selected.len())
+}
+
+fn cmd_bench_cpu(args: &Args, scale: usize) -> Result<ExitCode, String> {
     let executor = project::executor_from(args)?;
     let compare = args.has("compare");
     if compare && executor.is_sequential() {
@@ -161,18 +276,23 @@ fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
         ));
     }
 
-    println!("{}", bench::environment_for(&executor));
+    let executed = bench::Executed::cpu(&executor);
+    println!("{}", bench::environment_for(&executed));
     if let Some(warning) = bench::build_warning() {
         println!("\nWARNING: {warning}");
     }
 
     let mut artifact = RunArtifact::new("benchmark");
     artifact.set_parameter("scale", scale);
+    artifact.set_parameter("backend", "cpu");
     let mut results = lattice_observe::Json::array();
     let mut all_valid = true;
+    let mut valid_count = 0usize;
 
     let sequential = lattice_ir::Executor::sequential();
+    let sequential_executed = bench::Executed::cpu(&sequential);
     for benchmark in &selected {
+        let info = benchmark.info();
         // The baseline runs first when comparing, so the parallel run is the one with a
         // warm cache. That biases the speedup *down*, which is the direction a
         // performance claim should be biased.
@@ -185,27 +305,44 @@ fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
 
         if !args.has("quiet") {
             if let Some(baseline) = &baseline {
-                print!("{}", bench::report(benchmark, scale, &sequential, baseline));
+                print!("{}", bench::report(info, scale, &sequential_executed, baseline));
             }
-            print!("{}", bench::report(benchmark, scale, &executor, &outcome));
+            print!("{}", bench::report(info, scale, &executed, &outcome));
             if let Some(baseline) = &baseline {
-                print!("{}", bench::speedup_report(baseline, &outcome, &executor));
+                print!(
+                    "{}",
+                    bench::speedup_report(
+                        (&sequential_executed, baseline),
+                        (&executed, &outcome)
+                    )
+                );
             }
         }
 
-        let mut json = bench::to_json(benchmark, scale, &executor, &outcome);
+        valid_count += usize::from(outcome.valid());
+        let mut json = bench::to_json(info, scale, &executed, &outcome);
         if let Some(baseline) = &baseline {
-            json = json.set("sequential_baseline", bench::to_json(benchmark, scale, &sequential, baseline));
+            json = json.set(
+                "sequential_baseline",
+                bench::to_json(info, scale, &sequential_executed, baseline),
+            );
         }
         results.push(json);
     }
     artifact.set_section("benchmarks", results);
 
-    println!(
-        "\n{} of {} benchmarks met their correctness conditions",
-        selected.len() - usize::from(!all_valid),
-        selected.len()
-    );
+    finish_bench(args, artifact, all_valid, valid_count, selected.len())
+}
+
+/// The tail every `bench` path shares: the count, the artifact, and the exit code.
+fn finish_bench(
+    args: &Args,
+    artifact: RunArtifact,
+    all_valid: bool,
+    valid: usize,
+    total: usize,
+) -> Result<ExitCode, String> {
+    println!("\n{valid} of {total} benchmarks met their correctness conditions");
 
     if let Some(path) = args.value("json") {
         artifact.write(path).map_err(|e| format!("cannot write {path}: {e}"))?;
@@ -317,7 +454,9 @@ COMMANDS
   bench [<pattern>]        run benchmarks, reporting throughput and correctness together
     --scale <n>              problem-size multiplier (default 1)
     --threads <n|auto>       split solver loops across n threads (default 1)
-    --compare                also run sequentially and report the measured speedup
+    --backend <cpu|gpu>      which backend runs the kernels (default cpu; gpu needs
+                             a build with --features gpu, and runs fast32)
+    --compare                also run the sequential CPU baseline and report the speedup
     --json <path>            write a machine-readable report
     --quiet                  suppress the text report
 
@@ -340,6 +479,7 @@ EXAMPLES
   lattice validate --filter grid2d --json runs/validation.json
   lattice bench heat --scale 2
   lattice bench heat-explicit --threads auto --compare
+  lattice bench heat-explicit --backend gpu --compare
   lattice demo oscillator
   lattice demo heat-gaussian --steps 800 --json runs/heat.json
   lattice inspect contracts

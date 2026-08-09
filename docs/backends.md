@@ -132,6 +132,73 @@ storage together, and nobody could say which part belonged to which cause. The t
 of claim stay visibly different kinds of statement rather than one weakened into the other:
 `execution.md`'s cases assert equality of IEEE bit patterns and carry no tolerance at all.
 
+## What it costs, measured
+
+`lattice bench heat-explicit --backend gpu`, 400 explicit steps, best of three runs in
+separate processes on an RTX 4070 Laptop GPU through Vulkan and a 20-thread desktop CPU.
+§19.3 wants the hardware, backend and precision beside any number, and `lattice bench`
+prints all three.
+
+| Grid | cpu-scalar (f64) | cpu, 20 threads (f64) | wgpu (f32) | vs scalar | vs 20 threads |
+|---|---|---|---|---|---|
+| 256² | 102.8 ms | 37.5 ms | **3.87 ms** | 26.6× | 9.7× |
+| 512² | 403.3 ms | 95.5 ms | **5.86 ms** | 68.8× | 16.3× |
+| 1024² | 1971 ms | 424.3 ms | **15.1 ms** | 130.3× | 28.0× |
+
+**Half of that ratio is precision, not hardware.** The GPU stores `f32` and the CPU `f64`,
+and both are bandwidth-bound, so the GPU moves half the bytes per cell before any
+architectural advantage applies. `lattice bench --compare` prints a note saying exactly
+this whenever the two sides ran at different precisions, because a speedup between two
+different answers is not a speedup.
+
+At 1024² the kernel does 27.7 G element-updates/s, which at a minimum of 8 bytes of DRAM
+traffic per cell per step is about 222 GB/s against the adapter's ~256 GB/s. That is the
+wall, and it is the same wall §15.6's CPU numbers hit — [execution.md](execution.md)'s
+"five times on twenty threads is not a disappointment" applies here for the same reason.
+
+### The number that matters more
+
+§15.1: *"Measure end-to-end: include model compile time, upload/download, solver work […]
+not kernel time alone."* Total process wall time, best of three:
+
+| Grid | CPU process | GPU process | |
+|---|---|---|---|
+| 256² | **235 ms** | 958 ms | GPU 4.1× *slower* |
+| 512² | **569 ms** | 974 ms | GPU 1.7× *slower* |
+| 1024² | 2269 ms | **1192 ms** | GPU 1.9× faster |
+
+Opening a device costs **0.72–0.82 s** on this machine — enumerating adapters, creating a
+device, and forcing the driver's lazy initialization — and it is paid once per process
+whatever the grid size. For a 400-step benchmark that dominates everything: the GPU wins
+the kernel by two orders of magnitude and loses the *program* at 256² and 512².
+
+Neither number is the honest one on its own, so both are printed. A real simulation runs
+far more than 400 steps, and the break-even follows directly: at 1024² the GPU saves about
+1.96 s per 400 steps, so it repays a 0.8 s device open in roughly **165 steps**. At 256² it
+saves 99 ms per 400 steps and needs about **3,200**.
+
+### What the measurement got wrong first
+
+Three times, and each one is the reason a number above is trustworthy now.
+
+**A 25 ms readback that was driver initialization.** The first buffer round trip on a fresh
+device costs ~56 ms; every subsequent one of the same size costs ~160 µs. Attributing that
+to whichever operation happened to go first made the first operation's measurement a lie,
+so `GpuDevice::open` now pays it deliberately and the benchmark warms each problem shape
+before timing it.
+
+**A 500 ms readback at 256² that was a unit-parsing bug in the measuring script**, which
+read `647.700 µs` as milliseconds. It was reproducible, it was size-inverted — 256² "slower"
+than 1024² — and it survived two rounds of plausible hypotheses about power states and
+dispatch overhead before an isolated harness showed the same operation taking 612 µs.
+A reproducible wrong number is not more trustworthy than a noisy one.
+
+**A speedup quoted from `--compare`.** Running both backends back to back in one process
+gave 40× at 1024² where separate best-of-three runs give 130×, because the CPU baseline
+leaves the machine in a different state. `--compare` is for a quick check; a published
+figure needs separate processes and best of three, which is what
+[execution.md](execution.md) already said and what this table does.
+
 ## The shape of the boundary
 
 `lattice-compute` has no dependencies, because everything in it is a boundary.
@@ -188,7 +255,15 @@ hundred crates, while `lattice check`, `run` and `validate` have no dependencies
 $ cargo run -p lattice-wgpu --example probe          # what this machine offers
 $ cargo run -p lattice-cli --features gpu -- validate --filter gpu
 $ cargo test -p lattice-wgpu                          # the backend's own properties
+
+$ cargo build --release -p lattice-cli --features gpu
+$ ./target/release/lattice bench heat-explicit --backend gpu --scale 4
+$ ./target/release/lattice bench heat-explicit --backend gpu --compare
 ```
+
+`--backend gpu` runs only the benchmarks that have GPU kernels — today that is
+`heat-explicit` alone — and says so rather than falling back to the CPU for the others. A
+GPU number produced by the CPU would be the most misleading thing the harness could print.
 
 Without `--features gpu` the GPU rows are **absent** from `lattice validate` — 45 cases
 rather than 48 — rather than reported as skipped-and-passing, which is how M3 handles the

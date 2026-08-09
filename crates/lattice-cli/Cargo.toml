@@ -17,9 +17,11 @@ path = "src/main.rs"
 # from `lattice validate` rather than reported as passing.
 [features]
 default = []
-gpu = ["lattice-validation/gpu"]
+gpu = ["lattice-validation/gpu", "dep:lattice-compute", "dep:lattice-wgpu"]
 
 [dependencies]
+lattice-compute = { workspace = true, optional = true }
+lattice-wgpu = { workspace = true, optional = true }
 lattice-ir.workspace = true
 lattice-units.workspace = true
 lattice-syntax.workspace = true
