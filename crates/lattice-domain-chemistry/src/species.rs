@@ -27,65 +27,18 @@
 
 use std::collections::BTreeMap;
 
-/// Standard atomic weights, in g/mol, for the elements a 2D teaching engine meets.
-///
-/// From the IUPAC 2021 abridged table. Conventional values are used where an element
-/// has no stable isotopic composition, and the fourth digit is beyond anything a
-/// reaction-balance check depends on.
-///
-/// Not the whole periodic table: an element that is not here produces a clear
-/// "unknown element" diagnostic rather than a silently wrong molar mass, and adding one
-/// is a one-line change.
-const ATOMIC_WEIGHTS: &[(&str, f64)] = &[
-    ("H", 1.008),
-    ("He", 4.0026),
-    ("Li", 6.94),
-    ("Be", 9.0122),
-    ("B", 10.81),
-    ("C", 12.011),
-    ("N", 14.007),
-    ("O", 15.999),
-    ("F", 18.998),
-    ("Ne", 20.180),
-    ("Na", 22.990),
-    ("Mg", 24.305),
-    ("Al", 26.982),
-    ("Si", 28.085),
-    ("P", 30.974),
-    ("S", 32.06),
-    ("Cl", 35.45),
-    ("Ar", 39.95),
-    ("K", 39.098),
-    ("Ca", 40.078),
-    ("Ti", 47.867),
-    ("Cr", 51.996),
-    ("Mn", 54.938),
-    ("Fe", 55.845),
-    ("Co", 58.933),
-    ("Ni", 58.693),
-    ("Cu", 63.546),
-    ("Zn", 65.38),
-    ("Br", 79.904),
-    ("Ag", 107.87),
-    ("I", 126.90),
-    ("Ba", 137.33),
-    ("Pt", 195.08),
-    ("Au", 196.97),
-    ("Hg", 200.59),
-    ("Pb", 207.2),
-];
-
 /// The standard atomic weight of an element, in kg/mol.
+///
+/// Backed by the full table in [`crate::elements`]. This was a 36-entry list of its own
+/// until the playground needed a periodic table to point at; keeping two would have meant
+/// an element the picker offers and the balance checker rejects.
 pub fn atomic_mass(symbol: &str) -> Option<f64> {
-    ATOMIC_WEIGHTS
-        .iter()
-        .find(|(name, _)| *name == symbol)
-        .map(|(_, grams_per_mole)| grams_per_mole / 1000.0)
+    crate::elements::by_symbol(symbol).map(crate::elements::Element::molar_mass)
 }
 
 /// Every element this build knows, for a diagnostic's "did you mean" list.
 pub fn known_elements() -> impl Iterator<Item = &'static str> {
-    ATOMIC_WEIGHTS.iter().map(|(symbol, _)| *symbol)
+    crate::elements::all().iter().map(|element| element.symbol)
 }
 
 /// Why a formula could not be read.
