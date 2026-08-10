@@ -226,6 +226,45 @@ impl PlaygroundApp {
 
     /// The tool palette and the mode's sliders.
     fn controls(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        // Choices first. Picking the reaction changes what every control below it means,
+        // so it belongs above them rather than in the middle.
+        let choices = self.current().choices();
+        let mut chosen: Option<(usize, usize)> = None;
+        for (index, choice) in choices.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.colored_label(palette.text_secondary, &choice.name);
+                let current = choice
+                    .options
+                    .get(choice.selected)
+                    .cloned()
+                    .unwrap_or_default();
+                egui::ComboBox::from_id_salt(("choice", index))
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (option, label) in choice.options.iter().enumerate() {
+                            if ui
+                                .selectable_label(option == choice.selected, label)
+                                .clicked()
+                            {
+                                chosen = Some((index, option));
+                            }
+                        }
+                    });
+            });
+            if !choice.detail.is_empty() {
+                ui.colored_label(palette.text_muted, &choice.detail);
+            }
+        }
+        if let Some((index, option)) = chosen {
+            self.current_mut().set_choice(index, option);
+            // The tool palette is rebuilt from the new selection, and the old index may
+            // no longer exist — a recipe with two reactants followed by one with three.
+            self.tool = 0;
+        }
+        if !choices.is_empty() {
+            ui.add_space(6.0);
+        }
+
         let tools = self.current().tools();
         if !tools.is_empty() {
             ui.horizontal_wrapped(|ui| {

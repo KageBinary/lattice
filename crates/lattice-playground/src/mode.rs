@@ -110,6 +110,42 @@ impl Toggle {
     }
 }
 
+/// A one-of-many choice a mode exposes.
+///
+/// The third control type, after [`Knob`] and [`Toggle`], and it exists for the same reason
+/// [`Toggle`] does: a dozen reactions on a slider would be a lie about the value space. There
+/// is no reaction halfway between burning magnesium and making ammonia, and a control that
+/// implies one is a control that has to be explained away.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Choice {
+    /// The label.
+    pub name: String,
+    /// What can be picked, in display order.
+    pub options: Vec<String>,
+    /// Index into [`Choice::options`].
+    pub selected: usize,
+    /// One line about the current selection, shown underneath.
+    pub detail: String,
+}
+
+impl Choice {
+    /// A choice among `options`, currently on `selected`.
+    pub fn new(name: impl Into<String>, options: Vec<String>, selected: usize) -> Choice {
+        Choice {
+            name: name.into(),
+            options,
+            selected,
+            detail: String::new(),
+        }
+    }
+
+    /// Attach the line shown under the control.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Choice {
+        self.detail = detail.into();
+        self
+    }
+}
+
 /// One property of whatever is currently selected.
 ///
 /// The per-object counterpart of [`Knob`]. A knob is a setting of the *scene* — gravity,
@@ -218,6 +254,16 @@ pub trait Playground {
 
     /// Apply a change to knob `index`.
     fn set_knob(&mut self, index: usize, value: f64);
+
+    /// The dropdowns to draw. Most modes have none.
+    fn choices(&self) -> Vec<Choice> {
+        Vec::new()
+    }
+
+    /// Apply a change to choice `index`, selecting its `option`.
+    fn set_choice(&mut self, index: usize, option: usize) {
+        let _ = (index, option);
+    }
 
     /// The checkboxes to draw. Most modes have none.
     fn toggles(&self) -> Vec<Toggle> {

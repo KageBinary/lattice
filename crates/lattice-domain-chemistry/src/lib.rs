@@ -32,12 +32,14 @@ pub mod elements;
 pub mod kinetics;
 pub mod network;
 pub mod rate;
+pub mod recipe;
 pub mod spatial;
 pub mod species;
 
 pub use elements::{Category, Element};
 pub use kinetics::{Integrator, Kinetics, KineticsReport, DEFAULT_ACCURACY, MAX_SUBSTEPS};
 pub use network::{Balance, Reaction, ReactionNetwork, Term};
+pub use recipe::{presets, Fidelity, Ingredient, Recipe, REFERENCE_TEMPERATURE};
 pub use rate::{mass_action_rate, RateLaw, Temperature, GAS_CONSTANT};
 pub use spatial::ReactingMixture;
 pub use species::{atomic_mass, Composition, FormulaError, Phase, Species};

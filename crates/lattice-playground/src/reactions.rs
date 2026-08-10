@@ -23,15 +23,13 @@
 //! answers instead of one.
 
 use eframe::egui;
-use lattice_domain_chemistry::{
-    RateLaw, ReactingMixture, Reaction, ReactionNetwork, Species, Term,
-};
+use lattice_domain_chemistry::{presets, ReactingMixture, Recipe};
 use lattice_domain_grid2d::{Diffusivity, HeatDomain, TimeScheme};
 use lattice_ir::{Arena, Domain, Grid2d, Observations, ScalarField, StepContext};
 use lattice_viewer::render::WorldView;
 use lattice_viewer::{render, Colormap, Palette};
 
-use crate::mode::{Knob, Playground, Pointer, Toggle, Tool};
+use crate::mode::{Choice, Knob, Playground, Pointer, Toggle, Tool};
 
 /// Areal heat capacity of the chamber contents, J/(m²·K).
 const HEAT_CAPACITY: f64 = 6.0e4;
@@ -51,31 +49,17 @@ const EXTENT: [f64; 2] = [1.0, 1.0];
 const BRUSH_STRENGTH: f64 = 60.0;
 
 /// What the brush paints.
+/// What the brush paints.
+///
+/// One variant per *reactant* of whichever recipe is loaded, plus heat. Indexed rather
+/// than named, because the species are now the recipe's and a fixed `A`/`B` pair could
+/// only ever describe one reaction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Brush {
-    ReactantA,
-    ReactantB,
+    /// Lay down the species at this index into the recipe's ingredients.
+    Paint(usize),
+    /// Add heat.
     Warmth,
-}
-
-impl Brush {
-    const ALL: [Brush; 3] = [Brush::ReactantA, Brush::ReactantB, Brush::Warmth];
-
-    fn label(self) -> &'static str {
-        match self {
-            Brush::ReactantA => "paint A",
-            Brush::ReactantB => "paint B",
-            Brush::Warmth => "warm it up",
-        }
-    }
-
-    fn hint(self) -> &'static str {
-        match self {
-            Brush::ReactantA => "drag to lay down reactant A; it reacts wherever it meets B",
-            Brush::ReactantB => "drag to lay down reactant B; right-click erases",
-            Brush::Warmth => "drag to add heat — hotter mixture reacts faster (Arrhenius)",
-        }
-    }
 }
 
 /// The reaction sandbox.
@@ -88,6 +72,14 @@ pub struct ReactionPlayground {
     /// Staging buffers for the two coupling directions, reused every step.
     heat_buffer: ScalarField,
     temperature_buffer: ScalarField,
+    /// The loaded reaction, and its index into [`presets`].
+    recipe: Recipe,
+    recipe_index: usize,
+    /// Which species the canvas draws when it is not drawing temperature.
+    ///
+    /// Defaults to the recipe's first product, which is what someone who just picked a
+    /// reaction wants to watch appear.
+    display: usize,
     brush: Brush,
     brush_radius: f64,
     rate: f64,
@@ -116,17 +108,23 @@ impl ReactionPlayground {
     /// An empty chamber at room temperature.
     pub fn new() -> ReactionPlayground {
         let grid = Grid2d::new(CELLS, CELLS, EXTENT);
+        let recipe = presets().swap_remove(0);
+        let display = recipe.products().first().copied().unwrap_or(0);
+        let (rate, activation) = (recipe.rate, recipe.activation_energy);
         let mut playground = ReactionPlayground {
-            mixture: ReactingMixture::new("chamber", grid, network(4.0, 25_000.0)),
+            mixture: ReactingMixture::new("chamber", grid, recipe.network(rate, activation)),
             heat: room_temperature(grid),
             arena: Arena::with_capacity(1 << 17),
             grid,
             heat_buffer: ScalarField::new(&grid, 1),
             temperature_buffer: ScalarField::new(&grid, 1),
-            brush: Brush::ReactantA,
+            recipe,
+            recipe_index: 0,
+            display,
+            brush: Brush::Paint(0),
             brush_radius: 0.08,
-            rate: 4.0,
-            activation: 25_000.0,
+            rate,
+            activation,
             hover: None,
             show_temperature: false,
             disturbances: 0,
@@ -136,14 +134,47 @@ impl ReactionPlayground {
         playground
     }
 
+    /// Load preset `index`, emptying the chamber.
+    ///
+    /// The concentrations are *not* carried across, unlike a rate change. Species mean
+    /// different things between recipes — index 1 is oxygen in one and iron(III) oxide in
+    /// the next — so copying them over would silently relabel whatever was on screen as
+    /// something it is not. Changing the reaction is changing the experiment.
+    fn load(&mut self, index: usize) {
+        let mut recipes = presets();
+        if index >= recipes.len() {
+            return;
+        }
+        let recipe = recipes.swap_remove(index);
+        self.display = recipe.products().first().copied().unwrap_or(0);
+        self.rate = recipe.rate;
+        self.activation = recipe.activation_energy;
+        self.recipe = recipe;
+        self.recipe_index = index;
+        self.brush = Brush::Paint(self.recipe.reactants().first().copied().unwrap_or(0));
+
+        self.mixture = ReactingMixture::new(
+            "chamber",
+            self.grid,
+            self.recipe.network(self.rate, self.activation),
+        );
+        self.heat = room_temperature(self.grid);
+        self.painted = 0.0;
+        self.disturbances += 1;
+    }
+
     /// Rebuild the mixture after a rate change.
     ///
     /// A rate constant is baked into the network at construction, so changing one means
     /// a new network. The concentrations are carried across, because a slider that
     /// wiped the scene would be a slider nobody dares touch.
     fn rebuild(&mut self) {
-        let mut fresh = ReactingMixture::new("chamber", self.grid, network(self.rate, self.activation));
-        for index in 0..3 {
+        let mut fresh = ReactingMixture::new(
+            "chamber",
+            self.grid,
+            self.recipe.network(self.rate, self.activation),
+        );
+        for index in 0..self.recipe.ingredients.len() {
             let (Some(from), Some(into)) =
                 (self.mixture.concentration(index), fresh.concentration_mut(index))
             else {
@@ -164,8 +195,7 @@ impl ReactionPlayground {
         let radius = self.brush_radius;
         let grid = self.grid;
         let field = match self.brush {
-            Brush::ReactantA => self.mixture.concentration_mut(0),
-            Brush::ReactantB => self.mixture.concentration_mut(1),
+            Brush::Paint(index) => self.mixture.concentration_mut(index),
             Brush::Warmth => Some(self.heat.field_mut()),
         };
         let Some(field) = field else { return };
@@ -207,23 +237,6 @@ impl ReactionPlayground {
 }
 
 /// `A + B -> C`, exothermic and temperature-dependent.
-fn network(rate: f64, activation: f64) -> ReactionNetwork {
-    let mut network = ReactionNetwork::new();
-    network.add_species(Species::new("A").with_formula("C").unwrap().with_diffusion(4e-4));
-    network.add_species(Species::new("B").with_formula("O").unwrap().with_diffusion(4e-4));
-    network.add_species(Species::new("C").with_formula("CO").unwrap().with_diffusion(2e-4));
-    network.add_reaction(
-        Reaction::new(
-            "combine",
-            vec![Term::new(0, 1.0), Term::new(1, 1.0)],
-            vec![Term::new(2, 1.0)],
-            RateLaw::mass_action(rate).with_activation_energy(activation),
-        )
-        .with_enthalpy(-2.0e5),
-    );
-    network
-}
-
 fn room_temperature(grid: Grid2d) -> HeatDomain {
     HeatDomain::new("temperature", grid, Diffusivity::Uniform(2e-4))
         .with_scheme(TimeScheme::CrankNicolson)
@@ -241,7 +254,63 @@ impl Playground for ReactionPlayground {
     }
 
     fn tools(&self) -> Vec<Tool> {
-        Brush::ALL.iter().map(|brush| Tool::new(brush.label(), brush.hint())).collect()
+        let mut tools: Vec<Tool> = self
+            .recipe
+            .reactants()
+            .into_iter()
+            .map(|index| {
+                let ingredient = &self.recipe.ingredients[index];
+                Tool::new(
+                    format!("paint {}", ingredient.formula),
+                    format!(
+                        "drag to lay down {} ({}); right-click erases",
+                        ingredient.name, ingredient.formula
+                    ),
+                )
+            })
+            .collect();
+        tools.push(Tool::new(
+            "warm it up",
+            "drag to add heat — a hotter mixture reacts faster (Arrhenius)",
+        ));
+        tools
+    }
+
+    fn choices(&self) -> Vec<Choice> {
+        let recipes = presets();
+        let mut out = vec![
+            Choice::new(
+                "reaction",
+                recipes.iter().map(|recipe| recipe.name.clone()).collect(),
+                self.recipe_index,
+            )
+            .with_detail(format!(
+                "{}
+{}",
+                self.recipe.description,
+                self.recipe.fidelity.caveat()
+            )),
+        ];
+        out.push(
+            Choice::new(
+                "draw",
+                self.recipe.ingredients.iter().map(|i| i.formula.clone()).collect(),
+                self.display,
+            )
+            .with_detail(format!(
+                "{} — the canvas shows this species unless 'show temperature' is on",
+                self.recipe.ingredients[self.display].name
+            )),
+        );
+        out
+    }
+
+    fn set_choice(&mut self, index: usize, option: usize) {
+        match index {
+            0 => self.load(option),
+            1 if option < self.recipe.ingredients.len() => self.display = option,
+            _ => {}
+        }
     }
 
     fn knobs(&self) -> Vec<Knob> {
@@ -301,7 +370,12 @@ impl Playground for ReactionPlayground {
 
     fn pointer(&mut self, pointer: Pointer, tool: usize) {
         self.hover = Some(pointer.world);
-        self.brush = Brush::ALL[tool.min(Brush::ALL.len() - 1)];
+        let reactants = self.recipe.reactants();
+        // The last tool is always warmth; everything before it is a reactant.
+        self.brush = match reactants.get(tool) {
+            Some(&species) => Brush::Paint(species),
+            None => Brush::Warmth,
+        };
 
         // Painting on press *and* while held, so a click deposits and a drag draws.
         if pointer.pressed || pointer.held {
@@ -349,7 +423,7 @@ impl Playground for ReactionPlayground {
             // whole thing mid-tone — a picture that says the vessel is uniformly full of
             // the product it does not contain.
             render::field_to_image_above(
-                self.mixture.concentration(2).expect("three species"),
+                self.mixture.concentration(self.display).expect("a loaded species"),
                 Colormap::Sequential,
                 palette.mode,
                 palette,
@@ -396,7 +470,11 @@ impl Playground for ReactionPlayground {
     }
 
     fn reset(&mut self) {
-        self.mixture = ReactingMixture::new("chamber", self.grid, network(self.rate, self.activation));
+        self.mixture = ReactingMixture::new(
+            "chamber",
+            self.grid,
+            self.recipe.network(self.rate, self.activation),
+        );
         self.heat = room_temperature(self.grid);
         self.painted = 0.0;
     }
@@ -437,19 +515,24 @@ mod tests {
         }
     }
 
-    /// Totals of A, B and C.
-    fn totals(playground: &ReactionPlayground) -> [f64; 3] {
-        [
-            playground.mixture.total(0),
-            playground.mixture.total(1),
-            playground.mixture.total(2),
-        ]
+    /// Totals of every species in the loaded recipe, in ingredient order.
+    fn totals(playground: &ReactionPlayground) -> Vec<f64> {
+        (0..playground.recipe.ingredients.len())
+            .map(|index| playground.mixture.total(index))
+            .collect()
+    }
+
+    /// Paint every reactant of the loaded recipe into the same spot.
+    fn paint_all_reactants(playground: &mut ReactionPlayground, at: [f64; 2]) {
+        for tool in 0..playground.recipe.reactants().len() {
+            playground.pointer(press(at), tool);
+        }
     }
 
     #[test]
     fn a_fresh_chamber_is_empty_and_at_room_temperature() {
         let playground = ReactionPlayground::new();
-        assert_eq!(totals(&playground), [0.0, 0.0, 0.0]);
+        assert!(totals(&playground).iter().all(|total| *total == 0.0));
         assert!((playground.heat.field().max_interior() - AMBIENT).abs() < 1e-9);
     }
 
@@ -461,10 +544,15 @@ mod tests {
         playground.pointer(press([0.5, 0.5]), 0);
         run(&mut playground, 4.0);
 
-        let [a, b, c] = totals(&playground);
-        assert!(a > 0.0, "A was painted");
-        assert_eq!(b, 0.0);
-        assert!(c < 1e-12, "made {c} of product out of one reactant");
+        let totals = totals(&playground);
+        let reactants = playground.recipe.reactants();
+        assert!(totals[reactants[0]] > 0.0, "the first reactant was painted");
+        for &other in &reactants[1..] {
+            assert_eq!(totals[other], 0.0, "nothing else was painted");
+        }
+        for product in playground.recipe.products() {
+            assert!(totals[product] < 1e-12, "made {} of product", totals[product]);
+        }
         assert!(
             (playground.heat.field().max_interior() - 300.0).abs() < 1e-6,
             "and released no heat"
@@ -474,12 +562,12 @@ mod tests {
     #[test]
     fn two_reactants_in_the_same_place_react_and_heat() {
         let mut playground = ReactionPlayground::new();
-        playground.pointer(press([0.5, 0.5]), 0);
-        playground.pointer(press([0.5, 0.5]), 1);
+        paint_all_reactants(&mut playground, [0.5, 0.5]);
         run(&mut playground, 4.0);
 
-        let [_, _, c] = totals(&playground);
-        assert!(c > 0.0, "no product");
+        let totals = totals(&playground);
+        let product = playground.recipe.products()[0];
+        assert!(totals[product] > 0.0, "no product");
         assert!(
             playground.heat.field().max_interior() > 300.5,
             "exothermic, so the chamber should be warmer than {:.2} K",
@@ -494,47 +582,125 @@ mod tests {
     #[test]
     fn the_stoichiometry_balances() {
         let mut playground = ReactionPlayground::new();
-        playground.pointer(press([0.5, 0.5]), 0);
-        playground.pointer(press([0.5, 0.5]), 1);
+        paint_all_reactants(&mut playground, [0.5, 0.5]);
         let before = totals(&playground);
         run(&mut playground, 3.0);
         let after = totals(&playground);
 
-        let (used_a, used_b, made_c) = (
-            before[0] - after[0],
-            before[1] - after[1],
-            after[2] - before[2],
-        );
-        assert!(made_c > 1e-3, "nothing happened to measure");
-        let scale = made_c.abs();
-        assert!(
-            (used_a - made_c).abs() / scale < 1e-6,
-            "consumed {used_a} of A to make {made_c} of C"
-        );
-        assert!(
-            (used_b - made_c).abs() / scale < 1e-6,
-            "consumed {used_b} of B to make {made_c} of C"
-        );
+        // Every species change divided by its stoichiometric coefficient must be the
+        // same number: that is what a balanced equation *means*. The old form compared
+        // raw totals, which only worked because every coefficient happened to be one.
+        let recipe = &playground.recipe;
+        let extents: Vec<f64> = recipe
+            .ingredients
+            .iter()
+            .enumerate()
+            .map(|(index, ingredient)| (after[index] - before[index]) / ingredient.coefficient)
+            .collect();
+
+        let extent = extents[0];
+        assert!(extent > 1e-3, "nothing happened to measure");
+        for (index, measured) in extents.iter().enumerate() {
+            assert!(
+                (measured - extent).abs() / extent < 1e-6,
+                "{} moved by {measured} of reaction extent, not {extent}",
+                recipe.ingredients[index].formula
+            );
+        }
+    }
+
+    /// Every preset must actually do something when its reactants meet, at its own
+    /// default rate. A recipe whose rate constant is off by three decades is a menu entry
+    /// that does nothing when picked, and nothing else in the suite would notice.
+    #[test]
+    fn every_preset_reacts_visibly_at_its_own_default_rate() {
+        for (index, recipe) in presets().into_iter().enumerate() {
+            let mut playground = ReactionPlayground::new();
+            playground.set_choice(0, index);
+            paint_all_reactants(&mut playground, [0.5, 0.5]);
+
+            let before = totals(&playground);
+            run(&mut playground, 4.0);
+            let after = totals(&playground);
+
+            let product = recipe.products()[0];
+            let made = after[product] - before[product];
+            assert!(
+                made > 1e-3,
+                "{} made only {made:.3e} of {} in four seconds",
+                recipe.name,
+                recipe.ingredients[product].formula
+            );
+            assert!(
+                after.iter().all(|total| total.is_finite()),
+                "{} went non-finite",
+                recipe.name
+            );
+        }
+    }
+
+    /// The sandbox sliders have to reach every preset own numbers, or picking one leaves
+    /// a control showing a value it cannot represent.
+    #[test]
+    fn every_preset_sits_inside_the_sandbox_sliders() {
+        let playground = ReactionPlayground::new();
+        let knobs = playground.knobs();
+        let rate = knobs.iter().find(|k| k.name == "rate").expect("a rate knob");
+        let activation = knobs.iter().find(|k| k.name == "activation").expect("an Ea knob");
+
+        for recipe in presets() {
+            assert!(
+                (rate.min..=rate.max).contains(&recipe.rate),
+                "rate {} of {} is outside the slider {}..{}",
+                recipe.rate,
+                recipe.name,
+                rate.min,
+                rate.max
+            );
+            let kilojoules = recipe.activation_energy / 1000.0;
+            assert!(
+                (activation.min..=activation.max).contains(&kilojoules),
+                "activation {kilojoules} kJ/mol of {} is outside {}..{}",
+                recipe.name,
+                activation.min,
+                activation.max
+            );
+        }
     }
 
     /// Arrhenius, which is the reason the temperature is a field the mixture reads
     /// rather than a number. A warmed patch must react faster than a cold one.
+    ///
+    /// Measured on a *slow, high-activation-energy* recipe rather than whatever happens to
+    /// be loaded first. Both halves of that matter. A high activation energy is where
+    /// Arrhenius has something to say — that is what the exponent multiplies — and a slow
+    /// reaction is where the answer is not pinned at "all of it reacted either way". On the
+    /// default recipe this same test measures an 18% gain, not because the physics is
+    /// weaker but because the cold case has already consumed most of its reactants.
     #[test]
     fn a_warmer_mixture_reacts_faster() {
-        fn product_after(warm: bool) -> f64 {
+        let steep = presets()
+            .iter()
+            .position(|recipe| recipe.name == "rusting iron")
+            .expect("a slow, high-activation-energy preset");
+
+        fn product_after(preset: usize, warm: bool) -> f64 {
             let mut playground = ReactionPlayground::new();
-            playground.pointer(press([0.5, 0.5]), 0);
-            playground.pointer(press([0.5, 0.5]), 1);
+            playground.set_choice(0, preset);
+            paint_all_reactants(&mut playground, [0.5, 0.5]);
             if warm {
+                // The warmth brush is always the tool after the last reactant.
+                let warmth = playground.recipe.reactants().len();
                 for _ in 0..20 {
-                    playground.pointer(press([0.5, 0.5]), 2);
+                    playground.pointer(press([0.5, 0.5]), warmth);
                 }
             }
             run(&mut playground, 1.0);
-            playground.mixture.total(2)
+            let product = playground.recipe.products()[0];
+            playground.mixture.total(product)
         }
 
-        let (cold, warm) = (product_after(false), product_after(true));
+        let (cold, warm) = (product_after(steep, false), product_after(steep, true));
         assert!(cold > 0.0, "the cold case should still react a little");
         assert!(
             warm > cold * 1.2,
@@ -594,7 +760,7 @@ mod tests {
         run(&mut playground, 1.0);
         playground.reset();
 
-        assert_eq!(totals(&playground), [0.0, 0.0, 0.0]);
+        assert!(totals(&playground).iter().all(|total| *total == 0.0));
         assert!((playground.heat.field().max_interior() - AMBIENT).abs() < 1e-9);
 
         playground.pointer(press([0.5, 0.5]), 0);

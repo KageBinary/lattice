@@ -20,7 +20,7 @@ Or, once built, `target\release\lattice-play.exe --mode heat`.
 | mode | what you do | what it demonstrates |
 |---|---|---|
 | `physics` | drop boxes, balls and wedges; drag them; throw them | contacts, friction, restitution, stacking |
-| `reactions` | paint two reactants together and warm them | mass action, Arrhenius, reaction–diffusion, the temperature coupling |
+| `reactions` | pick a real reaction, paint its reactants together and warm them | mass action, Arrhenius, reaction–diffusion, the temperature coupling |
 | `heat` | paint hot and cold spots | diffusion, and what "conserved" is a claim *about* |
 
 Left-drag always acts with the selected tool. Right-click always removes — a body, a
@@ -83,6 +83,50 @@ outliving the whole store, so `reset` clears the selection explicitly. A fresh s
 restarts its generation counters at zero, and without that line a handle held across a reset
 resolves cleanly against an unrelated new body. `a_reset_clears_the_selection` found that
 one.
+
+## Picking a reaction
+
+The reactions mode is a menu of twelve real reactions — hydrogen and oxygen, methane
+combustion, thermite, rusting, the Haber process — and the whole mode is built from
+whichever one is loaded. The brush tools are that recipe's reactants, the canvas draws a
+species you choose, and the sliders start at the recipe's own numbers.
+
+**Every reaction here is real, and its rate constant is not.** Stoichiometry and enthalpy
+of reaction are the tabulated values, and the balance is checked rather than trusted. But a
+real rate constant depends on phase, pressure, catalyst and mechanism, and most of these do
+not proceed by a single elementary step at all — methane does not meet two oxygen molecules
+and become carbon dioxide, it goes through a radical chain with dozens of steps. What a
+preset carries is a *mass-action caricature* with the right species, the right balance, the
+right heat, and a rate chosen so the thing is watchable. `Fidelity` says so and the panel
+prints it, because a number that is illustrative and labelled illustrative is a teaching
+tool, and the same number unlabelled is a lie with a decimal point in it.
+
+### Why a recipe quotes its rate at a temperature *and* a concentration
+
+Two normalizations, and both were forced by a test rather than foreseen.
+
+`RateLaw` takes the declared constant as the pre-exponential `A` in `k(T) = A·exp(−Ea/RT)`,
+which is the right primitive and the wrong thing to put in front of a reader. At 300 K that
+exponential is `4×10⁻⁵` for an activation energy of 25 kJ/mol and `1×10⁻⁷` for one of
+40 kJ/mol — so two recipes sharing an `A` differ in speed by 400×, and a menu specified that
+way has entries that visibly do nothing for a reason invisible in the number. Methane
+combustion made 1.6×10⁻⁴ of product where hydrogen made a chamber full.
+
+Then order. A mass-action constant's units are `(m²/mol)^(order−1)/s`. `4 Fe + 3 O₂` is
+seventh order, and at 60 mol/m² its rate carries a factor of `60⁷ ≈ 3×10¹²` that a
+third-order reaction does not.
+
+So a recipe quotes a **pseudo-first-order rate at room temperature and a working
+concentration**, in 1/s — "how fast is this, here, with this much of it" — and the
+mass-action constant is derived by undoing both factors. `rate = 6` then means the same
+speed in every recipe, whatever its order or activation energy, and the activation energy
+goes back to meaning the thing worth a slider: how sharply the reaction *accelerates* when
+you warm it.
+
+Changing the reaction empties the chamber. Concentrations are carried across a rate change,
+because a slider that wiped the scene is a slider nobody dares touch — but species index 1
+is oxygen in one recipe and iron(III) oxide in the next, so carrying them across a recipe
+change would silently relabel whatever was on screen as something it is not.
 
 ## What the panel will and will not claim
 
@@ -171,6 +215,6 @@ cursor by roughly one time constant, and releasing at its own speed feels weak.
   playground where the heat capacity is adjustable is one where "why did that not get
   hot" has two answers instead of one.
 - No way to save or load a scene. Everything is built by clicking, every time.
-- The interaction is covered by 60 unit tests driving `Playground::pointer` directly.
+- The interaction is covered by 62 unit tests driving `Playground::pointer` directly.
   Automated *end-to-end* capture of the real window is not reliable on this machine — see
   the note in `docs/development.md`.

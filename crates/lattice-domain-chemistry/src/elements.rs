@@ -126,6 +126,10 @@ pub fn by_number(number: u8) -> Option<&'static Element> {
     ELEMENTS.get(number.checked_sub(1)? as usize)
 }
 
+/// One table row. Eight fields because an element has eight facts worth carrying, and
+/// grouping them into sub-structs would make the table below unreadable — which is the
+/// only thing that table has to be.
+#[allow(clippy::too_many_arguments)]
 const fn e(
     number: u8,
     symbol: &'static str,

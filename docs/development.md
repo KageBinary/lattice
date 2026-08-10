@@ -34,7 +34,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test                      # 985 tests across 18 crates
+$ cargo test                      # 1025 tests across 18 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
@@ -122,7 +122,7 @@ by calling them. The rule that has worked: **drive the logic, not the pixels.**
 Everything a mode does in response to the pointer goes through `Playground::pointer`,
 which takes a plain `Pointer` struct and needs no window, no GPU and no event loop. So
 `a_throw_leaves_the_body_moving_at_the_hands_speed` constructs the press and the release
-directly and asserts on the resulting velocity. Fifty tests cover the click paths this
+directly and asserts on the resulting velocity. Sixty-two tests cover the click paths this
 way, and they run in the ordinary `cargo test`.
 
 Only `draw` needs a real `egui::Painter`, and it is deliberately thin — it reads state
