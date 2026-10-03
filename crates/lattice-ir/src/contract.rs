@@ -464,6 +464,17 @@ pub trait Domain: Send + DomainType {
         Vec::new()
     }
 
+    /// Results that are a function rather than a number — a radial distribution, a
+    /// spectrum — as accumulated so far.
+    ///
+    /// Called at the end of a run for the artifact, and by a viewer whenever it likes,
+    /// so it must be cheap enough to call between frames and must not change state.
+    /// The set of curves depends only on how the domain is configured: one that has
+    /// not accumulated anything yet publishes an empty curve rather than none.
+    fn curves(&self) -> Vec<crate::curve::Curve> {
+        Vec::new()
+    }
+
     /// The quantities this domain publishes to, or will accept from, a coupling edge
     /// (spec §14.1).
     ///

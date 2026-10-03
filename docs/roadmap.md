@@ -481,13 +481,81 @@ prints where its tolerance went is an inspectability claim — and did nothing m
 the first. M4.4 is the first milestone to move the first half *backwards* in an honest
 direction: it found a case where the GPU is worth 1.9× rather than 27×, and said so.
 
-## Outside the milestones: the playground
+### M4.5
 
 M4.5 implementation and remaining limitations are recorded in
 [the engineering report](m4-engineering-report.md). In particular, GPU rendering is
 available for uncoupled heat fields, and GPU particle execution is available through
 the Rust backend API and benchmark harness. Arbitrary mixed-domain GPU execution,
 GPU rigid bodies, and GPU chemistry remain outside the released backend scope.
+
+## M5 — Molecular and quantum (in progress)
+
+**Spec exit condition:** *"energy/norm tests and visual examples."* Two halves: the
+molecular module of §12.4, whose tests are energy tests, and `quantum2d` of §13.1, whose
+tests are norm tests. The molecular half is done.
+
+### M5.1 — Classical molecular dynamics ✅
+
+§12.4's table, row by row:
+
+| Component | Spec's initial choice | Built |
+|---|---|---|
+| Integrator | velocity Verlet | velocity Verlet; BAOAB when a Langevin bath is attached |
+| Neighbour search | cell list + optional skin | `NeighborList`: a cell list, optionally cached behind a Verlet skin with bonded exclusions |
+| Boundary | periodic/reflective/open | all three, with minimum-image geometry that bonds and angles respect across a periodic seam |
+| Thermostat | Langevin and simple velocity-rescaling | both, each with its own contract — a thermostatted run does not claim energy conservation |
+| Potentials | LJ, harmonic bond, soft repulsion, Coulomb cutoff | LJ (energy- or force-shifted), harmonic bonds and angles, soft repulsion. **Coulomb is not built** |
+| Analysis | energy, RDF, MSD, temperature, pressure | all five; the RDF is published as a curve |
+
+In the language: `temperature:`, `layout: serpentine`, `bonds:`, `angles:`,
+`thermostat:`, `skin:` and `analysis: rdf(…)` on a `particles` block, documented in
+[language.md](language.md). [`examples/argon.lattice`](../examples/argon.lattice) is
+liquid argon in a bath with its structure measured;
+[`examples/polymer.lattice`](../examples/polymer.lattice) is a microcanonical bead-spring
+chain.
+
+Nine validation cases (`lattice validate --filter molecular2d`): §19.2's *"Lennard–Jones
+energy conservation, radial distribution trends, and neighbor-list consistency"*, plus
+the reduced-mass bond period, bonded-chain energy, both thermostats against their exact
+results, and Ornstein–Uhlenbeck diffusion. Every tolerance is derived — from Verlet's
+phase error, from the chain's fastest mode, or from the counting statistics of the
+sample — and every case prints what it measured against what the derivation predicted.
+
+A new IR type came with it: `Curve`, a result that is a function rather than a number.
+`Domain::curves` publishes them, the run artifact carries them (inside the content hash),
+and `lattice run` plots them.
+
+### What M5.1 taught us
+
+- **A result nobody can read is not a result.** The RDF was accumulated correctly from the
+  first draft — and then discarded at the end of every run, because the artifact had a
+  timeline of numbers and nowhere to put a function. §21.1 lists *data output* beside
+  validation for a reason: the unit tests passed, the analysis existed, and a user who
+  asked for it got nothing back.
+- **Reserved words collide with arguments.** `rdf(every=10)` did not parse, because
+  `every` is the keyword `observe … every` uses. A keyword before `=` in an argument list
+  is now a parameter name, since nothing else can stand there.
+- **A statistical tolerance has to count the right thing.** The first Langevin case
+  assumed `2γt` independent samples where the kinetic energy's correlation time gives
+  `γt`, and the tolerance came out √2 too tight — tight enough that an honest run sat at
+  2.8 standard errors. Five seeds now average −0.6.
+- **Not every theoretical error is visible at every length.** The energy-shifted cutoff
+  injects an impulse at every crossing, and the force-shifted form exists to remove it —
+  but over two τ of a 100-atom fluid the energy-shifted error still converges at order
+  1.89. The case reports that number rather than the story it was expected to tell.
+
+### Where M5.2 starts
+
+- **`quantum2d`** — §13.1: a complex wavefunction on a grid, split-step Fourier where the
+  boundaries permit and Crank–Nicolson where they do not, imaginary-time eigenstates,
+  absorbing boundaries, and the norm, expectation and detector observables. §19.2's
+  quantum row is its validation list, and §25.2's double slit is its example.
+- **Coulomb with a declared cutoff** is the one §12.4 potential not built. A plain cutoff
+  on `1/r` is a poor approximation the contract would have to say a great deal about;
+  doing it properly is Ewald-shaped work.
+
+## Outside the milestones: the playground
 
 `lattice-play` is not in the specification. It exists because the spec describes a
 scientific instrument — write a model, compile it, run it, measure it — and someone who

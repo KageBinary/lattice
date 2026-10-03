@@ -196,6 +196,66 @@ pub fn sparkline(values: &[f64], width: usize) -> String {
     format!("{out}   [{min:.6e} .. {max:.6e}]{note}")
 }
 
+/// Render a curve `y(x)` as a point plot with both axes labelled.
+///
+/// Each column takes the mean of the points whose `x` falls in it, so a fine
+/// histogram is averaged rather than aliased. The vertical axis always includes zero
+/// when the data are non-negative: a radial distribution drawn from its own minimum
+/// would turn the empty core into a floor and hide that it is empty.
+pub fn plot(xs: &[f64], ys: &[f64], columns: usize, rows: usize) -> String {
+    let finite: Vec<(f64, f64)> =
+        xs.iter().zip(ys).filter(|(x, y)| x.is_finite() && y.is_finite()).map(|(x, y)| (*x, *y)).collect();
+    if finite.is_empty() {
+        return "  (no finite points)\n".to_string();
+    }
+    let (x_min, x_max) = finite.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+    let (mut y_min, y_max) =
+        finite.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+    if y_min >= 0.0 {
+        y_min = 0.0;
+    }
+    let x_span = (x_max - x_min).max(f64::MIN_POSITIVE);
+    let y_span = y_max - y_min;
+
+    let mut sums = vec![(0.0, 0u32); columns];
+    for &(x, y) in &finite {
+        let column = (((x - x_min) / x_span * columns as f64) as usize).min(columns - 1);
+        sums[column].0 += y;
+        sums[column].1 += 1;
+    }
+
+    let mut grid = vec![b' '; columns * rows];
+    for (column, &(sum, count)) in sums.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let mean = sum / f64::from(count);
+        let level = if y_span > 0.0 { (mean - y_min) / y_span } else { 0.5 };
+        let row = rows - 1 - ((level * (rows - 1) as f64).round() as usize).min(rows - 1);
+        grid[row * columns + column] = b'*';
+    }
+
+    let top = format_value(y_max);
+    let bottom = format_value(y_min);
+    let gutter = top.len().max(bottom.len());
+    let mut out = String::new();
+    for row in 0..rows {
+        let label = match row {
+            0 => top.as_str(),
+            r if r == rows - 1 => bottom.as_str(),
+            _ => "",
+        };
+        out.push_str(&format!("  {label:>gutter$} |"));
+        out.push_str(&String::from_utf8_lossy(&grid[row * columns..(row + 1) * columns]));
+        out.push('\n');
+    }
+    let left = format_value(x_min);
+    let right = format_value(x_max);
+    let pad = columns.saturating_sub(left.len() + right.len());
+    out.push_str(&format!("  {:gutter$}  {left}{:pad$}{right}\n", "", ""));
+    out
+}
+
 fn format_value(v: f64) -> String {
     if !v.is_finite() {
         format!("{v}")
@@ -216,6 +276,20 @@ mod tests {
         let mut field = ScalarField::new(&grid, 1);
         field.init_from_position(&grid, |[x, _]| x);
         (grid, field)
+    }
+
+    #[test]
+    fn a_plot_puts_one_point_per_column_and_keeps_zero_on_the_axis() {
+        let xs: Vec<f64> = (0..40).map(f64::from).collect();
+        let ys: Vec<f64> = xs.iter().map(|x| if *x < 10.0 { 0.0 } else { 1.0 + (x / 5.0).sin() }).collect();
+        let text = plot(&xs, &ys, 20, 6);
+        let rows: Vec<&str> = text.lines().filter(|l| l.contains('|')).collect();
+        assert_eq!(rows.len(), 6);
+        let points = text.matches('*').count();
+        assert_eq!(points, 20, "{text}");
+        // The empty start sits on the bottom row, which is labelled zero.
+        assert!(rows[5].trim_start().starts_with("0.000000 |*****"), "{text}");
+        assert!(text.lines().last().unwrap().contains("39.000000"), "{text}");
     }
 
     #[test]

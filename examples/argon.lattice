@@ -1,0 +1,49 @@
+// Liquid argon in a Langevin bath, and the structure it settles into.
+//
+// 400 argon atoms start on a square lattice at 94 K and a reduced density of 0.7.
+// The bath holds the temperature while the lattice melts, and the radial
+// distribution function records the liquid that results: nothing inside the
+// repulsive core, a first shell near the pair minimum 2^(1/6) sigma = 3.82 Å,
+// fading shells beyond, and g(r) -> 1 at long range.
+//
+// Total energy is *not* reported as conserved here — energy flows through the
+// bath on purpose, and the solver contract says so.
+//
+//   lattice run examples/argon.lattice
+
+project argon {
+  dimensions: 2;
+  fidelity: molecular;
+  duration: 50 picosecond;
+
+  particles atoms {
+    count:   400;
+    region:  [8.14 nanometer, 8.14 nanometer];
+    spacing: 4.07 angstrom;
+    mass:    39.948 dalton;
+
+    // A Maxwell distribution at exactly 94 K with zero net momentum.
+    temperature: 94 kelvin;
+    seed:        20261003;
+
+    boundary: periodic;
+
+    // epsilon / k_B = 119.8 K. Force-shifted so that the step the force takes at
+    // the cutoff does not inject energy the bath would then have to remove.
+    force: lennard_jones(epsilon=1.654e-21 joule, sigma=3.405 angstrom,
+                         cutoff=8.5 angstrom, truncation=force_shift);
+
+    // Pairs are cached out to the cutoff plus this skin and rebuilt only when
+    // some atom has moved half of it.
+    skin: 1 angstrom;
+
+    thermostat: langevin(temperature=94 kelvin, friction=1 / picosecond);
+    // Sampled every 10 steps once the first 10 ps (1000 steps) have melted the
+    // lattice, so the starting configuration is not averaged into the liquid.
+    analysis:   rdf(bins=100, range=1.5 nanometer, every=10, after=1000);
+  }
+
+  solve dynamics(atoms) with velocity_verlet(dt=10 femtosecond);
+
+  observe atoms every 1 picosecond;
+}

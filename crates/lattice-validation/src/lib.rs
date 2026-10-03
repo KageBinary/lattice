@@ -40,6 +40,7 @@ mod execution;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod heat;
+mod molecular;
 mod particles;
 mod rigid;
 
@@ -246,6 +247,7 @@ impl core::fmt::Debug for Case {
 pub fn all_cases() -> Vec<Case> {
     let mut cases = Vec::new();
     cases.extend_from_slice(particles::CASES);
+    cases.extend_from_slice(molecular::CASES);
     cases.extend_from_slice(heat::CASES);
     cases.extend_from_slice(rigid::CASES);
     cases.extend_from_slice(chemistry::CASES);

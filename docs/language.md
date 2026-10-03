@@ -184,10 +184,49 @@ momentum is exactly zero — which is what makes the momentum diagnostic meaning
 | `gravity` | a magnitude (downward) or a `[ax, ay]` vector; defaults to Earth |
 | `drag(coefficient=)` | mass per time |
 | `harmonic_well(center=, stiffness=)` | stiffness in N/m |
-| `lennard_jones(epsilon=, sigma=, cutoff=)` | cutoff defaults to 2.5σ |
+| `lennard_jones(epsilon=, sigma=, cutoff=, truncation=)` | cutoff defaults to 2.5σ; `truncation` is `energy_shift` (default) or `force_shift` |
+| `soft_repulsion(stiffness=, range=)` | `U = ½k(d − r)²` inside `range`; stiffness in N/m |
 
 `boundary:` is `periodic`, `reflective` or `open` (the default). A `region` is required
 for a periodic or reflective boundary, and for any force with a cutoff.
+
+### Molecular settings
+
+Spec §12.4's molecular module is the same `particles` block with more attached. A
+complete one is [`examples/argon.lattice`](../examples/argon.lattice); a bonded chain is
+[`examples/polymer.lattice`](../examples/polymer.lattice).
+
+```
+particles chain {
+  count:   64;
+  spacing: 3.8 angstrom;
+  layout:  serpentine;
+  mass:    100 dalton;
+  temperature: 300 kelvin;
+  seed:    64;
+
+  bonds:  chain(stiffness=100 newton/meter);
+  angles: chain(stiffness=2e-20 joule, angle=180 degree);
+  thermostat: langevin(temperature=300 kelvin, friction=1 / picosecond);
+  skin: 1 angstrom;
+  analysis: rdf(bins=100, range=1.5 nanometer, every=10, after=1000);
+}
+```
+
+| Setting | Meaning |
+|---|---|
+| `temperature:` | initial velocities from a Maxwell distribution, rescaled so the instantaneous temperature is exactly this with zero net momentum. Excludes `speed:` |
+| `layout:` | `lattice` (default) fills rows left to right; `serpentine` reverses every other row, so consecutive particles are always one `spacing` apart — what a chain needs to start unstrained |
+| `bonds:` | harmonic bonds. `chain(…)`, `ring(…)` or `pairs([[i, j], …], …)` over particle indices in placement order; `stiffness=` in N/m, `length=` defaults to `spacing`. Bonded pairs are excluded from pair forces unless `pair_forces=included` |
+| `angles:` | harmonic angles. `chain(…)`, `ring(…)` or `triples([[i, j, k], …], …)`; `stiffness=` in J/rad², `angle=` the rest angle at the middle particle |
+| `thermostat:` | `langevin(temperature=, friction=)` — BAOAB, samples the canonical ensemble, needs `velocity_verlet` — or `velocity_rescale(temperature=, relaxation=)` (alias `berendsen`), which does not |
+| `skin:` | cache pairs in a Verlet list out to cutoff + skin, rebuilt when any particle has moved half the skin. Results agree with rebuilding every step to round-off |
+| `analysis:` | `rdf(bins=, range=, every=, after=)` — a radial distribution sampled every `every` steps once `after` steps have passed. `range` may not exceed half a periodic box |
+
+A thermostatted run publishes total energy as a metric, not an invariant: energy flows
+through the bath on purpose, and reporting its drift as a conservation failure would be
+wrong. The radial distribution is published as a *curve* — `g(r)` against `r` — in the
+run artifact and at the end of `lattice run`.
 
 ## Rigid bodies
 
@@ -490,8 +529,8 @@ numbers.
 |---|---|
 | `domain fluid2d` | M4 |
 | `domain quantum2d`, `potential`, `wavepacket`, `detector` | M5 |
+| user-defined expressions and force laws (spec §8.3) | M6 |
 
 Stochastic kinetics (Gillespie) is not implemented either, but it has no syntax of its
 own — a `solve reactions(…) with gillespie(…)` would be the way in, and it reports an
 unknown method.
-| user-defined expressions and force laws (spec §8.3) | M6 |

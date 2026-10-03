@@ -90,6 +90,7 @@
 pub mod arena;
 pub mod bodies;
 pub mod contract;
+pub mod curve;
 pub mod diagnostics;
 pub mod graph;
 pub mod grid;
@@ -106,6 +107,7 @@ pub use bodies::{BodySpec, Motion, RigidBodyStore};
 /// dependency: the executor arrives through [`StepContext`], so the IR is where a
 /// solver already looks for it.
 pub use lattice_cpu::{Executor, Grain, Partition};
+pub use curve::Curve;
 pub use contract::{
     ContractGap, Domain, FidelityProfile, Precision, SolverContract, StabilityReason, StableStep,
     StepContext,
@@ -119,7 +121,8 @@ pub use grid::{
     Boundary, BoundaryError, BoundarySet, Grid2d, ScalarField, Side, VectorField,
 };
 pub use model::{
-    BufferKind, BufferPlan, BufferSpec, CompiledModel, DomainSpec, ObserverSpec, VisualSpec,
+    format_number, BufferKind, BufferPlan, BufferSpec, CompiledModel, DomainSpec, ObserverSpec,
+    VisualSpec,
 };
 pub use ids::{
     BodyId, BufferId, DomainId, FieldId, MaterialId, ObserverId, OperatorId, ParticleId,

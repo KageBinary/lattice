@@ -231,11 +231,31 @@ pub struct ObserverSpec {
     pub interval: Option<f64>,
 }
 
+/// Format a number for a report: plainly when it reads well that way, in scientific
+/// notation when it is very large or very small.
+///
+/// Rust's `Display` for `f64` never uses an exponent, so a 20 ps duration prints as
+/// `0.00000000002` and an argon mass as twenty-five zeros and a digit — correct, and
+/// unreadable. Six significant figures are kept in scientific form, with trailing
+/// zeros dropped, so `2e-11` stays `2e-11`.
+pub fn format_number(value: f64) -> String {
+    if !value.is_finite() || value == 0.0 || (1e-3..1e6).contains(&value.abs()) {
+        return format!("{value}");
+    }
+    let text = format!("{value:.5e}");
+    match text.split_once('e') {
+        Some((mantissa, exponent)) if mantissa.contains('.') => {
+            format!("{}e{exponent}", mantissa.trim_end_matches('0').trim_end_matches('.'))
+        }
+        _ => text,
+    }
+}
+
 impl ObserverSpec {
     /// How often this observer samples, for the report.
     pub fn cadence(&self) -> String {
         match self.interval {
-            Some(seconds) => format!("every {seconds} s"),
+            Some(seconds) => format!("every {} s", format_number(seconds)),
             None => "every step".to_string(),
         }
     }
@@ -298,10 +318,10 @@ impl CompiledModel {
         out.push_str(&format!("  guarantee    {}\n", self.fidelity.guarantee()));
         out.push_str(&format!("  precision    {}\n", self.precision.code()));
         if let Some(dt) = self.timestep {
-            out.push_str(&format!("  timestep     {dt} s\n"));
+            out.push_str(&format!("  timestep     {} s\n", format_number(dt)));
         }
         if let Some(duration) = self.duration {
-            out.push_str(&format!("  duration     {duration} s\n"));
+            out.push_str(&format!("  duration     {} s\n", format_number(duration)));
         }
 
         out.push_str(&format!("\ndomains ({})\n", self.domains.len()));
@@ -377,6 +397,17 @@ fn format_bytes(bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::graph::{Operation, OperationKind};
+
+    #[test]
+    fn numbers_read_plainly_until_they_need_an_exponent() {
+        assert_eq!(format_number(400.0), "400");
+        assert_eq!(format_number(0.05), "0.05");
+        assert_eq!(format_number(0.0), "0");
+        assert_eq!(format_number(2e-11), "2e-11");
+        assert_eq!(format_number(39.948 * 1.660_539_066_60e-27), "6.63352e-26");
+        assert_eq!(format_number(-1.5e9), "-1.5e9");
+        assert_eq!(format_number(f64::NAN), "NaN");
+    }
 
     #[test]
     fn buffer_sizes_account_for_the_halo() {

@@ -1,0 +1,41 @@
+// A bead-spring polymer: one chain, held together by bonds and stiffened by angles.
+//
+// 64 beads are laid out boustrophedon — left to right, then back — so consecutive
+// beads start exactly one spacing apart and every bond begins at its rest length.
+// Harmonic bonds join consecutive beads, harmonic angles resist bending at each
+// interior bead, and a soft repulsion keeps beads that are far apart along the
+// chain from passing through one another. Bonded neighbours are excluded from the
+// repulsion, so the bond is the only thing acting between them.
+//
+// No bath: this run is microcanonical, so total energy is an invariant and the
+// diagnostics hold it to the integrator's bound.
+//
+//   lattice run examples/polymer.lattice
+
+project polymer {
+  dimensions: 2;
+  fidelity: molecular;
+  duration: 5 picosecond;
+
+  particles beads {
+    count:   64;
+    region:  [5 nanometer, 5 nanometer];
+    origin:  [1 nanometer, 1 nanometer];
+    spacing: 3.8 angstrom;
+    layout:  serpentine;
+    mass:    100 dalton;
+
+    temperature: 300 kelvin;
+    seed:        64;
+
+    // The rest length is the placement spacing unless a `length` is given.
+    bonds:  chain(stiffness=100 newton/meter);
+    angles: chain(stiffness=2e-20 joule, angle=180 degree);
+
+    force: soft_repulsion(stiffness=20 newton/meter, range=3.8 angstrom);
+  }
+
+  solve dynamics(beads) with velocity_verlet(dt=2 femtosecond);
+
+  observe beads every 0.1 picosecond;
+}

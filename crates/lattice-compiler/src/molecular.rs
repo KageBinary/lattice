@@ -303,7 +303,7 @@ pub fn analysis(expr: &Expr, evaluator: &Evaluator<'_>, diagnostics: &mut Diagno
     };
     match call.name {
         "rdf" => {
-            call.reject_unknown(&["bins", "range", "every"], diagnostics);
+            call.reject_unknown(&["bins", "range", "every", "after"], diagnostics);
             let bins = call.require("bins", 0, diagnostics).and_then(|expr| {
                 let bins = evaluator.count(expr, "the bin count", diagnostics)?;
                 if bins == 0 {
@@ -330,7 +330,13 @@ pub fn analysis(expr: &Expr, evaluator: &Evaluator<'_>, diagnostics: &mut Diagno
                 }
                 Some(every as u64)
             });
-            Some(RdfRequest { bins: bins?, range: range?, every: every? })
+            // Optional: steps to discard first, so the starting configuration — usually
+            // a lattice — is not averaged into the structure of what it melts into.
+            let after = match call.named("after") {
+                Some(expr) => evaluator.count(expr, "the steps to discard before sampling", diagnostics)? as u64,
+                None => 0,
+            };
+            Some(RdfRequest { bins: bins?, range: range?, every: every?, after })
         }
         other => {
             unknown("analysis", other, call.span, ANALYSES, diagnostics);
@@ -538,7 +544,10 @@ mod tests {
     fn analyses_parse() {
         let (r, d, f) = with("rdf(bins=100, range=2 nanometer, every=5)", analysis);
         assert!(!d.has_errors(), "{}", d.render(&f));
-        assert_eq!(r, Some(RdfRequest { bins: 100, range: 2e-9, every: 5 }));
+        assert_eq!(r, Some(RdfRequest { bins: 100, range: 2e-9, every: 5, after: 0 }));
+        let (r, d, _) = with("rdf(bins=100, range=2 nanometer, every=5, after=2000)", analysis);
+        assert!(!d.has_errors());
+        assert_eq!(r.unwrap().after, 2000);
         let (r, d, _) = with("rdf(bins=100, range=2 nanometer, every=0)", analysis);
         assert!(r.is_none() && d.codes().contains(&"E0405"));
         let (r, d, _) = with("msd(every=1)", analysis);

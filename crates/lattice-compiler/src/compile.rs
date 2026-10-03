@@ -2126,8 +2126,9 @@ impl<'a> Compiler<'a> {
             parts.push(format!("started at {temperature} K"));
         }
         for request in &set.analyses {
+            let after = if request.after > 0 { format!(" after step {}", request.after) } else { String::new() };
             parts.push(format!(
-                "RDF: {} bins to {:.4e} m every {} steps",
+                "RDF: {} bins to {:.4e} m every {} steps{after}",
                 request.bins, request.range, request.every
             ));
         }
@@ -2139,7 +2140,7 @@ impl<'a> Compiler<'a> {
             family: domain.contract().name.to_string(),
             summary: format!(
                 "{} particles, mass {} kg, {:?} boundary, {forces}",
-                set.count, set.mass, set.boundary
+                set.count, lattice_ir::format_number(set.mass), set.boundary
             ),
             buffers: vec![buffer],
             contract: Some(domain.contract()),

@@ -174,6 +174,9 @@ pub struct RdfRequest {
     pub range: f64,
     /// Sample every this many steps.
     pub every: u64,
+    /// Steps to discard before the first sample, so a run that starts from a lattice
+    /// does not count the lattice. Zero samples from the start.
+    pub after: u64,
 }
 
 /// A 2D particle system.
@@ -819,13 +822,14 @@ const fn contract_for(integrator: Integrator, coupling: Coupling) -> SolverContr
                 "Lennard-Jones energy conservation in a periodic box",
                 "observed convergence order matches the declared order",
                 "neighbour-list consistency: a Verlet skin misses no pair",
-                "harmonic bond vibration period and bonded-chain energy conservation",
-                "harmonic angle bending period",
+                "harmonic bond vibration period at the reduced mass",
+                "bonded-chain energy conservation with bonds and angles",
+                "force-shifted Lennard-Jones energy error converges at second order",
             ],
             Coupling::Langevin => &[
                 "free particles equilibrate to the bath temperature",
                 "free-particle diffusion follows the Einstein relation D = k_B T / (m gamma)",
-                "the dilute-gas radial distribution matches the Boltzmann factor",
+                "a Lennard-Jones liquid's radial distribution: an empty core and a first shell at the pair minimum",
             ],
             Coupling::VelocityRescale => &[
                 "an ideal gas relaxes toward T0 by exactly the Berendsen recurrence",
@@ -925,6 +929,7 @@ impl Domain for ParticleDomain {
         }
         self.steps += 1;
         if let (Some(request), Some(rdf)) = (self.rdf_request, self.rdf.as_mut())
+            && self.steps > request.after
             && self.steps % request.every == 0
         {
             rdf.sample(&self.store);
@@ -996,6 +1001,32 @@ impl Domain for ParticleDomain {
         if let Some(list) = &self.neighbors {
             out.record_metric(format!("{prefix}.neighbor_rebuilds"), list.rebuilds() as f64, "1");
         }
+    }
+
+    fn curves(&self) -> Vec<lattice_ir::Curve> {
+        let Some(rdf) = &self.rdf else { return Vec::new() };
+        let result = rdf.result();
+        let mut curve = lattice_ir::Curve::new(
+            format!("{}.rdf", self.name),
+            ("r", "m"),
+            ("g(r)", "1"),
+            result.r.clone(),
+            result.g.clone(),
+        )
+        .note(format!("{} frames, bin width {:.4e} m", result.frames, result.bin_width))
+        .note(format!("mean number density {:.4e} /m^2", result.density));
+        if result.frames > 0
+            && let Some((r, g)) = result.peak()
+        {
+            curve = curve.note(format!("first maximum g = {g:.3} at r = {r:.4e} m"));
+        }
+        if self.bounds.is_some_and(|b| !b.is_fully_periodic()) {
+            curve = curve.note(
+                "normalized as for a homogeneous periodic box; near a wall the shells are cut \
+                 off and g falls below 1 for geometric rather than physical reasons",
+            );
+        }
+        vec![curve]
     }
 
     fn render_channels(&self) -> Vec<lattice_ir::RenderChannel<'_>> {
@@ -1365,7 +1396,7 @@ mod tests {
 
     #[test]
     fn a_radial_distribution_is_accumulated_on_its_cadence() {
-        let mut d = lennard_jones_gas(6, 1.5, None).with_rdf(RdfRequest { bins: 20, range: 4.0, every: 5 });
+        let mut d = lennard_jones_gas(6, 1.5, None).with_rdf(RdfRequest { bins: 20, range: 4.0, every: 5, after: 0 });
         d.initialize();
         assert!(d.radial_distribution().is_none(), "nothing sampled yet");
         let mut arena = Arena::with_capacity(0);
@@ -1376,6 +1407,27 @@ mod tests {
         assert_eq!(rdf.frames, 10);
         assert_eq!(rdf.g.len(), 20);
         assert!(rdf.counts.iter().sum::<u64>() > 0);
+    }
+
+    #[test]
+    fn a_requested_rdf_is_published_as_a_curve_before_and_after_sampling() {
+        assert!(lennard_jones_gas(4, 1.5, None).curves().is_empty(), "no request, no curve");
+
+        let mut d = lennard_jones_gas(6, 1.5, None).with_rdf(RdfRequest { bins: 20, range: 4.0, every: 5, after: 0 });
+        d.initialize();
+        // The set of curves depends on configuration, not on progress.
+        let empty = d.curves();
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].notes[0].starts_with("0 frames"), "{:?}", empty[0].notes);
+
+        let mut arena = Arena::with_capacity(0);
+        for _ in 0..50 {
+            d.advance(1e-3, &mut ctx(&mut arena));
+        }
+        let curve = &d.curves()[0];
+        assert_eq!(curve.name, format!("{}.rdf", d.name()));
+        assert_eq!((curve.x_label, curve.x_unit, curve.y_label), ("r", "m", "g(r)"));
+        assert_eq!(curve.y, d.radial_distribution().unwrap().g);
     }
 
     #[test]

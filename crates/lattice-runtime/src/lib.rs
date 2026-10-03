@@ -332,6 +332,11 @@ impl Simulation {
             .collect()
     }
 
+    /// Every curve across all domains, as accumulated so far.
+    pub fn curves(&self) -> Vec<lattice_ir::Curve> {
+        self.domains.iter().flat_map(|domain| domain.curves()).collect()
+    }
+
     /// The tightest stability constraint across all domains.
     ///
     /// Spec §9.1: domains *"report stability limits and preferred cadence"*, and the
@@ -570,6 +575,11 @@ impl Simulation {
         });
         if !stop.is_success() {
             artifact.warn(stop.describe());
+        }
+        // Curves summarize the whole run, so they are taken once, after the last step —
+        // including after a stop, where a partial result is still what was measured.
+        for curve in self.curves() {
+            artifact.add_curve(curve);
         }
 
         RunOutcome {

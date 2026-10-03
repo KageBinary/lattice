@@ -20,7 +20,7 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lattice_ir::{Observations, SolverContract};
+use lattice_ir::{Curve, Observations, SolverContract};
 
 use crate::json::Json;
 use crate::timing::{MemoryReport, Profile, Throughput};
@@ -48,6 +48,7 @@ pub struct RunArtifact {
     contracts: Vec<&'static SolverContract>,
     parameters: Json,
     timeline: Vec<TimelineSample>,
+    curves: Vec<Curve>,
     /// Timing profile. Excluded from the content hash.
     pub profile: Profile,
     /// Memory footprint. Excluded from the content hash.
@@ -74,6 +75,7 @@ impl RunArtifact {
             contracts: Vec::new(),
             parameters: Json::object(),
             timeline: Vec::new(),
+            curves: Vec::new(),
             profile: Profile::new(),
             memory: MemoryReport::new(),
             throughput: None,
@@ -142,6 +144,18 @@ impl RunArtifact {
         });
     }
 
+    /// Attach a curve a domain published, such as a radial distribution.
+    ///
+    /// Curves are physics, so they are covered by the content hash.
+    pub fn add_curve(&mut self, curve: Curve) {
+        self.curves.push(curve);
+    }
+
+    /// Curves attached so far.
+    pub fn curves(&self) -> &[Curve] {
+        &self.curves
+    }
+
     /// Set the throughput summary.
     pub fn set_throughput(&mut self, throughput: Throughput) {
         self.throughput = Some(throughput);
@@ -198,6 +212,15 @@ impl RunArtifact {
             );
         }
         root.insert("timeline", timeline);
+        // Absent rather than empty when there are none, so adding curves to the format
+        // did not change the hash of every run that has none.
+        if !self.curves.is_empty() {
+            let mut curves = Json::array();
+            for curve in &self.curves {
+                curves.push(curve_to_json(curve));
+            }
+            root.insert("curves", curves);
+        }
         root.insert("warnings", self.warnings.clone());
         root
     }
@@ -278,8 +301,23 @@ impl RunArtifact {
                 sample.step, sample.time
             ));
         }
+        for curve in self.curves.iter().filter(|c| c.has_non_finite()) {
+            out.push_str(&format!("NON-FINITE VALUE: curve `{}`\n", curve.name));
+        }
         out
     }
+}
+
+/// Serialize a curve.
+pub fn curve_to_json(curve: &Curve) -> Json {
+    let axis = |label: &str, unit: &str, values: &[f64]| {
+        Json::object().set("label", label).set("unit", unit).set("values", values.to_vec())
+    };
+    Json::object()
+        .set("name", curve.name.clone())
+        .set("x", axis(curve.x_label, curve.x_unit, &curve.x))
+        .set("y", axis(curve.y_label, curve.y_unit, &curve.y))
+        .set("notes", curve.notes.clone())
 }
 
 /// Serialize a solver contract.
@@ -387,6 +425,24 @@ mod tests {
         // The solver contract travels with the results.
         let solvers = json.get("solvers").unwrap();
         assert!(solvers.to_compact_string().contains("nothing happens"));
+    }
+
+    #[test]
+    fn curves_travel_with_their_axes_and_change_the_hash() {
+        let plain = artifact();
+        let mut with_curve = artifact();
+        with_curve.add_curve(
+            Curve::new("test.rdf", ("r", "m"), ("g(r)", "1"), vec![1.0, 2.0], vec![0.0, 1.0]).note("2 frames"),
+        );
+        let text = with_curve.to_json().to_compact_string();
+        assert!(text.contains("\"curves\""), "{text}");
+        assert!(text.contains("\"label\":\"g(r)\""), "{text}");
+        assert!(text.contains("2 frames"), "{text}");
+        assert!(!plain.to_json().to_compact_string().contains("\"curves\""), "absent when there are none");
+        assert_ne!(plain.content_hash(), with_curve.content_hash(), "a curve is physics");
+
+        with_curve.add_curve(Curve::new("test.bad", ("r", "m"), ("g", "1"), vec![1.0], vec![f64::NAN]));
+        assert!(with_curve.summary().contains("NON-FINITE VALUE: curve `test.bad`"));
     }
 
     /// The hash must be stable across runs of the same physics...

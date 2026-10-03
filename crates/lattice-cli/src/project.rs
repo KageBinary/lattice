@@ -129,6 +129,9 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
             print!("{}", render_channel(&channel));
         }
         print!("{}", timeline_plots(&outcome.artifact));
+        for curve in outcome.artifact.curves() {
+            print!("{}", render_curve(curve));
+        }
         println!();
         println!("{}", outcome.stop.describe());
         println!();
@@ -267,6 +270,22 @@ fn timeline_plots(artifact: &lattice_observe::RunArtifact) -> String {
             "  ({} more series in the run artifact)\n",
             names.len() - MAX_SERIES
         ));
+    }
+    out
+}
+
+/// Draw one curve, with its axes and how it was obtained.
+fn render_curve(curve: &lattice_ir::Curve) -> String {
+    let mut out = format!(
+        "\n  {} — {} [{}] against {} [{}]\n",
+        curve.name, curve.y_label, curve.y_unit, curve.x_label, curve.x_unit
+    );
+    out.push_str(&render::plot(&curve.x, &curve.y, 64, 12));
+    for note in &curve.notes {
+        out.push_str(&format!("  {note}\n"));
+    }
+    if curve.has_non_finite() {
+        out.push_str("  WARNING: this curve contains non-finite values\n");
     }
     out
 }
