@@ -19,12 +19,15 @@
 use std::time::Instant;
 
 use lattice_compute::{Device, DeviceError, Precision};
-use lattice_domain_grid2d::{gaussian, Diffusivity, HeatDomain, TimeScheme};
+use lattice_domain_grid2d::{Diffusivity, HeatDomain, TimeScheme, gaussian};
 use lattice_ir::{BoundarySet, Domain, Grid2d};
-use lattice_observe::{phase, MemoryReport, Profile, Throughput};
-use lattice_wgpu::{DiffusionSetup, GpuDevice, GpuDiffusion};
+use lattice_observe::{MemoryReport, Profile, Throughput, phase};
+use lattice_wgpu::{CrankNicolsonSetup, DiffusionSetup, GpuCrankNicolson, GpuDevice, GpuDiffusion};
 
 use crate::bench::{BenchOutcome, Check, Executed, Info};
+
+#[path = "bench_gpu_particles.rs"]
+mod particles;
 
 /// A benchmark that runs on a GPU device.
 #[derive(Clone, Copy)]
@@ -42,30 +45,65 @@ pub struct GpuBenchmark {
 impl GpuBenchmark {
     /// The backend-independent description.
     pub fn info(&self) -> Info {
-        Info { name: self.name, description: self.description, correctness: self.correctness }
+        Info {
+            name: self.name,
+            description: self.description,
+            correctness: self.correctness,
+        }
     }
 }
 
 /// Every benchmark with a GPU implementation.
 ///
-/// Deliberately short. `particles-gravity` and `particles-lj` have no GPU kernels, and
-/// `heat-crank-nicolson` needs conjugate gradient, whose inner products are the reduction
-/// this backend has not yet decided how to do. Listing them here with a CPU fallback behind
-/// them would report a GPU number for work that never touched the GPU.
+/// Still short. `particles-gravity` and `particles-lj` have no GPU kernels — §15.6's "local
+/// particles" and "Lennard-Jones MD" targets are GPU targets and the pair-force question is
+/// still open — and listing them here with a CPU fallback behind them would report a GPU
+/// number for work that never touched the GPU.
+///
+/// `heat-crank-nicolson` joined in M4.4. It is a different shape of benchmark from
+/// everything above it: the work per step is not fixed, because the number of conjugate
+/// gradient iterations depends on the problem, and each iteration stalls once on an
+/// eight-byte readback that §10.3's stopping rule requires. Both are reported.
 pub fn all() -> &'static [GpuBenchmark] {
-    &[GpuBenchmark {
-        name: "heat-explicit",
-        description: "explicit diffusion on a uniform grid, resident on the device — \
-                      the §15.6 'heat/diffusion grid' target",
-        correctness: "the field integral is conserved on a closed domain, to the bound \
-                      f32 rounding allows",
-        run: bench_heat_explicit,
-    }]
+    &[
+        GpuBenchmark {
+            name: "particles-gravity",
+            description: "resident velocity-Verlet particles in uniform gravity",
+            correctness: "analytic trajectories within accumulated f32 rounding",
+            run: particles::gravity,
+        },
+        GpuBenchmark {
+            name: "particles-lj",
+            description: "resident velocity-Verlet Lennard-Jones particles with sorted spatial bins",
+            correctness: "bounded shifted-potential energy and momentum drift; finite state",
+            run: particles::lj,
+        },
+        GpuBenchmark {
+            name: "heat-explicit",
+            description: "explicit diffusion on a uniform grid, resident on the device — \
+                          the §15.6 'heat/diffusion grid' target",
+            correctness: "the field integral is conserved on a closed domain, to the bound \
+                          f32 rounding allows",
+            run: bench_heat_explicit,
+        },
+        GpuBenchmark {
+            name: "heat-crank-nicolson",
+            description: "implicit diffusion with a device-resident conjugate-gradient \
+                          solve, at ten times the explicit stability limit",
+            correctness: "the integral is conserved, every linear solve converged, and the \
+                          residual tolerance was one f32 can reach",
+            run: bench_heat_implicit,
+        },
+    ]
 }
 
 /// Look up GPU benchmarks whose name contains `pattern`.
 pub fn matching(pattern: &str) -> Vec<GpuBenchmark> {
-    all().iter().copied().filter(|b| b.name.contains(pattern)).collect()
+    all()
+        .iter()
+        .copied()
+        .filter(|b| b.name.contains(pattern))
+        .collect()
 }
 
 /// How a GPU run was executed.
@@ -110,8 +148,10 @@ fn bench_heat_explicit(scale: usize, device: &GpuDevice) -> Result<BenchOutcome,
         let domain = heat_domain(side);
         let dt = 0.8 * domain.stable_step().max;
         let mut warm = build_solver(device, &domain, side)?;
-        warm.run(device, dt, 2).map_err(|error| DeviceError::Backend(error.to_string()))?;
-        warm.interior(device).map_err(|error| DeviceError::Backend(error.to_string()))?;
+        warm.run(device, dt, 2)
+            .map_err(|error| DeviceError::Backend(error.to_string()))?;
+        warm.interior(device)
+            .map_err(|error| DeviceError::Backend(error.to_string()))?;
         device.finish()?;
     }
 
@@ -130,19 +170,23 @@ fn bench_heat_explicit(scale: usize, device: &GpuDevice) -> Result<BenchOutcome,
     profile.record(phase::SETUP, setup_start.elapsed());
 
     let compute_start = Instant::now();
-    solver.run(device, dt, STEPS).map_err(|error| DeviceError::Backend(error.to_string()))?;
+    solver
+        .run(device, dt, STEPS)
+        .map_err(|error| DeviceError::Backend(error.to_string()))?;
     let compute = compute_start.elapsed();
     profile.record(phase::COMPUTE, compute);
 
     let readback_start = Instant::now();
-    let interior_values =
-        solver.interior(device).map_err(|error| DeviceError::Backend(error.to_string()))?;
+    let interior_values = solver
+        .interior(device)
+        .map_err(|error| DeviceError::Backend(error.to_string()))?;
     profile.record(phase::OBSERVE, readback_start.elapsed());
 
     let after: f64 = interior_values.iter().sum::<f64>() * cell_area;
     let drift = (after - before).abs() / before.abs();
-    let non_finite =
-        f64::from(u8::from(interior_values.iter().any(|value| !value.is_finite())));
+    let non_finite = f64::from(u8::from(
+        interior_values.iter().any(|value| !value.is_finite()),
+    ));
 
     let mut memory = MemoryReport::new();
     // Two ping-pong fields, two face arrays and a source, all at the device's width.
@@ -163,10 +207,171 @@ fn bench_heat_explicit(scale: usize, device: &GpuDevice) -> Result<BenchOutcome,
         profile,
         memory,
         checks: vec![
-            Check::new("relative integral drift on a closed domain", drift, drift_limit(STEPS)),
+            Check::new(
+                "relative integral drift on a closed domain",
+                drift,
+                drift_limit(STEPS),
+            ),
             Check::new("cells holding a non-finite value", non_finite, 0.0),
         ],
     })
+}
+
+/// Steps the implicit benchmark runs. Fewer than the explicit one's 400 because each is a
+/// solve, and matching the CPU `heat-crank-nicolson` benchmark exactly so the two figures
+/// are about the same work.
+const IMPLICIT_STEPS: usize = 100;
+
+/// How far past the explicit stability limit the implicit benchmark steps. Ten, matching the
+/// CPU benchmark — and the whole reason to pay for a solve.
+const OVER_LIMIT: f64 = 10.0;
+
+/// Implicit diffusion, solved on the device.
+///
+/// # What is being measured, and what a reader must not conclude from it
+///
+/// The throughput figure is steps per second, and a step here is *not* a fixed amount of
+/// work: it is a right-hand side assembly plus however many conjugate-gradient iterations
+/// the problem needs. Comparing it against `heat-explicit`'s steps per second compares two
+/// different quantities. The iteration count is published beside it for exactly that reason,
+/// and so is the readback count — §10.3 requires the residual history to be able to stop a
+/// run, and the only way to honour that on a device is to bring one scalar home per
+/// iteration.
+///
+/// The residual tolerance is not the CPU's. It cannot be: `1e-10` is three orders of
+/// magnitude below what `f32` can say about this operator, and asking for it would produce a
+/// run that hits its iteration cap every step and reports as a slow GPU rather than as a
+/// numerical impossibility. The floor is computed from the problem and the tolerance is set
+/// to ten times it, which is published as a correctness condition rather than buried.
+fn bench_heat_implicit(scale: usize, device: &GpuDevice) -> Result<BenchOutcome, DeviceError> {
+    let side = 256 * scale;
+    let mut profile = Profile::new();
+
+    let domain = heat_domain_implicit(side);
+    let dt = OVER_LIMIT * domain.operator().explicit_stability_limit().max;
+
+    // Everything lazy has to happen before the clock starts, for the reason
+    // `bench_heat_explicit` gives. An implicit solver compiles fifteen pipelines rather than
+    // two, so this matters more here, not less.
+    {
+        let mut warm = build_implicit(device, &domain, side, dt)?;
+        warm.step(device).map_err(backend)?;
+        warm.interior(device).map_err(backend)?;
+        device.finish()?;
+    }
+
+    let setup_start = Instant::now();
+    let domain = heat_domain_implicit(side);
+    let cell_area = domain.grid().cell_area();
+    let before: f64 = interior(domain.field()).iter().sum::<f64>() * cell_area;
+
+    let mut solver = build_implicit(device, &domain, side, dt)?;
+    device.finish()?;
+    profile.record(phase::SETUP, setup_start.elapsed());
+
+    let compute_start = Instant::now();
+    solver.run(device, IMPLICIT_STEPS).map_err(backend)?;
+    let compute = compute_start.elapsed();
+    profile.record(phase::COMPUTE, compute);
+
+    let readback_start = Instant::now();
+    let interior_values = solver.interior(device).map_err(backend)?;
+    profile.record(phase::OBSERVE, readback_start.elapsed());
+
+    let after: f64 = interior_values.iter().sum::<f64>() * cell_area;
+    let drift = (after - before).abs() / before.abs();
+    let non_finite = f64::from(u8::from(
+        interior_values.iter().any(|value| !value.is_finite()),
+    ));
+
+    let mut memory = MemoryReport::new();
+    let width = device.precision().state_bytes();
+    let cells = domain.field().len();
+    memory.record(
+        "device buffers",
+        // x, b, r, p, ap, plus the packed face and source coefficients.
+        (5 * cells + (side + 1) * side + side * (side + 1) + cells) * width,
+    );
+
+    let iterations = solver.total_iterations();
+    Ok(BenchOutcome {
+        throughput: Throughput {
+            steps: IMPLICIT_STEPS as u64,
+            simulated_seconds: dt * IMPLICIT_STEPS as f64,
+            wall_clock: compute,
+            elements: (side * side) as u64,
+        },
+        profile,
+        memory,
+        checks: vec![
+            // The integral drift bound is the explicit one plus what the solves are entitled
+            // to: each stops at a relative residual, and ||A^-1|| <= 1 carries that straight
+            // to the solution.
+            Check::new(
+                "relative integral drift on a closed domain",
+                drift,
+                drift_limit(IMPLICIT_STEPS) + IMPLICIT_STEPS as f64 * solver.tolerance(),
+            ),
+            Check::new("cells holding a non-finite value", non_finite, 0.0),
+            Check::new(
+                "steps whose linear solve did not converge",
+                solver.non_converged_steps() as f64,
+                0.0,
+            ),
+            // Not a correctness condition about the answer — one about the *question*. A run
+            // asking for less than the floor is not measuring the solver.
+            Check::new(
+                "residual tolerance below the f32 floor, as a ratio",
+                solver.tolerance_floor() / solver.tolerance(),
+                1.0,
+            ),
+            // Published as a check with a generous limit rather than as a note, because it is
+            // the quantity M4.5 would attack and a silent regression in it is invisible.
+            Check::new(
+                "conjugate-gradient iterations per step",
+                iterations as f64 / IMPLICIT_STEPS as f64,
+                64.0,
+            ),
+        ],
+    })
+}
+
+fn backend(error: impl core::fmt::Display) -> DeviceError {
+    DeviceError::Backend(error.to_string())
+}
+
+/// The same scene as [`heat_domain`], solved implicitly.
+fn heat_domain_implicit(side: usize) -> HeatDomain {
+    heat_domain(side).with_scheme(TimeScheme::CrankNicolson)
+}
+
+/// Build a device-resident implicit solver, at ten times the floor its precision allows.
+fn build_implicit(
+    device: &GpuDevice,
+    domain: &HeatDomain,
+    side: usize,
+    dt: f64,
+) -> Result<GpuCrankNicolson, DeviceError> {
+    let operator = domain.operator();
+    let field = domain.field();
+    let mut setup = CrankNicolsonSetup {
+        nx: side,
+        ny: side,
+        halo: field.halo(),
+        stride: field.stride(),
+        inv_dx2: operator.inv_dx2(),
+        inv_dy2: operator.inv_dy2(),
+        theta: TimeScheme::CrankNicolson.theta(),
+        dt,
+        field: field.as_slice(),
+        face_x: operator.face_x(),
+        face_y: operator.face_y(),
+        source: None,
+        tolerance: 0.0,
+        max_iterations: 500,
+    };
+    setup.tolerance = 10.0 * GpuCrankNicolson::floor_for(device.precision(), &setup);
+    GpuCrankNicolson::new(device, setup).map_err(backend)
 }
 
 /// The largest integral drift `f32` rounding can produce over `steps` steps.

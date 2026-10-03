@@ -27,10 +27,12 @@
 
 use std::time::Instant;
 
+mod schedule;
+
 use lattice_ir::{
     Arena, CompiledModel, Domain, Executor, Observations, StabilityReason, StableStep, StepContext,
 };
-use lattice_observe::{phase, Json, Profile, RunArtifact, Throughput};
+use lattice_observe::{Json, Profile, RunArtifact, Throughput, phase};
 
 /// The simulation clock.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -68,7 +70,10 @@ impl RunConfig {
     /// A configuration that halts on instability, which is what a user wants unless
     /// they are deliberately studying a blow-up.
     pub fn new() -> RunConfig {
-        RunConfig { stop_on_non_finite: true, ..RunConfig::default() }
+        RunConfig {
+            stop_on_non_finite: true,
+            ..RunConfig::default()
+        }
     }
 
     /// Take duration and timestep from a compiled model, keeping any override.
@@ -155,11 +160,20 @@ impl StopReason {
                  a step limit"
                     .to_string()
             }
-            StopReason::NonFinite { observation, step, time } => format!(
+            StopReason::NonFinite {
+                observation,
+                step,
+                time,
+            } => format!(
                 "HALTED: `{observation}` became non-finite at step {step} (t = {time:e} s). \
                  The run stopped there rather than filling the artifact with NaN"
             ),
-            StopReason::Unstable { domain, requested, limit, reason } => format!(
+            StopReason::Unstable {
+                domain,
+                requested,
+                limit,
+                reason,
+            } => format!(
                 "REFUSED: timestep {requested:e} s exceeds the stability limit {limit:e} s for \
                  domain `{domain}` ({}). Nothing was stepped — a clamped run would have \
                  finished and been wrong",
@@ -206,6 +220,7 @@ pub struct Simulation {
     /// is recorded in the artifact — parallel execution does not change the numbers
     /// (see `lattice_cpu`), but a reader should not have to take that on trust.
     executor: Executor,
+    schedule: Option<schedule::Schedule>,
     clock: Clock,
     observations: Observations,
     profile: Profile,
@@ -251,12 +266,18 @@ impl Simulation {
         // The buffer plan already decided how much scratch the model needs, which is
         // what keeps NFR-001 true: this is the last allocation before the hot loop.
         let arena = Arena::with_capacity(model.buffers.scratch_elements());
+        let schedule = schedule::Schedule::new(
+            &model.graph,
+            domains.len(),
+            model.buffers.scratch_elements(),
+        );
         Simulation {
             model,
             domains,
             coupler: lattice_coupling::Coupler::new(),
             arena,
             executor: Executor::sequential(),
+            schedule,
             clock: Clock::default(),
             observations: Observations::new(),
             profile: Profile::new(),
@@ -271,6 +292,9 @@ impl Simulation {
     /// configuration. One executor per simulation is also the arrangement that keeps
     /// the thread count a property of the run.
     pub fn with_executor(mut self, executor: Executor) -> Simulation {
+        if let Some(schedule) = &mut self.schedule {
+            schedule.enable_parallel(executor.threads());
+        }
         self.executor = executor;
         self
     }
@@ -302,7 +326,10 @@ impl Simulation {
 
     /// Every drawable channel across all domains (spec §7.3).
     pub fn render_channels(&self) -> Vec<lattice_ir::RenderChannel<'_>> {
-        self.domains.iter().flat_map(|domain| domain.render_channels()).collect()
+        self.domains
+            .iter()
+            .flat_map(|domain| domain.render_channels())
+            .collect()
     }
 
     /// The tightest stability constraint across all domains.
@@ -312,10 +339,10 @@ impl Simulation {
     /// whichever domain binds, so the answer to "why is my timestep so small?" names
     /// a mechanism rather than a number.
     pub fn stability(&self) -> StableStep {
-        self.domains
-            .iter()
-            .map(|domain| domain.stable_step())
-            .fold(StableStep::unconditional(f64::INFINITY), StableStep::tightest)
+        self.domains.iter().map(|domain| domain.stable_step()).fold(
+            StableStep::unconditional(f64::INFINITY),
+            StableStep::tightest,
+        )
     }
 
     /// The domain whose stability limit binds, if any does.
@@ -340,7 +367,11 @@ impl Simulation {
 
         // A preferred step of infinity means no domain expressed a preference, which
         // happens only when there are no domains at all.
-        let requested = if requested.is_finite() && requested > 0.0 { requested } else { 1e-3 };
+        let requested = if requested.is_finite() && requested > 0.0 {
+            requested
+        } else {
+            1e-3
+        };
 
         for domain in &self.domains {
             let limit = domain.stable_step();
@@ -361,24 +392,37 @@ impl Simulation {
     /// [`Simulation::run`] is the normal entry point; this exists for tests and for
     /// callers driving the clock themselves.
     pub fn step(&mut self, dt: f64) {
-        let mut context = StepContext {
-            time: self.clock.time,
-            step: self.clock.step,
-            arena: &mut self.arena,
-            executor: &self.executor,
-        };
-        for domain in &mut self.domains {
-            domain.prepare(&mut context);
-        }
-        for domain in &mut self.domains {
-            domain.advance(dt, &mut context);
+        if let Some(schedule) = &self.schedule {
+            schedule.step(
+                &mut self.domains,
+                &mut self.arena,
+                &self.executor,
+                self.clock.time,
+                self.clock.step,
+                dt,
+            );
+        } else {
+            let mut context = StepContext {
+                time: self.clock.time,
+                step: self.clock.step,
+                arena: &mut self.arena,
+                executor: &self.executor,
+            };
+            for domain in &mut self.domains {
+                domain.prepare(&mut context);
+            }
+            for domain in &mut self.domains {
+                domain.advance(dt, &mut context);
+            }
         }
 
         // Coupling runs *after* the domains, which makes this a loose staggered scheme
         // (§14.2): each domain advances on the latest state it was given, and what it
         // produces reaches its neighbours before the next step. One exchange is always
         // in flight, which is what the ledger's residual measures.
-        let report = self.coupler.exchange(&mut self.domains, self.clock.step, self.clock.time, dt);
+        let report = self
+            .coupler
+            .exchange(&mut self.domains, self.clock.step, self.clock.time, dt);
         for (edge, fault) in &report.faults {
             let message = format!("coupling edge `{edge}`: {fault}");
             if !self.coupling_faults.contains(&message) {
@@ -399,8 +443,8 @@ impl Simulation {
 
     /// Run to completion.
     pub fn run(&mut self, config: &RunConfig) -> RunOutcome {
-        let mut artifact = RunArtifact::new(self.model.name.clone())
-            .with_precision(self.model.precision.code());
+        let mut artifact =
+            RunArtifact::new(self.model.name.clone()).with_precision(self.model.precision.code());
         for domain in &self.model.domains {
             if let Some(contract) = domain.contract {
                 artifact.add_contract(contract);
@@ -429,7 +473,12 @@ impl Simulation {
             Ok(dt) => dt,
             Err(stop) => {
                 artifact.warn(stop.describe());
-                return RunOutcome { stop, clock: self.clock, timestep: 0.0, artifact };
+                return RunOutcome {
+                    stop,
+                    clock: self.clock,
+                    timestep: 0.0,
+                    artifact,
+                };
             }
         };
         artifact.set_parameter("timestep_seconds", timestep);
@@ -447,7 +496,12 @@ impl Simulation {
             (None, None) => {
                 let stop = StopReason::NoStoppingCondition;
                 artifact.warn(stop.describe());
-                return RunOutcome { stop, clock: self.clock, timestep, artifact };
+                return RunOutcome {
+                    stop,
+                    clock: self.clock,
+                    timestep,
+                    artifact,
+                };
             }
         };
 
@@ -505,7 +559,9 @@ impl Simulation {
         let elapsed = started.elapsed();
         self.profile.record(phase::COMPUTE, elapsed);
         artifact.profile = core::mem::take(&mut self.profile);
-        artifact.memory.record("planned buffers", self.model.buffers.total_bytes());
+        artifact
+            .memory
+            .record("planned buffers", self.model.buffers.total_bytes());
         artifact.set_throughput(Throughput {
             steps: self.clock.step,
             simulated_seconds: self.clock.time,
@@ -516,7 +572,12 @@ impl Simulation {
             artifact.warn(stop.describe());
         }
 
-        RunOutcome { stop, clock: self.clock, timestep, artifact }
+        RunOutcome {
+            stop,
+            clock: self.clock,
+            timestep,
+            artifact,
+        }
     }
 
     /// Degrees of freedom advanced per step, for the throughput report.
@@ -596,7 +657,11 @@ mod tests {
             if self.limit.is_infinite() {
                 StableStep::unconditional(self.preferred)
             } else {
-                StableStep::limited(self.preferred, self.limit, StabilityReason::DiffusionExplicit)
+                StableStep::limited(
+                    self.preferred,
+                    self.limit,
+                    StabilityReason::DiffusionExplicit,
+                )
             }
         }
         fn prepare(&mut self, _ctx: &mut StepContext<'_>) {}
@@ -614,7 +679,14 @@ mod tests {
 
     fn model_with(name: &str) -> CompiledModel {
         let mut buffers = BufferPlan::new();
-        buffers.allocate("state", BufferKind::ScalarField { nx: 8, ny: 8, halo: 1 });
+        buffers.allocate(
+            "state",
+            BufferKind::ScalarField {
+                nx: 8,
+                ny: 8,
+                halo: 1,
+            },
+        );
         buffers.require_scratch(64);
         CompiledModel {
             name: name.to_string(),
@@ -700,7 +772,12 @@ mod tests {
 
         let outcome = simulation.run(&RunConfig::new().with_duration(1.0).with_timestep(0.1));
         match &outcome.stop {
-            StopReason::Unstable { domain, requested, limit, .. } => {
+            StopReason::Unstable {
+                domain,
+                requested,
+                limit,
+                ..
+            } => {
                 assert_eq!(domain, "heat");
                 assert_eq!(*requested, 0.1);
                 assert!((*limit - 0.001).abs() < 1e-12);
@@ -710,7 +787,10 @@ mod tests {
         assert_eq!(outcome.clock.step, 0, "nothing should have been stepped");
         let text = outcome.stop.describe();
         assert!(text.contains("REFUSED"), "{text}");
-        assert!(text.contains("would have finished and been wrong"), "{text}");
+        assert!(
+            text.contains("would have finished and been wrong"),
+            "{text}"
+        );
     }
 
     /// NFR-007 again: the first non-finite value halts the run and is recorded.
@@ -722,14 +802,19 @@ mod tests {
 
         let outcome = simulation.run(&RunConfig::new().with_duration(10.0).with_timestep(0.1));
         match &outcome.stop {
-            StopReason::NonFinite { observation, step, .. } => {
+            StopReason::NonFinite {
+                observation, step, ..
+            } => {
                 assert_eq!(observation, "blowup.count");
                 assert_eq!(*step, 5);
             }
             other => panic!("{other:?}"),
         }
         assert!(!outcome.is_success());
-        assert_eq!(outcome.clock.step, 5, "the run stopped rather than continuing");
+        assert_eq!(
+            outcome.clock.step, 5,
+            "the run stopped rather than continuing"
+        );
         assert!(outcome.artifact.first_non_finite().is_some());
     }
 
@@ -751,8 +836,10 @@ mod tests {
 
     #[test]
     fn every_domain_is_advanced_each_step() {
-        let mut simulation =
-            simulation(vec![Box::new(Counter::new("a")), Box::new(Counter::new("b"))]);
+        let mut simulation = simulation(vec![
+            Box::new(Counter::new("a")),
+            Box::new(Counter::new("b")),
+        ]);
         simulation.run(&RunConfig::new().with_max_steps(4).with_timestep(0.1));
         simulation.observe();
         assert_eq!(simulation.observations().value("a.count"), Some(4.0));
@@ -769,7 +856,11 @@ mod tests {
         // 100 steps, sampled every 0.1 s: about ten samples plus the initial one.
         let samples = outcome.artifact.timeline().len();
         assert!((10..=13).contains(&samples), "got {samples} samples");
-        assert_eq!(outcome.artifact.timeline()[0].step, 0, "the initial state is recorded");
+        assert_eq!(
+            outcome.artifact.timeline()[0].step,
+            0,
+            "the initial state is recorded"
+        );
     }
 
     #[test]
@@ -777,7 +868,11 @@ mod tests {
         let mut simulation = simulation(vec![Box::new(Counter::new("a"))]);
         let config = RunConfig::new().with_max_steps(5).with_timestep(0.1);
         let outcome = simulation.run(&config);
-        assert_eq!(outcome.artifact.timeline().len(), 6, "five steps plus the initial state");
+        assert_eq!(
+            outcome.artifact.timeline().len(),
+            6,
+            "five steps plus the initial state"
+        );
     }
 
     #[test]
@@ -809,8 +904,7 @@ mod tests {
     fn runs_are_reproducible() {
         let hash_of = || {
             let mut simulation = simulation(vec![Box::new(Counter::new("a"))]);
-            let outcome =
-                simulation.run(&RunConfig::new().with_max_steps(20).with_timestep(0.05));
+            let outcome = simulation.run(&RunConfig::new().with_max_steps(20).with_timestep(0.05));
             outcome.artifact.content_hash()
         };
         assert_eq!(hash_of(), hash_of());
@@ -834,8 +928,7 @@ mod tests {
         let mut model = model_with("m");
         model.timestep = Some(0.02);
         let mut simulation = Simulation::new(model, vec![Box::new(Counter::new("a"))]);
-        let outcome =
-            simulation.run(&RunConfig::new().with_max_steps(1).with_timestep(0.5));
+        let outcome = simulation.run(&RunConfig::new().with_max_steps(1).with_timestep(0.5));
         assert!((outcome.timestep - 0.5).abs() < 1e-12);
     }
 
@@ -886,5 +979,185 @@ mod tests {
             .describe()
             .contains("HALTED")
         );
+    }
+
+    #[test]
+    fn graph_schedule_orders_dependencies_and_runs_independent_domains_concurrently() {
+        use lattice_ir::{DomainId, Operation, OperationKind};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Probe {
+            name: String,
+            entered: Arc<AtomicUsize>,
+            log: Arc<Mutex<Vec<String>>>,
+        }
+        impl Domain for Probe {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn contract(&self) -> &'static SolverContract {
+                &CONTRACT
+            }
+            fn stable_step(&self) -> StableStep {
+                StableStep::unconditional(0.1)
+            }
+            fn prepare(&mut self, _: &mut StepContext<'_>) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("prepare {}", self.name));
+            }
+            fn advance(&mut self, _: f64, ctx: &mut StepContext<'_>) {
+                assert_eq!(ctx.executor.threads(), 1, "no nested pool dispatch");
+                let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                while self.entered.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    self.entered.load(Ordering::SeqCst),
+                    2,
+                    "both independent advances must overlap"
+                );
+                let mut frame = ctx.arena.frame();
+                frame.alloc_zeroed(8)[0] = 42.0;
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("advance {}", self.name));
+            }
+            fn observe(&self, _: &mut Observations) {}
+        }
+        let mut model = model_with("dag");
+        let mut operations = Vec::new();
+        for index in 0..2 {
+            for kind in [OperationKind::Prepare, OperationKind::Advance] {
+                // No explicit buffers: ownership alone must order prepare before advance.
+                operations.push(
+                    Operation::new(format!("{kind:?} {index}"), kind)
+                        .in_domain(DomainId::from_index(index))
+                        .costing(65536.0),
+                );
+            }
+        }
+        model.graph = OperationGraph::build(operations);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let domains = (0..2)
+            .map(|index| {
+                Box::new(Probe {
+                    name: index.to_string(),
+                    entered: entered.clone(),
+                    log: log.clone(),
+                }) as Box<dyn Domain>
+            })
+            .collect();
+        let mut simulation =
+            Simulation::new(model, domains).with_executor(Executor::with_threads(2));
+        simulation.step(0.1);
+        let log = log.lock().unwrap();
+        assert!(log[..2].iter().all(|s| s.starts_with("prepare")), "{log:?}");
+        assert!(log[2..].iter().all(|s| s.starts_with("advance")), "{log:?}");
+    }
+
+    #[test]
+    fn graph_execution_preserves_the_scalar_artifact_hash() {
+        use lattice_ir::{DomainId, Operation, OperationKind};
+        let run = |threads| {
+            let mut model = model_with("deterministic dag");
+            model.graph = OperationGraph::build(
+                (0..3)
+                    .flat_map(|i| {
+                        [OperationKind::Prepare, OperationKind::Advance].map(|kind| {
+                            Operation::new(format!("{kind:?}{i}"), kind)
+                                .in_domain(DomainId::from_index(i))
+                                .costing(65536.0)
+                        })
+                    })
+                    .collect(),
+            );
+            let domains = (0..3)
+                .map(|i| Box::new(Counter::new(&format!("counter{i}"))) as Box<dyn Domain>)
+                .collect();
+            Simulation::new(model, domains)
+                .with_executor(Executor::with_threads(threads))
+                .run(&RunConfig::new().with_max_steps(20))
+                .artifact
+                .content_hash()
+        };
+        assert_eq!(run(1), run(3));
+    }
+
+    #[test]
+    fn a_small_cross_domain_dependency_keeps_advance_before_dependent_prepare() {
+        use lattice_ir::{BufferId, DomainId, Operation, OperationKind};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Dependent {
+            producer: bool,
+            ready: Arc<AtomicBool>,
+        }
+        impl Domain for Dependent {
+            fn name(&self) -> &str {
+                if self.producer {
+                    "producer"
+                } else {
+                    "consumer"
+                }
+            }
+            fn contract(&self) -> &'static SolverContract {
+                &CONTRACT
+            }
+            fn stable_step(&self) -> StableStep {
+                StableStep::unconditional(0.1)
+            }
+            fn prepare(&mut self, _: &mut StepContext<'_>) {
+                if !self.producer {
+                    assert!(self.ready.load(Ordering::SeqCst));
+                }
+            }
+            fn advance(&mut self, _: f64, _: &mut StepContext<'_>) {
+                if self.producer {
+                    self.ready.store(true, Ordering::SeqCst);
+                } else {
+                    self.ready.store(false, Ordering::SeqCst);
+                }
+            }
+            fn observe(&self, _: &mut Observations) {}
+        }
+        let mut model = model_with("cross-domain dependency");
+        let a = DomainId::from_index(0);
+        let b = DomainId::from_index(1);
+        let shared = BufferId::from_index(0);
+        model.graph = OperationGraph::build(vec![
+            Operation::new("prepare a", OperationKind::Prepare).in_domain(a),
+            Operation::new("advance a", OperationKind::Advance)
+                .in_domain(a)
+                .writing(shared),
+            Operation::new("prepare b", OperationKind::Prepare)
+                .in_domain(b)
+                .reading(shared),
+            Operation::new("advance b", OperationKind::Advance).in_domain(b),
+        ]);
+        let ready = Arc::new(AtomicBool::new(false));
+        let domains = [true, false]
+            .into_iter()
+            .map(|producer| {
+                Box::new(Dependent {
+                    producer,
+                    ready: ready.clone(),
+                }) as Box<dyn Domain>
+            })
+            .collect();
+        let mut simulation =
+            Simulation::new(model, domains).with_executor(Executor::with_threads(2));
+        for _ in 0..3 {
+            simulation.step(0.1);
+        }
+        assert!(!ready.load(Ordering::SeqCst));
     }
 }

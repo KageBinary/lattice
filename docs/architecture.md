@@ -434,8 +434,9 @@ and *drift*:
 
 `Reconciliation` compares a domain's observed change against what the ledger says it
 received, so a coupled run's energy imbalance becomes an attributable number rather
-than an unexplained one. Nothing couples yet — this is M3 machinery, built now because
-the diagnostics have to exist before the coupling does, not after.
+than an unexplained one. The M3 reacting chamber uses this accounting for reaction
+energy transferred into its heat field. Both headless execution and the CPU viewer
+preserve the compiler's coupling edges.
 
 ## Reproducibility
 
@@ -485,21 +486,38 @@ That is stated rather than papered over. The architectural line is drawn — the
 never reaches into a solver's internals, and everything it needs to schedule comes from
 the model — and solvers cross it one at a time.
 
+## M4 execution and rendering
+
+`Simulation` compiles domain calls from the operation graph once. Buffer hazards and
+exclusive ownership of domain state order nodes; sufficiently wide, expensive levels
+use the persistent CPU pool. Each concurrent domain gets its own scratch arena and a
+scalar inner executor. Narrow levels retain kernel-level parallelism, avoiding nested
+dispatch and underutilization. Coupling remains a serial end-of-step exchange and
+observations retain their sampling cadence. Hand-built simulations with no graph keep
+the original sequential domain driver.
+
+The backend exposes command encoding and resident buffers. `GpuFieldImage` converts
+a field buffer into a persistent texture using a caller-supplied palette. The GPU
+viewer shares egui's device/queue, then submits compute and color conversion before
+egui samples the texture. It reads fields only for labelled diagnostic snapshots;
+drawing never requires a field readback or CPU image upload. The backend has no egui
+dependency. The default CPU viewer retains its model, coupling and diagnostics paths.
+
+GPU particles use eight contiguous scalar arrays and a deterministic sorted cell list.
+Atomic insertion constructs bins; a per-cell sort removes insertion-order variation
+before force gathering. Lennard–Jones therefore has a declared repeatable summation
+order, while its CPU pair-scatter reference remains unchanged.
+
 ## Deliberate omissions
 
-- **No parallelism.** Everything is single-threaded scalar CPU. §15.3 wants parallel
-  iterators and SIMD; §15.1 says *"optimize after validation"*. The operation graph
-  already computes which operations are independent and reports the ideal speedup, so
-  the information is there when the execution is.
-- **No coupling.** `couple a.b -> c.d` parses, type-checks as far as it can, and then
-  errors with "milestone M3". The conservation ledger that will account for those
-  transfers is already built and tested — diagnostics have to exist before the thing
-  they diagnose, not after.
+- **No iterative coupling scheduler.** One-way and loose staggered exchanges are
+  implemented; fixed-point groups need checkpointing and convergence controls.
 - **No user-defined expressions.** Spec §8.3's expression language, which compiles
   custom force and rate laws to CPU and GPU kernels, is M6. Until then the builtin
   vocabulary is a closed set, and an unrecognized function is an error that *lists what
   is available*.
-- **No GPU.** M4.
+- **No general GPU model scheduler.** The released GPU solvers provide composable
+  command encoding, but arbitrary coupled models still execute on the CPU.
 
 Each of these is a case of spec §21.1: *"New domains should not be added while the
 current domain lacks a reference test or cannot explain its stability limits."*

@@ -5,7 +5,16 @@
 //! here is written against the portable feature set — no native extensions, no
 //! vendor-specific paths — because a baseline that needs a particular adapter is not one.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PipelineSet {
+    pub layout: wgpu::BindGroupLayout,
+    pub pipelines: Vec<wgpu::ComputePipeline>,
+    bindings: Vec<wgpu::BindGroupLayoutEntry>,
+    entry_points: Vec<String>,
+}
 
 use lattice_compute::{
     Backend, Buffer, Capabilities, Device, DeviceError, KernelCache, KernelKey, KernelSource,
@@ -58,9 +67,42 @@ pub struct GpuDevice {
     /// cache is the one piece of a device that is genuinely mutable; the lock is taken
     /// once per pipeline construction, never inside a dispatch.
     shaders: Mutex<KernelCache<wgpu::ShaderModule>>,
+    pipelines: Mutex<HashMap<KernelKey, PipelineSet>>,
 }
 
 impl GpuDevice {
+    /// Share the renderer's device and queue. Handles must originate from the same
+    /// adapter/device; wgpu validates resource ownership at every submission.
+    /// No adapter enumeration or second device is needed for embedded simulation.
+    pub fn from_shared(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        adapter_info: wgpu::AdapterInfo,
+    ) -> Self {
+        let limits = device.limits();
+        let capabilities = Capabilities {
+            adapter: format!("{} ({:?})", adapter_info.name, adapter_info.backend),
+            precisions: vec![Precision::Fast32],
+            max_workgroup: Some(limits.max_compute_invocations_per_workgroup),
+            max_buffer_bytes: limits.max_buffer_size,
+        };
+        Self {
+            device,
+            queue,
+            adapter_info,
+            capabilities,
+            precision: Precision::Fast32,
+            shaders: Mutex::new(KernelCache::new()),
+            pipelines: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn raw_device(&self) -> &wgpu::Device {
+        &self.device
+    }
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
     /// Open the default adapter at `precision`.
     ///
     /// # Errors
@@ -73,8 +115,7 @@ impl GpuDevice {
     /// [`DeviceError::UnsupportedPrecision`] for anything but [`Precision::Fast32`]. See
     /// [`GpuDevice::capabilities`].
     pub fn open(precision: Precision) -> Result<GpuDevice, DeviceError> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -124,6 +165,7 @@ impl GpuDevice {
             capabilities,
             adapter_info,
             shaders: Mutex::new(KernelCache::new()),
+            pipelines: Mutex::new(HashMap::new()),
         };
         opened.warm_up()?;
         Ok(opened)
@@ -160,14 +202,18 @@ impl GpuDevice {
         key: KernelKey,
         source: &KernelSource,
     ) -> Result<wgpu::ShaderModule, DeviceError> {
-        let mut cache =
-            self.shaders.lock().map_err(|error| DeviceError::Backend(error.to_string()))?;
+        let mut cache = self
+            .shaders
+            .lock()
+            .map_err(|error| DeviceError::Backend(error.to_string()))?;
         let module = cache.get_or_compile(key, source, |source| {
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(source.name()),
-                source: wgpu::ShaderSource::Wgsl(source.body().into()),
-            });
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(source.name()),
+                    source: wgpu::ShaderSource::Wgsl(source.body().into()),
+                });
             match pollster::block_on(scope.pop()) {
                 Some(error) => Err(DeviceError::Backend(error.to_string())),
                 None => Ok(module),
@@ -184,6 +230,79 @@ impl GpuDevice {
         }
     }
 
+    /// Cache layouts together with pipelines, preserving bind-group compatibility.
+    pub(crate) fn pipeline_set(
+        &self,
+        key: KernelKey,
+        source: &KernelSource,
+        bindings: &[wgpu::BindGroupLayoutEntry],
+        entries: &[&str],
+    ) -> Result<PipelineSet, DeviceError> {
+        let module = self.shader_module(key, source)?;
+        let mut cache = self
+            .pipelines
+            .lock()
+            .map_err(|e| DeviceError::Backend(e.to_string()))?;
+        if let Some(set) = cache.get(&key) {
+            if set.bindings != bindings
+                || !set
+                    .entry_points
+                    .iter()
+                    .map(String::as_str)
+                    .eq(entries.iter().copied())
+            {
+                return Err(DeviceError::Backend(
+                    "pipeline cache key reused with a different layout or entry points".into(),
+                ));
+            }
+            return Ok(set.clone());
+        }
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(source.name()),
+                entries: bindings,
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(source.name()),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipelines = entries
+            .iter()
+            .map(|entry| {
+                self.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(entry),
+                        layout: Some(&pipeline_layout),
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+            })
+            .collect();
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            return Err(DeviceError::Backend(error.to_string()));
+        }
+        let set = PipelineSet {
+            layout,
+            pipelines,
+            bindings: bindings.to_vec(),
+            entry_points: entries.iter().map(|s| s.to_string()).collect(),
+        };
+        cache.insert(key, set.clone());
+        Ok(set)
+    }
+
+    /// Number of compiled pipeline families retained by this device.
+    pub fn pipeline_cache_len(&self) -> usize {
+        self.pipelines.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
     /// Read any device buffer of `out.len()` `f32`s back into `f64`.
     ///
     /// The solver owns its ping-pong buffers as raw wgpu handles rather than as
@@ -193,10 +312,26 @@ impl GpuDevice {
         buffer: &wgpu::Buffer,
         out: &mut [f64],
     ) -> Result<(), DeviceError> {
+        self.read_raw_at(buffer, 0, out)
+    }
+
+    /// [`GpuDevice::read_raw`], starting `first` elements into the buffer.
+    ///
+    /// The implicit solver keeps its handful of scalars — `rs`, the curvature, `alpha` —
+    /// in one buffer alongside nothing else it wants back, and the conjugate-gradient
+    /// iteration reads two of them per iteration. Copying the whole buffer to learn eight
+    /// bytes would make the stall bigger than the thing it is waiting for.
+    pub(crate) fn read_raw_at(
+        &self,
+        buffer: &wgpu::Buffer,
+        first: usize,
+        out: &mut [f64],
+    ) -> Result<(), DeviceError> {
         if out.is_empty() {
             return Ok(());
         }
-        let bytes = (out.len() * self.precision.state_bytes()) as u64;
+        let stride = self.precision.state_bytes() as u64;
+        let bytes = out.len() as u64 * stride;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: bytes,
@@ -204,10 +339,11 @@ impl GpuDevice {
             mapped_at_creation: false,
         });
 
-        let mut encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes);
-        self.submit_and_wait(encoder)?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(buffer, first as u64 * stride, &staging, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -258,10 +394,12 @@ impl GpuDevice {
     /// otherwise.
     pub fn probe_wgsl_f64(&self) -> Result<(), String> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let _module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("f64-probe"),
-            source: wgpu::ShaderSource::Wgsl(
-                r#"
+        let _module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("f64-probe"),
+                source: wgpu::ShaderSource::Wgsl(
+                    r#"
                 @group(0) @binding(0) var<storage, read_write> data: array<f32>;
 
                 @compute @workgroup_size(1)
@@ -270,9 +408,9 @@ impl GpuDevice {
                     data[0] = f32(widened * 2.0lf);
                 }
                 "#
-                .into(),
-            ),
-        });
+                    .into(),
+                ),
+            });
         match pollster::block_on(scope.pop()) {
             Some(error) => Err(error.to_string()),
             None => Ok(()),
@@ -309,11 +447,18 @@ impl Device for GpuDevice {
     }
 
     fn alloc(&self, elements: usize, usage: Usage) -> Result<GpuBuffer, DeviceError> {
-        let bytes = (elements * self.precision.state_bytes()) as u64;
-        if bytes > self.capabilities.max_buffer_bytes {
+        let bytes = elements
+            .checked_mul(self.precision.state_bytes())
+            .map(|n| n as u64)
+            .unwrap_or(u64::MAX);
+        let limit = self
+            .capabilities
+            .max_buffer_bytes
+            .min(self.device.limits().max_storage_buffer_binding_size);
+        if bytes > limit {
             return Err(DeviceError::AllocationTooLarge {
                 requested: bytes,
-                limit: self.capabilities.max_buffer_bytes,
+                limit,
             });
         }
 
@@ -329,12 +474,20 @@ impl Device for GpuDevice {
             mapped_at_creation: false,
         });
 
-        Ok(GpuBuffer { buffer, len: elements, precision: self.precision, usage })
+        Ok(GpuBuffer {
+            buffer,
+            len: elements,
+            precision: self.precision,
+            usage,
+        })
     }
 
     fn write(&self, buffer: &mut GpuBuffer, data: &[f64]) -> Result<(), DeviceError> {
         if buffer.len != data.len() {
-            return Err(DeviceError::LengthMismatch { buffer: buffer.len, host: data.len() });
+            return Err(DeviceError::LengthMismatch {
+                buffer: buffer.len,
+                host: data.len(),
+            });
         }
         if data.is_empty() {
             return Ok(());
@@ -343,19 +496,23 @@ impl Device for GpuDevice {
         // The narrowing. One place, and the reason `Mechanism::StateRounding` can be
         // named as the source of the disagreement this backend produces.
         let narrowed: Vec<f32> = data.iter().map(|&value| value as f32).collect();
-        self.queue.write_buffer(&buffer.buffer, 0, bytes_of_f32(&narrowed));
-        self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+        self.queue
+            .write_buffer(&buffer.buffer, 0, bytes_of_f32(&narrowed));
         Ok(())
     }
 
     fn read(&self, buffer: &GpuBuffer, out: &mut [f64]) -> Result<(), DeviceError> {
         if buffer.len != out.len() {
-            return Err(DeviceError::LengthMismatch { buffer: buffer.len, host: out.len() });
+            return Err(DeviceError::LengthMismatch {
+                buffer: buffer.len,
+                host: out.len(),
+            });
         }
         self.read_raw(&buffer.buffer, out)
     }
 
     fn finish(&self) -> Result<(), DeviceError> {
+        self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
         self.wait()
     }
 }
@@ -367,5 +524,7 @@ impl Device for GpuDevice {
 fn bytes_of_f32(values: &[f32]) -> &[u8] {
     // SAFETY: `f32` is `Copy`, has no uninitialized padding, and every bit pattern of
     // `[u8; 4]` is a valid `f32`. The lifetime is tied to `values`.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
 }

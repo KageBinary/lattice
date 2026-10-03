@@ -206,18 +206,28 @@ Delivered:
   first order, for a whole afternoon, because the test compared whole buffers and the
   halo holds intermediate boundary state rather than part of the answer.
 
-## M4 — Portable GPU (in progress)
+## M4 — Portable GPU ✅
 
 **Spec exit condition:** *"selected CPU/GPU cross-validation and performance goals."*
 
-Four things were needed. Three are done.
+Current implementation: resident field rendering, domain-DAG scheduling, GPU gravity
+and Lennard–Jones, implicit Dirichlet boundaries, and pipeline caching are implemented.
+See [M4 engineering report](m4-engineering-report.md) for the final test and performance
+record, supported scope and remaining formatting debt. All 56 validation cases pass,
+including eleven GPU cases; both shared-device viewer smoke paths pass. The final
+review also fixed explicit timestep selection, small-graph overhead, redundant
+gravity dispatch and incorrect backend/precision metadata in exported reports.
+M4.1–M4.4 below retain their historical measurements and decisions.
 
-1. **A `wgpu` compute backend** ✅ — the portable baseline, running explicit diffusion
-   device-resident. The operation graph's parallel levels are still unconsumed.
+The state at the end of M4.4 was:
+
+1. **A `wgpu` compute backend** ✅ — the portable baseline, running explicit diffusion and
+   now implicit Crank–Nicolson device-resident. The operation graph's parallel levels are
+   still unconsumed.
 2. **Kernel cache** ✅ / **zero-copy rendering** — §15.5's cache is built and keyed on all
    four of the inputs that section names; the viewer still uploads a CPU texture.
-3. **CPU/GPU cross-validation** ✅ — three GPU rows at §19.1's `cross-backend` level, with
-   a tolerance derived rather than fitted, and `lattice bench --backend gpu` for the
+3. **CPU/GPU cross-validation** ✅ — eight GPU rows at §19.1's `cross-backend` level, with
+   tolerances derived rather than fitted, and `lattice bench --backend gpu` for the
    performance half.
 4. **CPU parallelism** ✅ — §15.3's parallel iterators, deferred twice before this.
 
@@ -334,7 +344,7 @@ answered; two are still open and are what M4.3 runs into.
 |---|---|---|
 | How exact is cross-backend agreement? | bit-identical | a derived budget, dominated by `f32` state rounding |
 | Precision | `accurate64` throughout | `fast32` only — WGSL has no `f64` |
-| Reductions | sequential | **open** — no sequential fallback to retreat to |
+| Reductions | sequential | a fixed tree of stated depth — answered in M4.4, and it turned out not to matter |
 | Lennard-Jones pair forces | left sequential | **open** — a gather or a colouring becomes mandatory |
 
 ### M4.3 — `lattice bench --backend gpu` ✅
@@ -376,31 +386,108 @@ harness can select, which is what a performance claim needed before it could be 
   readback is slow". `GpuDevice::open` pays it on purpose now, which is also where §15.1
   would put it.
 
-### Where M4.4 starts
+### M4.4 — Crank–Nicolson on the device ✅
 
-- **Crank–Nicolson on the device** is the next real piece, and it is where reductions stop
-  being a zero term in the budget. CG's inner products decide when the iteration stops, so
-  a change in reduction order changes the iteration count and through it the answer.
-- **Zero-copy rendering** — the buffers live on the device; the viewer still uploads a CPU
-  texture. The measured readback cost (0.4–5.9 ms per frame at these sizes, plus a device
-  open) is what it would remove.
+The implicit scheme, solved by conjugate gradient with the dot products running on the
+device. Documented in [backends.md](backends.md).
+
+- **`lattice-wgpu::reduction`** — `GpuDot`, a dot product whose association order is fixed
+  at construction and *written down*: contiguous blocks per workgroup, a contiguous serial
+  run per invocation, two fixed binary trees. `Interior::depth` reports the resulting
+  accumulation depth — **16** at 24 576 cells, against 24 575 for a sequential sum — so the
+  budget is handed the real number rather than a constant somebody chose.
+- **`GpuCrankNicolson`** — thirteen kernels and three reductions, with `α` and `β` staying
+  on the device and exactly **one eight-byte readback per iteration**, which is what §10.3's
+  stopping rule costs. Two backends' worth of divergence semantics kept identical by moving
+  the curvature test *into* the update kernels.
+- **A tolerance floor that is enforced, not documented.** `ε·(1 + ‖A‖₂)`, computed at setup
+  from the face coefficients. `HeatDomain`'s default `1e-10` is 26 000× below it and is
+  refused with the floor and the `‖A‖` it came from.
+- **`Mechanism::SolveTermination` and `Norm`** — a mechanism that scales with `τ` rather
+  than `ε`, and the first budget in the project that had to say which norm it was derived in.
+- **Five more cross-backend rows** (`lattice validate` runs 45 cases, `--features gpu` runs
+  53) and **`lattice bench heat-crank-nicolson --backend gpu`**.
+
+1052 tests. Clippy and rustdoc clean.
+
+### What M4.4 taught us
+
+- **The reduction was the wrong thing to be afraid of.** M4.2 deferred this whole piece of
+  work because a reduction is where `Mechanism::ReductionOrder` stops being zero, and the
+  reasoning was explicit: CG's inner products decide when the iteration stops, so a change
+  in reduction order changes the iteration count and through it the answer. All of that is
+  true and the term lands **six orders of magnitude below** the budget's largest. A perturbed
+  dot product changes *which iterate* CG arrives at, and the stopping test then measures that
+  iterate afresh — the reduction moves the path, not the destination. What actually dominates
+  is a mechanism that did not exist in the explicit case at all.
+- **A reduction inside a solver audits nothing.** The corollary, and the reason there is a
+  case comparing a bare `GpuDot` against a sequential sum. A term worth a billionth of a
+  budget is a term the budget does not test. Reductions whose value *is* the answer — a
+  conserved total, an observation, a fixed-iteration solver — have no re-measurement to hide
+  behind, and that is where the mechanism is real.
+- **A precision has a floor on what question you may ask it.** Not on the answer's accuracy —
+  on the *question*. `ε·(1 + ‖A‖₂)` is what forming `b − Ax` costs even given an exact `x`,
+  so a solver asked for less iterates to its cap and reports as slow hardware. This is the
+  first place in the project where a backend refuses a *parameter* rather than a precision,
+  and it belongs in the same family as `Capabilities::supports`: refuse rather than
+  substitute, and say what the limit was.
+- **A budget and its measurement must be in the same norm.** Every mechanism before this one
+  bounded error per cell, so the max norm was correct without anyone choosing it. A stopping
+  rule on `‖r‖₂` is a statement about a vector, and checking it per cell costs `√N` — 157
+  here — belonging entirely to the change of norm. Two orders of magnitude of looseness that
+  describe nothing is exactly the failure `Tolerance` exists to prevent, so the norm is now
+  part of the budget.
+- **The stall is the program.** The stencil is 27× the CPU at 256²; a CG iteration is
+  **1.8×**. The arithmetic per iteration is the same kind the stencil does — the difference
+  is that an iteration contains a fence, because §10.3 requires the residual to be able to
+  stop the run. Fusing the scalar copy onto the iteration's own submission, and reusing one
+  staging buffer, was worth **1.6×** on its own, which says how much of an implicit device
+  solve is queue latency rather than work. (That 1.6× rests on a single before-measurement,
+  which is the mistake M4.3 warned about; it is flagged in backends.md and wants re-taking.)
+- **Steps per second is not a unit when the step is a solve.** The GPU looked 4.0× the CPU
+  and is 1.8×; the gap is entirely that the two stop at different residual tolerances and
+  therefore run 4.57 against 9.5 iterations per step. Both benchmarks now publish iterations
+  per step, because §19.3's "publish the conditions" has to include the thing that makes two
+  numbers comparable.
+
+### Where M4.5 started (historical checklist)
+
+- **Zero-copy rendering** is now the largest unbuilt item in M4. The buffers live on the
+  device; the viewer still uploads a CPU texture. The measured readback cost (0.4–5.9 ms per
+  frame at these sizes, plus a device open) is what it would remove.
 - **`OperationGraph::levels` is *still* unconsumed.** It has computed which operations are
   independent since M1. A backend that schedules across *operations* rather than within one
-  is what would use it, and neither M4.2 nor M4.3 became that.
-- **Device open is 0.8 s and nothing has tried to reduce it.** It is plausibly mostly
-  adapter enumeration, and a run that already knows which adapter it wants may not need it.
-  Nobody has profiled it.
-- **The particle benchmarks have no GPU kernels**, so `--backend gpu` runs exactly one
-  benchmark. §15.6's "local particles" and "Lennard-Jones MD" targets are GPU targets, and
-  the pair-force question is still open.
+  is what would use it, and none of M4.2, M4.3 or M4.4 became that.
+- **The fence per CG iteration is the implicit path's whole performance story**, and there
+  are two ways at it that do not touch §10.3. A preconditioner cuts iterations, and each
+  iteration carries a fence, so it cuts wall-clock more than arithmetic — but it changes the
+  iteration count and therefore the answer, which makes it a change to the *reference*.
+  Speculative dispatch of `k` iterations with a batched residual readback does not change
+  the answer, but needs `x` checkpointed to unwind past the converged one. Neither has been
+  attempted.
+- **Device open is 0.8–1.5 s and nothing has tried to reduce it.** Unchanged from M4.3, and
+  it is plausibly mostly adapter enumeration.
+- **The particle benchmarks still have no GPU kernels.** §15.6's "local particles" and
+  "Lennard-Jones MD" targets are GPU targets, and the pair-force question — a gather or a
+  colouring — is still open. It is now the only one of M4.2's four open questions left.
+- **Dirichlet on the implicit path** is where `HaloMode`'s homogeneous/inhomogeneous
+  distinction finally needs a device-side counterpart, and where `assemble_rhs` stops being
+  able to omit the affine term `θ·c`.
 
 **Before starting, reread §23.1's kill criteria**, particularly *"the compiled runtime is
 not materially faster or easier to inspect than a straightforward Python prototype."* M4.1
 improved the first half. M4.2 arguably improved the second — a validation report that
 prints where its tolerance went is an inspectability claim — and did nothing measured for
-the first.
+the first. M4.4 is the first milestone to move the first half *backwards* in an honest
+direction: it found a case where the GPU is worth 1.9× rather than 27×, and said so.
 
 ## Outside the milestones: the playground
+
+M4.5 implementation and remaining limitations are recorded in
+[the engineering report](m4-engineering-report.md). In particular, GPU rendering is
+available for uncoupled heat fields, and GPU particle execution is available through
+the Rust backend API and benchmark harness. Arbitrary mixed-domain GPU execution,
+GPU rigid bodies, and GPU chemistry remain outside the released backend scope.
 
 `lattice-play` is not in the specification. It exists because the spec describes a
 scientific instrument — write a model, compile it, run it, measure it — and someone who

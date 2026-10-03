@@ -66,7 +66,10 @@ fn run(args: &Args) -> Result<ExitCode, String> {
             project::check(args)
         }
         "run" => {
-            check_flags(args, &["duration", "steps", "timestep", "threads", "json", "quiet"])?;
+            check_flags(
+                args,
+                &["duration", "steps", "timestep", "threads", "json", "quiet"],
+            )?;
             project::run(args)
         }
         "validate" => cmd_validate(args),
@@ -97,8 +100,16 @@ fn check_flags(args: &Args, known: &[&str]) -> Result<(), String> {
         Err(format!(
             "unknown flag{} {}; this command accepts {}",
             if unknown.len() > 1 { "s" } else { "" },
-            unknown.iter().map(|f| format!("--{f}")).collect::<Vec<_>>().join(", "),
-            known.iter().map(|f| format!("--{f}")).collect::<Vec<_>>().join(", ")
+            unknown
+                .iter()
+                .map(|f| format!("--{f}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            known
+                .iter()
+                .map(|f| format!("--{f}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ))
     }
 }
@@ -124,20 +135,38 @@ fn cmd_validate(args: &Args) -> Result<ExitCode, String> {
 
     if let Some(path) = args.value("json") {
         let mut artifact = RunArtifact::new("validation");
+        if report
+            .results()
+            .iter()
+            .any(|result| result.case.domain == "wgpu")
+        {
+            artifact = artifact
+                .with_backend("cpu+wgpu")
+                .with_precision("accurate64+fast32");
+        }
         artifact.set_parameter("filter", args.value("filter").unwrap_or("(all)"));
         artifact.set_section("validation", report.to_json());
         for contract in inspect::all_contracts() {
             artifact.add_contract(contract);
         }
-        artifact.write(path).map_err(|e| format!("cannot write {path}: {e}"))?;
+        artifact
+            .write(path)
+            .map_err(|e| format!("cannot write {path}: {e}"))?;
         println!("wrote {path}");
     }
 
-    Ok(if report.all_passed() { ExitCode::SUCCESS } else { ExitCode::from(CHECK_FAILED) })
+    Ok(if report.all_passed() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(CHECK_FAILED)
+    })
 }
 
 fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
-    check_flags(args, &["scale", "threads", "backend", "compare", "json", "quiet"])?;
+    check_flags(
+        args,
+        &["scale", "threads", "backend", "compare", "json", "quiet"],
+    )?;
 
     let scale: usize = args.parsed_or("scale", 1)?;
     if scale == 0 {
@@ -147,7 +176,9 @@ fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
     match args.value("backend").unwrap_or("cpu") {
         "cpu" => cmd_bench_cpu(args, scale),
         "gpu" => cmd_bench_gpu(args, scale),
-        other => Err(format!("--backend: `{other}` is not a backend; pass `cpu` or `gpu`")),
+        other => Err(format!(
+            "--backend: `{other}` is not a backend; pass `cpu` or `gpu`"
+        )),
     }
 }
 
@@ -158,15 +189,15 @@ fn cmd_bench(args: &Args) -> Result<ExitCode, String> {
 /// this harness could print.
 #[cfg(not(feature = "gpu"))]
 fn cmd_bench_gpu(_args: &Args, _scale: usize) -> Result<ExitCode, String> {
-    Err("this binary was built without the GPU backend; rebuild with `--features gpu`"
-        .to_string())
+    Err("this binary was built without the GPU backend; rebuild with `--features gpu`".to_string())
 }
 
 #[cfg(feature = "gpu")]
 fn cmd_bench_gpu(args: &Args, scale: usize) -> Result<ExitCode, String> {
     if args.value("threads").is_some() {
-        return Err("--threads applies to the CPU backend; the GPU chooses its own schedule"
-            .to_string());
+        return Err(
+            "--threads applies to the CPU backend; the GPU chooses its own schedule".to_string(),
+        );
     }
 
     // Timed and printed because §15.1 says measure end-to-end, and this is the largest
@@ -205,7 +236,9 @@ fn cmd_bench_gpu(args: &Args, scale: usize) -> Result<ExitCode, String> {
     let sequential = lattice_ir::Executor::sequential();
     let cpu_executed = bench::Executed::cpu(&sequential);
 
-    let mut artifact = RunArtifact::new("benchmark");
+    let mut artifact = RunArtifact::new("benchmark")
+        .with_backend(executed.label.as_str())
+        .with_precision(executed.precision);
     artifact.set_parameter("scale", scale);
     artifact.set_parameter("backend", "gpu");
     let mut results = lattice_observe::Json::array();
@@ -217,7 +250,11 @@ fn cmd_bench_gpu(args: &Args, scale: usize) -> Result<ExitCode, String> {
         // The CPU baseline runs first for the same reason it does on the CPU path: the
         // measured run gets the warm cache, which biases the ratio down.
         let baseline = compare
-            .then(|| bench::matching(info.name).first().map(|cpu| (cpu.run)(scale, &sequential)))
+            .then(|| {
+                bench::matching(info.name)
+                    .first()
+                    .map(|cpu| (cpu.run)(scale, &sequential))
+            })
             .flatten();
         let outcome = (benchmark.run)(scale, &device)
             .map_err(|error| format!("{} failed on the GPU: {error}", info.name))?;
@@ -282,7 +319,9 @@ fn cmd_bench_cpu(args: &Args, scale: usize) -> Result<ExitCode, String> {
         println!("\nWARNING: {warning}");
     }
 
-    let mut artifact = RunArtifact::new("benchmark");
+    let mut artifact = RunArtifact::new("benchmark")
+        .with_backend(executed.label.as_str())
+        .with_precision(executed.precision);
     artifact.set_parameter("scale", scale);
     artifact.set_parameter("backend", "cpu");
     let mut results = lattice_observe::Json::array();
@@ -305,16 +344,16 @@ fn cmd_bench_cpu(args: &Args, scale: usize) -> Result<ExitCode, String> {
 
         if !args.has("quiet") {
             if let Some(baseline) = &baseline {
-                print!("{}", bench::report(info, scale, &sequential_executed, baseline));
+                print!(
+                    "{}",
+                    bench::report(info, scale, &sequential_executed, baseline)
+                );
             }
             print!("{}", bench::report(info, scale, &executed, &outcome));
             if let Some(baseline) = &baseline {
                 print!(
                     "{}",
-                    bench::speedup_report(
-                        (&sequential_executed, baseline),
-                        (&executed, &outcome)
-                    )
+                    bench::speedup_report((&sequential_executed, baseline), (&executed, &outcome))
                 );
             }
         }
@@ -345,11 +384,17 @@ fn finish_bench(
     println!("\n{valid} of {total} benchmarks met their correctness conditions");
 
     if let Some(path) = args.value("json") {
-        artifact.write(path).map_err(|e| format!("cannot write {path}: {e}"))?;
+        artifact
+            .write(path)
+            .map_err(|e| format!("cannot write {path}: {e}"))?;
         println!("wrote {path}");
     }
 
-    Ok(if all_valid { ExitCode::SUCCESS } else { ExitCode::from(CHECK_FAILED) })
+    Ok(if all_valid {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(CHECK_FAILED)
+    })
 }
 
 fn cmd_demo(args: &Args) -> Result<ExitCode, String> {
@@ -382,14 +427,21 @@ fn cmd_demo(args: &Args) -> Result<ExitCode, String> {
     }
 
     if let Some(path) = args.value("json") {
-        result.artifact.write(path).map_err(|e| format!("cannot write {path}: {e}"))?;
+        result
+            .artifact
+            .write(path)
+            .map_err(|e| format!("cannot write {path}: {e}"))?;
         println!("\nwrote {path}");
     }
 
     // A demo that produced a non-finite value has failed, however pretty it looked.
     let healthy =
         result.artifact.first_non_finite().is_none() && result.artifact.warnings().is_empty();
-    Ok(if healthy { ExitCode::SUCCESS } else { ExitCode::from(CHECK_FAILED) })
+    Ok(if healthy {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(CHECK_FAILED)
+    })
 }
 
 fn cmd_inspect(args: &Args) -> Result<ExitCode, String> {
@@ -406,16 +458,14 @@ fn cmd_inspect(args: &Args) -> Result<ExitCode, String> {
         Some("cases") => inspect::cases(),
         Some("benchmarks") => inspect::benchmarks(),
         Some("demos") => inspect::demos(),
-        None => {
-            "usage: lattice inspect <subject>\n\n\
+        None => "usage: lattice inspect <subject>\n\n\
              subjects:\n  \
              contracts    every solver's equations, assumptions, and known limitations\n  \
              units        resolve a unit expression, or list the registry\n  \
              cases        the validation cases and what each establishes\n  \
              benchmarks   the benchmarks and their correctness conditions\n  \
              demos        the demonstration scenes\n"
-                .to_string()
-        }
+            .to_string(),
         Some(other) => {
             return Err(format!(
                 "cannot inspect `{other}`; expected contracts, units, cases, benchmarks, or demos"
@@ -515,7 +565,10 @@ mod tests {
     fn an_unknown_command_is_a_usage_error() {
         let err = run(&parse("frobnicate")).unwrap_err();
         assert!(err.contains("frobnicate"), "{err}");
-        assert!(err.contains("validate"), "the message should list valid commands: {err}");
+        assert!(
+            err.contains("validate"),
+            "the message should list valid commands: {err}"
+        );
     }
 
     /// A mistyped flag must stop the run. Ignoring it would silently drop the
@@ -524,7 +577,10 @@ mod tests {
     fn a_mistyped_flag_is_rejected() {
         let err = run(&parse("validate --jsno out.json")).unwrap_err();
         assert!(err.contains("--jsno"), "{err}");
-        assert!(err.contains("--json"), "the message should show what was expected: {err}");
+        assert!(
+            err.contains("--json"),
+            "the message should show what was expected: {err}"
+        );
     }
 
     #[test]
@@ -541,7 +597,10 @@ mod tests {
 
     #[test]
     fn validate_runs_and_a_filter_narrows_it() {
-        assert_eq!(run(&parse("validate --filter free_fall --quiet")).unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            run(&parse("validate --filter free_fall --quiet")).unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 
     #[test]
@@ -582,7 +641,10 @@ mod tests {
 
     #[test]
     fn inspect_units_accepts_an_unquoted_expression() {
-        assert_eq!(run(&parse("inspect units 9.31e-9 meter^2 / second")).unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            run(&parse("inspect units 9.31e-9 meter^2 / second")).unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 
     #[test]

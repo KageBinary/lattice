@@ -27,7 +27,9 @@
 //! standard practice and costs the *velocity-dependent terms* their second-order
 //! accuracy; position-dependent terms are unaffected. The domain contract states this.
 
-use lattice_ir::{Executor, Grain, ParticleStore};
+use lattice_ir::{Executor, Grain, ParticleStore, Pcg32};
+
+use crate::thermostat::{ornstein_uhlenbeck_coefficients, BOLTZMANN};
 
 /// A time-integration scheme for particle dynamics.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -188,6 +190,110 @@ impl Integrator {
                     banded(executor, d.vel_y, |i, v| *v += half * inv_mass[i] * force_y[i]);
                 }
             }
+        }
+    }
+}
+
+/// The heat bath a Langevin run is coupled to: its temperature, its friction, and
+/// the generator the random kicks come from.
+///
+/// Owned by the domain, so the generator's state travels with the simulation and a
+/// run is reproducible from its seed.
+#[derive(Debug)]
+pub struct LangevinBath {
+    /// Target temperature, kelvin.
+    pub temperature: f64,
+    /// Friction `γ`, per second.
+    pub friction: f64,
+    /// The generator the O step draws from, in particle order.
+    pub rng: Pcg32,
+}
+
+impl LangevinBath {
+    /// The PCG stream the bath draws on.
+    ///
+    /// Initial velocities are drawn from stream 0 of the model's seed; giving the
+    /// bath its own stream means the same seed does not reuse the same deviates for
+    /// the kicks that it spent on the starting velocities.
+    pub const STREAM: u64 = 1;
+
+    /// A bath at `temperature` with friction `friction`, seeded from `seed`.
+    pub fn new(temperature: f64, friction: f64, seed: u64) -> Self {
+        Self { temperature, friction, rng: Pcg32::seed_with_stream(seed, Self::STREAM) }
+    }
+}
+
+impl Integrator {
+    /// One BAOAB step of Langevin dynamics.
+    ///
+    /// ```text
+    ///   B: v += ½·dt·a(t)          A: x += ½·dt·v
+    ///   O: v ← c₁·v + c₂·sqrt(k_B T/m)·ξ
+    ///   A: x += ½·dt·v             F: a(t+dt)        B: v += ½·dt·a(t+dt)
+    /// ```
+    ///
+    /// The kicks and drifts are split across `executor` exactly as velocity Verlet's
+    /// are; the O step runs on the calling thread because it consumes the bath's
+    /// generator in particle order, which is what makes the result independent of the
+    /// thread count. A pinned particle (zero inverse mass) draws its two normals like
+    /// every other — so the stream is the same whatever is pinned — and discards them.
+    ///
+    /// Only velocity Verlet has a Langevin form here; the first-order schemes are not
+    /// symplectic pairings the splitting can be built on, and the domain refuses to
+    /// combine them with a bath.
+    ///
+    /// The force invariant is the same as [`Integrator::step`]: accumulators hold
+    /// `F(x(t))` on entry and `F(x(t+dt))` on exit.
+    pub fn step_langevin<F>(
+        self,
+        executor: &Executor,
+        dt: f64,
+        store: &mut ParticleStore,
+        bath: &mut LangevinBath,
+        mut eval_forces: F,
+    ) where
+        F: FnMut(&mut ParticleStore),
+    {
+        assert!(
+            matches!(self, Integrator::VelocityVerlet),
+            "Langevin dynamics is only defined here for velocity Verlet, not {}",
+            self.name()
+        );
+        let half = 0.5 * dt;
+        let (c1, c2) = ornstein_uhlenbeck_coefficients(bath.friction, dt);
+        let kt = BOLTZMANN * bath.temperature;
+        {
+            let d = store.dynamics();
+            {
+                let (inv_mass, force_x, force_y) = (d.inv_mass, &*d.force_x, &*d.force_y);
+                banded(executor, d.vel_x, |i, v| *v += half * inv_mass[i] * force_x[i]);
+                banded(executor, d.vel_y, |i, v| *v += half * inv_mass[i] * force_y[i]);
+            }
+            {
+                let (vel_x, vel_y) = (&*d.vel_x, &*d.vel_y);
+                banded(executor, d.pos_x, |i, x| *x += half * vel_x[i]);
+                banded(executor, d.pos_y, |i, y| *y += half * vel_y[i]);
+            }
+            // O: exact Ornstein–Uhlenbeck relaxation toward the bath, sequential.
+            for ((&inv_mass, vx), vy) in d.inv_mass.iter().zip(d.vel_x.iter_mut()).zip(d.vel_y.iter_mut()) {
+                let xi_x = bath.rng.normal();
+                let xi_y = bath.rng.normal();
+                let sigma = (kt * inv_mass).sqrt();
+                *vx = c1 * *vx + c2 * sigma * xi_x;
+                *vy = c1 * *vy + c2 * sigma * xi_y;
+            }
+            {
+                let (vel_x, vel_y) = (&*d.vel_x, &*d.vel_y);
+                banded(executor, d.pos_x, |i, x| *x += half * vel_x[i]);
+                banded(executor, d.pos_y, |i, y| *y += half * vel_y[i]);
+            }
+        }
+        eval_forces(store);
+        {
+            let d = store.dynamics();
+            let (inv_mass, force_x, force_y) = (d.inv_mass, &*d.force_x, &*d.force_y);
+            banded(executor, d.vel_x, |i, v| *v += half * inv_mass[i] * force_x[i]);
+            banded(executor, d.vel_y, |i, v| *v += half * inv_mass[i] * force_y[i]);
         }
     }
 }
@@ -552,6 +658,105 @@ mod tests {
         }
         assert_eq!(store.pos_x()[0], 0.0, "an infinite-mass particle must not accelerate");
         assert!(store.pos_x()[1] > 1.0);
+    }
+
+    /// With the friction switched off the O step is the identity, and BAOAB is
+    /// velocity Verlet with its drift taken in two halves — the same numbers to
+    /// round-off, and the same energy behaviour.
+    #[test]
+    fn baoab_without_friction_is_velocity_verlet() {
+        let k = 2.0;
+        let dt = 0.01;
+        let mut plain = single_particle(1.0, 0.5, 1.5);
+        let mut langevin = single_particle(1.0, 0.5, 1.5);
+        let mut fa = oscillator(k);
+        let mut fb = oscillator(k);
+        fa(&mut plain);
+        fb(&mut langevin);
+        let mut bath = LangevinBath::new(300.0, 0.0, 1);
+        let executor = Executor::shared_sequential();
+        for _ in 0..2_000 {
+            Integrator::VelocityVerlet.step(dt, &mut plain, &mut fa);
+            Integrator::VelocityVerlet.step_langevin(executor, dt, &mut langevin, &mut bath, &mut fb);
+        }
+        assert!((plain.pos_x()[0] - langevin.pos_x()[0]).abs() < 1e-12, "{} vs {}", plain.pos_x()[0], langevin.pos_x()[0]);
+        assert!((plain.vel_x()[0] - langevin.vel_x()[0]).abs() < 1e-12);
+    }
+
+    /// The O step is exact, so free particles sample the Maxwell distribution at the
+    /// bath temperature whatever the timestep. Averaged over many decorrelated
+    /// samples the kinetic temperature must sit on the target to within its own
+    /// statistical scatter — `sqrt(2 / (N_df · samples))` relative, five of them here.
+    #[test]
+    fn free_particles_under_baoab_equilibrate_to_the_bath_temperature() {
+        let n = 2_000;
+        let mut store = ParticleStore::with_capacity(n);
+        for i in 0..n {
+            store.spawn(ParticleSpec::at([i as f64, 0.0]).with_mass(1.0 + (i % 3) as f64)).unwrap();
+        }
+        let temperature = 250.0;
+        let friction = 10.0;
+        let dt = 0.05;
+        let mut bath = LangevinBath::new(temperature, friction, 77);
+        let no_forces = |s: &mut ParticleStore| s.clear_forces();
+        let executor = Executor::shared_sequential();
+
+        // Burn in for several correlation times, then sample once per correlation time.
+        for _ in 0..200 {
+            Integrator::VelocityVerlet.step_langevin(executor, dt, &mut store, &mut bath, no_forces);
+        }
+        let samples = 400;
+        let per_sample = (1.0 / (friction * dt)).ceil() as usize;
+        let mut mean = 0.0;
+        for _ in 0..samples {
+            for _ in 0..per_sample {
+                Integrator::VelocityVerlet.step_langevin(executor, dt, &mut store, &mut bath, no_forces);
+            }
+            mean += crate::analysis::temperature(&store).unwrap();
+        }
+        mean /= samples as f64;
+        let dof = 2 * n - 2;
+        let scatter = temperature * (2.0 / (dof as f64 * samples as f64)).sqrt();
+        assert!(
+            (mean - temperature).abs() < 5.0 * scatter,
+            "mean {mean} K against {temperature} K, scatter {scatter}"
+        );
+    }
+
+    /// The bath's generator is consumed in particle order on one thread, so the
+    /// executor changes nothing about a Langevin trajectory either.
+    #[test]
+    fn a_langevin_step_is_bit_identical_across_thread_counts() {
+        let run = |executor: &Executor| {
+            let mut store = ParticleStore::with_capacity(70_000);
+            for i in 0..70_000 {
+                let t = i as f64 * 1e-4;
+                store.spawn(ParticleSpec::at([t.sin(), t.cos()]).with_mass(0.5 + t)).unwrap();
+            }
+            let mut forces = oscillator(1.0);
+            forces(&mut store);
+            let mut bath = LangevinBath::new(10.0, 2.0, 5);
+            for _ in 0..5 {
+                Integrator::VelocityVerlet.step_langevin(executor, 0.01, &mut store, &mut bath, &mut forces);
+            }
+            store.pos_x().iter().chain(store.vel_y()).map(|v| v.to_bits()).collect::<Vec<_>>()
+        };
+        let reference = run(Executor::shared_sequential());
+        assert_eq!(run(&Executor::with_threads(4)), reference);
+    }
+
+    #[test]
+    #[should_panic(expected = "only defined here for velocity Verlet")]
+    fn langevin_refuses_a_first_order_scheme() {
+        let mut store = single_particle(0.0, 0.0, 1.0);
+        let mut bath = LangevinBath::new(1.0, 1.0, 0);
+        Integrator::SemiImplicitEuler.step_langevin(
+            Executor::shared_sequential(),
+            0.01,
+            &mut store,
+            &mut bath,
+            |s| s.clear_forces(),
+        );
     }
 
     #[test]

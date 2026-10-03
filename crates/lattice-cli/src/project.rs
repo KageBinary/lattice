@@ -304,6 +304,13 @@ fn render_channel(channel: &RenderChannel<'_>) -> String {
             }
             out.push_str(&render::scatter(&xs, &ys, *origin, *extent, 72, 20, "outline points"));
         }
+        RenderChannel::Bonds { pairs, .. } => {
+            // The scatter above already shows where the particles are; a terminal
+            // cannot draw a line between two of them without covering others. The
+            // count is what it can show honestly.
+            let through_walls = (0..pairs.len()).filter(|&i| channel.bond_endpoints(i).is_none()).count();
+            out.push_str(&format!("  {} bonds, {through_walls} through a periodic wall\n", pairs.len()));
+        }
         RenderChannel::Contacts { x, depth, .. } => {
             // Overlaying these on the ASCII silhouette would put two marks in one cell
             // and hide both. The numbers are what a terminal can show honestly.

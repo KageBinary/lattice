@@ -61,6 +61,7 @@ pub mod builtins;
 pub mod chemistry;
 pub mod compile;
 pub mod eval;
+pub mod molecular;
 pub mod rigid;
 
 pub use compile::{compile, Compiled};

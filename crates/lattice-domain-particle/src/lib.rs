@@ -53,20 +53,43 @@
 //! # Neighbour search
 //!
 //! Any force law that reports a [`ForceLaw::cutoff`] triggers construction of a
-//! [`CellList`]. Cells are at least one cutoff wide, so all interacting partners lie
-//! in the 3×3 block around a particle's own cell. A cutoff-based force with no region
-//! declared is a panic at [`ParticleDomain::initialize`] rather than a silent fallback
-//! to O(N²).
+//! [`NeighborList`]: a [`CellList`] whose cells are at least one cutoff wide, so all
+//! interacting partners lie in the 3×3 block around a particle's own cell, optionally
+//! cached behind a Verlet skin ([`ParticleDomain::with_skin`]). A cutoff-based force
+//! with no region declared is a panic at [`ParticleDomain::initialize`] rather than a
+//! silent fallback to O(N²).
+//!
+//! # Molecular dynamics
+//!
+//! Spec §12.4's module is the same domain with more attached: [`HarmonicBond`] and
+//! [`HarmonicAngle`] act on declared topology, [`SoftRepulsion`] and a force-shifted
+//! [`LennardJones`] join the pair laws, a [`Thermostat`] couples the system to a
+//! temperature, and [`analysis`] measures temperature, pressure, the radial
+//! distribution function and mean squared displacement. Every configuration publishes
+//! its own contract, so a thermostatted run says what it gave up to hold its
+//! temperature.
 
+pub mod analysis;
+mod bonded;
 mod domain;
 mod forces;
+mod image;
 mod integrator;
 mod neighbors;
+mod thermostat;
+mod verlet;
 
-pub use domain::{BoundaryBox, ParticleBoundary, ParticleDomain};
-pub use forces::{ForceLaw, HarmonicWell, LennardJones, LinearDrag, UniformAcceleration};
-pub use integrator::{Integrator, PARTICLE_GRAIN};
+pub use bonded::{Angle, Bond, HarmonicAngle, HarmonicBond};
+pub use domain::{BoundaryBox, ParticleBoundary, ParticleDomain, RdfRequest};
+pub use forces::{
+    ForceContext, ForceLaw, HarmonicWell, LennardJones, LinearDrag, SoftRepulsion, Truncation,
+    UniformAcceleration,
+};
+pub use image::MinimumImage;
+pub use integrator::{Integrator, LangevinBath, PARTICLE_GRAIN};
 pub use neighbors::CellList;
+pub use thermostat::{ornstein_uhlenbeck_coefficients, rescale_velocities, Thermostat, BOLTZMANN};
+pub use verlet::{Exclusions, NeighborList, VerletList};
 
 // Re-exported for convenience: constructing a domain always needs these.
 pub use lattice_ir::{ParticleId, ParticleSpec, ParticleStore};

@@ -21,6 +21,8 @@ lattice-syntax.workspace = true
 lattice-compiler.workspace = true
 lattice-runtime.workspace = true
 lattice-observe.workspace = true
+lattice-domain-grid2d.workspace = true
+lattice-wgpu.workspace = true
 
 eframe = "0.36"
 egui_plot = "0.37"

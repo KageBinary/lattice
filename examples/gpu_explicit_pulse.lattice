@@ -1,0 +1,18 @@
+// Insulated explicit diffusion, suitable for the resident GPU viewer:
+// lattice-view examples/gpu_explicit_pulse.lattice --gpu --play
+// The same source can be run by the reference CPU driver.
+project gpu_explicit_pulse {
+  dimensions: 2;
+  fidelity: engineering_2d;
+  duration: 10 second;
+  grid box { size: [256, 256]; extent: [1 meter, 1 meter]; }
+  field temperature on box =
+      gaussian(center=[0.5 meter, 0.5 meter], sigma=0.06 meter, peak=100 kelvin)
+  {
+    diffusivity: 1e-4 meter^2 / second;
+    boundary: insulated;
+  }
+  solve heat(temperature) with explicit(dt=0.01 second);
+  observe temperature every 1 second;
+  visualize temperature as heatmap;
+}

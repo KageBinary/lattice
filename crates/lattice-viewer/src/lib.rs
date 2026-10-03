@@ -31,6 +31,7 @@
 //! ```
 
 pub mod app;
+pub mod gpu;
 pub mod history;
 pub mod palette;
 pub mod render;
@@ -53,7 +54,10 @@ pub fn run_with(path: impl AsRef<Path>, play: bool) -> Result<(), String> {
     let path = path.as_ref().to_path_buf();
     let title = format!(
         "lattice — {}",
-        path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned()
+        )
     );
 
     let options = eframe::NativeOptions {
@@ -64,6 +68,10 @@ pub fn run_with(path: impl AsRef<Path>, play: bool) -> Result<(), String> {
         ..Default::default()
     };
 
-    eframe::run_native(&title, options, Box::new(move |_cc| Ok(Box::new(ViewerApp::with_options(path, play)))))
-        .map_err(|error| format!("cannot open a window: {error}"))
+    eframe::run_native(
+        &title,
+        options,
+        Box::new(move |_cc| Ok(Box::new(ViewerApp::with_options(path, play)))),
+    )
+    .map_err(|error| format!("cannot open a window: {error}"))
 }

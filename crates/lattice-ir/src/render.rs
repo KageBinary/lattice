@@ -88,6 +88,28 @@ pub enum RenderChannel<'a> {
         /// View size, m.
         extent: [f64; 2],
     },
+    /// Bonds between particles: pairs of indices into a particle channel's arrays.
+    ///
+    /// Published alongside [`RenderChannel::Particles`] by a domain with bonded
+    /// topology, and drawn over it. A pair whose separation exceeds half the box on a
+    /// periodic axis is bonded through the wall; a viewer draws nothing for it rather
+    /// than a line across the whole picture.
+    Bonds {
+        /// Channel name.
+        name: &'a str,
+        /// x positions, m.
+        x: &'a [f64],
+        /// y positions, m.
+        y: &'a [f64],
+        /// Bonded slot pairs.
+        pairs: &'a [[u32; 2]],
+        /// Which axes of the region wrap.
+        periodic: [bool; 2],
+        /// Lower-left corner of the view, m.
+        origin: [f64; 2],
+        /// View size, m.
+        extent: [f64; 2],
+    },
     /// Contact points and their normals.
     ///
     /// §17 asks for constraints and forces to be visible. A contact solver whose
@@ -117,6 +139,7 @@ impl RenderChannel<'_> {
             RenderChannel::Scalar { name, .. }
             | RenderChannel::Particles { name, .. }
             | RenderChannel::Bodies { name, .. }
+            | RenderChannel::Bonds { name, .. }
             | RenderChannel::Contacts { name, .. } => name,
         }
     }
@@ -132,6 +155,7 @@ impl RenderChannel<'_> {
                 let statics = is_static.iter().filter(|s| **s).count();
                 format!("{} rigid bodies ({statics} static)", x.len())
             }
+            RenderChannel::Bonds { pairs, .. } => format!("{} bonds", pairs.len()),
             RenderChannel::Contacts { x, .. } => format!("{} contact points", x.len()),
         }
     }
@@ -143,7 +167,7 @@ impl RenderChannel<'_> {
     pub fn has_non_finite(&self) -> bool {
         match self {
             RenderChannel::Scalar { field, .. } => field.first_non_finite().is_some(),
-            RenderChannel::Particles { x, y, .. } => {
+            RenderChannel::Particles { x, y, .. } | RenderChannel::Bonds { x, y, .. } => {
                 x.iter().chain(y.iter()).any(|v| !v.is_finite())
             }
             RenderChannel::Bodies { x, y, cos, sin, .. } => {
@@ -157,6 +181,25 @@ impl RenderChannel<'_> {
                 .chain(*depth)
                 .any(|v| !v.is_finite()),
         }
+    }
+
+    /// The two endpoints of one bond, in world coordinates, or `None` when the bond
+    /// crosses a periodic seam (its minimum-image length exceeds half the box) or the
+    /// channel is not [`RenderChannel::Bonds`].
+    pub fn bond_endpoints(&self, index: usize) -> Option<[[f64; 2]; 2]> {
+        let RenderChannel::Bonds { x, y, pairs, periodic, extent, .. } = self else {
+            return None;
+        };
+        let &[a, b] = pairs.get(index)?;
+        let (a, b) = (a as usize, b as usize);
+        let from = [*x.get(a)?, *y.get(a)?];
+        let to = [*x.get(b)?, *y.get(b)?];
+        for axis in 0..2 {
+            if periodic[axis] && (to[axis] - from[axis]).abs() > 0.5 * extent[axis] {
+                return None;
+            }
+        }
+        Some([from, to])
     }
 
     /// The vertices of one body's outline, in world coordinates.
@@ -249,6 +292,27 @@ mod tests {
             extent: [1.0, 1.0],
         };
         assert_eq!(channel.describe(), "2 particle positions");
+        assert!(!channel.has_non_finite());
+    }
+
+    #[test]
+    fn a_bond_channel_hides_bonds_through_a_periodic_wall() {
+        let (x, y) = (vec![0.5, 9.5, 1.0], vec![5.0, 5.0, 5.0]);
+        let pairs = [[0u32, 1u32], [0, 2], [2, 9]];
+        let channel = RenderChannel::Bonds {
+            name: "chain",
+            x: &x,
+            y: &y,
+            pairs: &pairs,
+            periodic: [true, false],
+            origin: [0.0, 0.0],
+            extent: [10.0, 10.0],
+        };
+        assert_eq!(channel.describe(), "3 bonds");
+        assert_eq!(channel.bond_endpoints(0), None, "bonded through the wall");
+        assert_eq!(channel.bond_endpoints(1), Some([[0.5, 5.0], [1.0, 5.0]]));
+        assert_eq!(channel.bond_endpoints(2), None, "an index past the arrays draws nothing");
+        assert_eq!(channel.bond_endpoints(7), None);
         assert!(!channel.has_non_finite());
     }
 

@@ -6,9 +6,9 @@ use lattice_ir::{
     StableStep, StepContext,
 };
 
-use crate::boundary::{apply_boundaries, HaloMode};
-use crate::operator::{DiffusionOperator, Diffusivity, BAND_GRAIN};
-use crate::solver::{conjugate_gradient, CgWorkspace};
+use crate::boundary::{HaloMode, apply_boundaries};
+use crate::operator::{BAND_GRAIN, DiffusionOperator, Diffusivity};
+use crate::solver::{CgWorkspace, conjugate_gradient};
 
 /// How the diffusion term is advanced in time.
 ///
@@ -137,7 +137,11 @@ impl HeatDomain {
         // usefulness rather than necessity: ten times what an explicit scheme could
         // manage is a visible win without being recklessly inaccurate.
         let explicit_limit = operator.explicit_stability_limit().max;
-        let preferred_dt = if explicit_limit.is_finite() { 10.0 * explicit_limit } else { 1.0 };
+        let preferred_dt = if explicit_limit.is_finite() {
+            10.0 * explicit_limit
+        } else {
+            1.0
+        };
 
         Self {
             name: name.into(),
@@ -205,7 +209,10 @@ impl HeatDomain {
     /// the earliest point that check can run.
     pub fn with_boundaries(mut self, boundaries: BoundarySet) -> Self {
         if let Err(e) = boundaries.validate() {
-            panic!("invalid boundary conditions for domain `{}`: {e}", self.name);
+            panic!(
+                "invalid boundary conditions for domain `{}`: {e}",
+                self.name
+            );
         }
         self.boundaries = boundaries;
         self
@@ -261,6 +268,11 @@ impl HeatDomain {
         ScalarField::new(&self.grid, HALO)
     }
 
+    /// Prescribed source, for backend setup using the same model data.
+    pub fn source(&self) -> Option<&ScalarField> {
+        self.source.as_ref()
+    }
+
     /// The grid.
     pub fn grid(&self) -> &Grid2d {
         &self.grid
@@ -309,8 +321,7 @@ impl HeatDomain {
     pub fn memory_bytes(&self) -> usize {
         let field_bytes = self.field.len() * size_of::<f64>();
         let fields = 4 + usize::from(self.source.is_some());
-        let faces = ((self.grid.nx() + 1) * self.grid.ny()
-            + self.grid.nx() * (self.grid.ny() + 1))
+        let faces = ((self.grid.nx() + 1) * self.grid.ny() + self.grid.nx() * (self.grid.ny() + 1))
             * size_of::<f64>();
         fields * field_bytes + self.cg.bytes() + faces
     }
@@ -349,25 +360,37 @@ impl HeatDomain {
     /// Explicit update: one stencil pass, no solve.
     fn step_explicit(&mut self, dt: f64, executor: &Executor) {
         let (dx, dy) = (self.grid.dx(), self.grid.dy());
-        let Self { field, work, operator, boundaries, source, .. } = self;
+        let Self {
+            field,
+            work,
+            operator,
+            boundaries,
+            source,
+            ..
+        } = self;
 
         apply_boundaries(field, boundaries, dx, dy, HaloMode::Inhomogeneous);
         operator.apply_with(executor, field, work);
 
         let (nx, stride, halo) = (field.nx(), field.stride(), field.halo());
-        executor.for_each_row_band_mut(field.row_span_mut(), stride, BAND_GRAIN.per_row(nx), |first, band| {
-            for local in 0..band.len() / stride {
-                let j = first + local;
-                let laplacian = work.row(j);
-                let source_row = source.as_ref().map(|s| s.row(j));
-                let base = local * stride + halo;
-                let target = &mut band[base..base + nx];
-                for i in 0..nx {
-                    let s = source_row.map_or(0.0, |r| r[i]);
-                    target[i] += dt * (laplacian[i] + s);
+        executor.for_each_row_band_mut(
+            field.row_span_mut(),
+            stride,
+            BAND_GRAIN.per_row(nx),
+            |first, band| {
+                for local in 0..band.len() / stride {
+                    let j = first + local;
+                    let laplacian = work.row(j);
+                    let source_row = source.as_ref().map(|s| s.row(j));
+                    let base = local * stride + halo;
+                    let target = &mut band[base..base + nx];
+                    for i in 0..nx {
+                        let s = source_row.map_or(0.0, |r| r[i]);
+                        target[i] += dt * (laplacian[i] + s);
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
     /// Implicit update: assemble the right-hand side, then solve.
@@ -415,22 +438,27 @@ impl HeatDomain {
         // rhs = u^n + dt·[(1−θ)·L(u^n) + θ·c + S]
         let (nx, stride, halo) = (rhs.nx(), rhs.stride(), rhs.halo());
         let current = &*field;
-        executor.for_each_row_band_mut(rhs.row_span_mut(), stride, BAND_GRAIN.per_row(nx), |first, band| {
-            for local in 0..band.len() / stride {
-                let j = first + local;
-                let previous = current.row(j);
-                let laplacian = work.row(j);
-                let constant = bc_constant.row(j);
-                let source_row = source.as_ref().map(|s| s.row(j));
-                let base = local * stride + halo;
-                let target = &mut band[base..base + nx];
-                for i in 0..nx {
-                    let s = source_row.map_or(0.0, |r| r[i]);
-                    target[i] =
-                        previous[i] + dt * ((1.0 - theta) * laplacian[i] + theta * constant[i] + s);
+        executor.for_each_row_band_mut(
+            rhs.row_span_mut(),
+            stride,
+            BAND_GRAIN.per_row(nx),
+            |first, band| {
+                for local in 0..band.len() / stride {
+                    let j = first + local;
+                    let previous = current.row(j);
+                    let laplacian = work.row(j);
+                    let constant = bc_constant.row(j);
+                    let source_row = source.as_ref().map(|s| s.row(j));
+                    let base = local * stride + halo;
+                    let target = &mut band[base..base + nx];
+                    for i in 0..nx {
+                        let s = source_row.map_or(0.0, |r| r[i]);
+                        target[i] = previous[i]
+                            + dt * ((1.0 - theta) * laplacian[i] + theta * constant[i] + s);
+                    }
                 }
-            }
-        });
+            },
+        );
 
         // Solve (I − θ·dt·L_hom)·u^{n+1} = rhs, warm-started from u^n.
         let coefficient = theta * dt;
@@ -572,7 +600,10 @@ impl Domain for HeatDomain {
 
     fn stable_step(&self) -> StableStep {
         match self.scheme {
-            TimeScheme::Explicit => self.operator.explicit_stability_limit(),
+            TimeScheme::Explicit => StableStep {
+                preferred: self.preferred_dt,
+                ..self.operator.explicit_stability_limit()
+            },
             _ => StableStep::unconditional(self.preferred_dt),
         }
     }
@@ -596,8 +627,16 @@ impl Domain for HeatDomain {
             self.integral_unit(),
             ObservationKind::Invariant(Invariant::FieldIntegral),
         );
-        out.record_metric(format!("{prefix}.min"), self.field.min_interior(), self.display_unit.clone());
-        out.record_metric(format!("{prefix}.max"), self.field.max_interior(), self.display_unit.clone());
+        out.record_metric(
+            format!("{prefix}.min"),
+            self.field.min_interior(),
+            self.display_unit.clone(),
+        );
+        out.record_metric(
+            format!("{prefix}.max"),
+            self.field.max_interior(),
+            self.display_unit.clone(),
+        );
 
         // Whether these rows exist is decided by the *scheme*, not by whether a step has
         // happened yet. An explicit scheme has no linear solve, so reporting one would
@@ -606,11 +645,9 @@ impl Domain for HeatDomain {
         // step and vanish again on a reset — a reader watching a table gain and lose
         // rows reasonably concludes something broke, and nothing did.
         if self.scheme.is_implicit() {
-            let (iterations, residual) = self
-                .last_outcome
-                .map_or((0.0, 0.0), |outcome| {
-                    (outcome.iterations() as f64, outcome.residual())
-                });
+            let (iterations, residual) = self.last_outcome.map_or((0.0, 0.0), |outcome| {
+                (outcome.iterations() as f64, outcome.residual())
+            });
             out.record(
                 format!("{prefix}.solver_iterations"),
                 iterations,
@@ -703,6 +740,18 @@ mod tests {
         HeatDomain::new(name, grid, Diffusivity::Uniform(1.0))
     }
 
+    #[test]
+    fn explicit_preferred_timestep_is_honored_without_changing_the_stability_limit() {
+        let heat = domain("explicit").with_scheme(TimeScheme::Explicit);
+        let limit = heat.stable_step().max;
+        let heat = heat.with_preferred_step(limit / 10.0);
+        assert_eq!(heat.stable_step().preferred, limit / 10.0);
+        assert_eq!(heat.stable_step().max, limit);
+        let heat = heat.with_preferred_step(limit * 2.0);
+        assert_eq!(heat.stable_step().preferred, limit * 2.0);
+        assert!(!heat.stable_step().admits(heat.stable_step().preferred));
+    }
+
     /// The viewer draws a scale bar labelled "K" beside a table row reading
     /// "(field unit)·m^2", and a reader has to decide which one is lying.
     #[test]
@@ -714,13 +763,21 @@ mod tests {
         );
 
         let labelled = domain("h").with_display_unit("K");
-        assert_eq!(labelled.integral_unit(), "K·m^2", "an area integral of kelvin is K·m^2");
+        assert_eq!(
+            labelled.integral_unit(),
+            "K·m^2",
+            "an area integral of kelvin is K·m^2"
+        );
 
         // And it survives into the observation, which is where a reader sees it.
         let mut out = Observations::new();
         labelled.observe(&mut out);
         assert_eq!(out.get("h.integral").unwrap().unit, "K·m^2");
-        assert_eq!(out.get("h.max").unwrap().unit, "K", "and agrees with the scale bar");
+        assert_eq!(
+            out.get("h.max").unwrap().unit,
+            "K",
+            "and agrees with the scale bar"
+        );
         assert!(
             matches!(
                 out.get("h.integral").unwrap().kind,

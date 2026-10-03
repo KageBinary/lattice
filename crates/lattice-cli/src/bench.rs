@@ -292,8 +292,8 @@ fn bench_particles_lj(scale: usize, executor: &Executor) -> BenchOutcome {
     let momentum_scale: f64 =
         domain.store().vel_x().iter().zip(domain.store().mass()).map(|(v, m)| (v * m).abs()).sum();
     let pairs = domain
-        .cells()
-        .map(|c| c.pair_count(domain.store().pos_x(), domain.store().pos_y()))
+        .neighbors()
+        .map(|list| list.pair_count(domain.store().pos_x(), domain.store().pos_y()))
         .unwrap_or(0);
 
     let compute_start = Instant::now();
@@ -366,6 +366,7 @@ fn run_heat(
 
     let compute_start = Instant::now();
     let mut worst_iterations = 0usize;
+    let mut total_iterations = 0usize;
     let mut any_diverged = false;
     {
         let mut arena = Arena::with_capacity(0);
@@ -374,6 +375,7 @@ fn run_heat(
             domain.advance(dt, &mut ctx);
             if let Some(outcome) = domain.last_solve() {
                 worst_iterations = worst_iterations.max(outcome.iterations());
+                total_iterations += outcome.iterations();
                 any_diverged |= !outcome.is_converged();
             }
         }
@@ -396,6 +398,16 @@ fn run_heat(
             "linear solves that failed to converge",
             f64::from(u8::from(any_diverged)),
             0.0,
+        ));
+        // Published so that this number is comparable with the GPU benchmark's. A step of an
+        // implicit scheme is not a fixed amount of work, and two backends solving to
+        // different residual tolerances do different numbers of iterations to reach it — so
+        // steps per second alone cannot be compared between them, and §19.3's "publish the
+        // conditions" needs this to be one of the conditions.
+        checks.push(Check::new(
+            "conjugate-gradient iterations per step",
+            total_iterations as f64 / steps.max(1) as f64,
+            64.0,
         ));
     }
 

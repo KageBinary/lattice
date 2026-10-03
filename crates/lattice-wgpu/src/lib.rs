@@ -52,8 +52,19 @@
 //! as a failure — the validation suite reports such cases the way M3 reports the Gillespie
 //! rows, because a case that could not run must not report as passing.
 
+mod bindings;
+mod crank_nicolson;
 mod device;
 mod diffusion;
+mod field_image;
+mod geometry;
+mod particles;
+mod reduction;
+pub use field_image::GpuFieldImage;
+pub use wgpu;
 
+pub use crank_nicolson::{CgOutcome, CrankNicolsonSetup, GpuCrankNicolson, ImplicitError};
 pub use device::{GpuBuffer, GpuDevice};
 pub use diffusion::{DiffusionError, DiffusionSetup, GpuDiffusion, SOLVER_PRECISION};
+pub use particles::{GpuParticles, ParticleSetup, ParticleSnapshot};
+pub use reduction::{GpuDot, Interior};

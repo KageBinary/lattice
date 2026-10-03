@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, containers, TextureHandle, TextureOptions};
+use eframe::egui::{self, TextureHandle, TextureOptions, containers};
 use egui_plot::{Line, Plot, PlotPoints};
 use lattice_compiler::compile_source;
 use lattice_ir::{Observations, RenderChannel};
@@ -66,7 +66,10 @@ pub struct ViewerApp {
 
 impl std::fmt::Debug for ViewerApp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ViewerApp").field("path", &self.path).field("playing", &self.playing).finish()
+        f.debug_struct("ViewerApp")
+            .field("path", &self.path)
+            .field("playing", &self.playing)
+            .finish()
     }
 }
 
@@ -129,7 +132,10 @@ fn load(path: &Path) -> State {
         Ok(text) => text,
         Err(error) => return State::Failed(format!("cannot read {}: {error}", path.display())),
     };
-    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let file = SourceFile::new(name, text);
 
     let (compiled, diagnostics) = compile_source(&file);
@@ -147,9 +153,13 @@ fn load(path: &Path) -> State {
         );
     }
 
-    let warnings = if diagnostics.is_empty() { String::new() } else { diagnostics.render(&file) };
+    let warnings = if diagnostics.is_empty() {
+        String::new()
+    } else {
+        diagnostics.render(&file)
+    };
     let report = compiled.model.report();
-    let simulation = Simulation::new(compiled.model, compiled.domains);
+    let simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
 
     let stability = simulation.stability();
     let timestep = simulation
@@ -192,7 +202,12 @@ impl eframe::App for ViewerApp {
 
             // Stop at the first non-finite value rather than filling the plots with
             // NaN and burying it (NFR-007).
-            if loaded.simulation.observations().first_non_finite().is_some() {
+            if loaded
+                .simulation
+                .observations()
+                .first_non_finite()
+                .is_some()
+            {
                 self.playing = false;
             }
             ctx.request_repaint();
@@ -212,7 +227,11 @@ impl ViewerApp {
                 let ready = matches!(self.state, State::Ready(_));
 
                 ui.add_enabled_ui(ready, |ui| {
-                    let label = if self.playing { "⏸  pause" } else { "▶  play" };
+                    let label = if self.playing {
+                        "⏸  pause"
+                    } else {
+                        "▶  play"
+                    };
                     if ui.button(label).clicked() {
                         self.playing = !self.playing;
                     }
@@ -258,9 +277,17 @@ impl ViewerApp {
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let theme = if self.mode == Mode::Dark { "☀ light" } else { "🌙 dark" };
+                    let theme = if self.mode == Mode::Dark {
+                        "☀ light"
+                    } else {
+                        "🌙 dark"
+                    };
                     if ui.button(theme).clicked() {
-                        self.mode = if self.mode == Mode::Dark { Mode::Light } else { Mode::Dark };
+                        self.mode = if self.mode == Mode::Dark {
+                            Mode::Light
+                        } else {
+                            Mode::Dark
+                        };
                     }
                     ui.colored_label(
                         palette.text_muted,
@@ -273,140 +300,158 @@ impl ViewerApp {
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        containers::Panel::right("diagnostics").default_size(380.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let State::Ready(loaded) = &self.state else {
-                    ui.colored_label(palette.status(Status::Critical), "this model did not compile");
-                    return;
-                };
-
-                ui.add_space(6.0);
-                ui.heading("diagnostics");
-
-                // Timestep against the stability limit. Spec §17.3 wants the viewer to
-                // answer "why is my timestep so small?" with the mechanism, so the
-                // limiting domain is named.
-                ui.add_space(4.0);
-                ui.colored_label(palette.text_secondary, "stability");
-                let verdict = render::stability_verdict(loaded.timestep, loaded.stability_limit);
-                render::status_line(ui, palette, &verdict);
-                if let Some(domain) = &loaded.limiting_domain {
-                    ui.colored_label(palette.text_muted, format!("set by domain `{domain}`"));
-                }
-
-                // Conservation drift, one line per quantity that ought to be conserved.
-                ui.add_space(8.0);
-                ui.colored_label(palette.text_secondary, "conservation");
-                let mut any = false;
-                for series in self.history.series() {
-                    if !series.is_invariant() || series.is_constant() {
-                        continue;
-                    }
-                    let Some(drift) = self.history.drift_of(series) else { continue };
-                    any = true;
-                    ui.colored_label(palette.text_primary, short_name(&series.name));
-                    let mut verdict = render::drift_verdict(drift.value);
-                    // Name the yardstick rather than describing it. "of momentum_scale"
-                    // points at a row of the values table two inches below; "of the
-                    // scale being cancelled" leaves the reader to guess which scale.
-                    let basis = match drift.basis {
-                        DriftBasis::PublishedScale => self
-                            .history
-                            .scale_series_for(&series.name)
-                            .map_or_else(|| drift.basis.phrase().to_string(), |scale| {
-                                format!("of {}", short_name(&scale.name))
-                            }),
-                        other => other.phrase().to_string(),
-                    };
-                    verdict.detail = format!("{:+.3e} {basis}", drift.value);
-                    render::status_line(ui, palette, &verdict);
-                }
-                if !any {
-                    // Distinguish "not started" from "this scene has no invariant to
-                    // report". A rigid world with gravity and a floor genuinely has
-                    // none, and saying so beats an empty heading.
-                    let claims_any = self.history.series().iter().any(Series::is_invariant);
-                    ui.colored_label(
-                        palette.text_muted,
-                        if claims_any || self.history.sample_count() < 2 {
-                            "nothing has drifted yet — press play"
-                        } else {
-                            "no conserved quantity here — gravity adds momentum and a static \
-                             body absorbs it, so this domain publishes none"
-                        },
-                    );
-                }
-
-                // The values table. This is the relief channel that makes the plots
-                // legible without relying on colour, and it is where a reader gets an
-                // exact number rather than a position on an axis.
-                ui.add_space(8.0);
-                ui.colored_label(palette.text_secondary, "current values");
-                egui::Grid::new("values").num_columns(2).striped(true).show(ui, |ui| {
-                    for series in self.history.series() {
-                        let Some(latest) = series.latest() else { continue };
-                        ui.colored_label(palette.text_secondary, short_name(&series.name));
-                        let color = if latest.is_finite() {
-                            palette.text_primary
-                        } else {
-                            palette.status(Status::Critical)
-                        };
-                        let scale = self.history.display_scale_for(series);
+        containers::Panel::right("diagnostics")
+            .default_size(380.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let State::Ready(loaded) = &self.state else {
                         ui.colored_label(
-                            color,
-                            format!(
-                                "{} {}",
-                                render::format_value_against(latest, scale),
-                                unit_label(&series.unit)
-                            ),
+                            palette.status(Status::Critical),
+                            "this model did not compile",
                         );
-                        ui.end_row();
-                    }
-                });
+                        return;
+                    };
 
-                // One plot per unit. Never two units on one pair of axes.
-                let groups = self.history.by_unit();
-                let plottable = groups
-                    .iter()
-                    .any(|(_, members)| members.iter().any(|s| self.history.is_worth_plotting(s)));
-                if plottable {
-                    ui.add_space(10.0);
-                    ui.colored_label(palette.text_secondary, "over time");
-                    for (unit, members) in &groups {
-                        plot_group(ui, palette, &self.history, unit, members);
-                    }
-                }
+                    ui.add_space(6.0);
+                    ui.heading("diagnostics");
 
-                ui.add_space(10.0);
-                ui.checkbox(&mut self.show_contracts, "solver contracts");
-                if self.show_contracts {
-                    for spec in &loaded.simulation.model().domains {
-                        if let Some(contract) = spec.contract {
-                            ui.add_space(4.0);
-                            ui.monospace(contract.report());
+                    // Timestep against the stability limit. Spec §17.3 wants the viewer to
+                    // answer "why is my timestep so small?" with the mechanism, so the
+                    // limiting domain is named.
+                    ui.add_space(4.0);
+                    ui.colored_label(palette.text_secondary, "stability");
+                    let verdict =
+                        render::stability_verdict(loaded.timestep, loaded.stability_limit);
+                    render::status_line(ui, palette, &verdict);
+                    if let Some(domain) = &loaded.limiting_domain {
+                        ui.colored_label(palette.text_muted, format!("set by domain `{domain}`"));
+                    }
+
+                    // Conservation drift, one line per quantity that ought to be conserved.
+                    ui.add_space(8.0);
+                    ui.colored_label(palette.text_secondary, "conservation");
+                    let mut any = false;
+                    for series in self.history.series() {
+                        if !series.is_invariant() || series.is_constant() {
+                            continue;
+                        }
+                        let Some(drift) = self.history.drift_of(series) else {
+                            continue;
+                        };
+                        any = true;
+                        ui.colored_label(palette.text_primary, short_name(&series.name));
+                        let mut verdict = render::drift_verdict(drift.value);
+                        // Name the yardstick rather than describing it. "of momentum_scale"
+                        // points at a row of the values table two inches below; "of the
+                        // scale being cancelled" leaves the reader to guess which scale.
+                        let basis = match drift.basis {
+                            DriftBasis::PublishedScale => {
+                                self.history.scale_series_for(&series.name).map_or_else(
+                                    || drift.basis.phrase().to_string(),
+                                    |scale| format!("of {}", short_name(&scale.name)),
+                                )
+                            }
+                            other => other.phrase().to_string(),
+                        };
+                        verdict.detail = format!("{:+.3e} {basis}", drift.value);
+                        render::status_line(ui, palette, &verdict);
+                    }
+                    if !any {
+                        // Distinguish "not started" from "this scene has no invariant to
+                        // report". A rigid world with gravity and a floor genuinely has
+                        // none, and saying so beats an empty heading.
+                        let claims_any = self.history.series().iter().any(Series::is_invariant);
+                        ui.colored_label(
+                            palette.text_muted,
+                            if claims_any || self.history.sample_count() < 2 {
+                                "nothing has drifted yet — press play"
+                            } else {
+                                "no conserved quantity here — gravity adds momentum and a static \
+                             body absorbs it, so this domain publishes none"
+                            },
+                        );
+                    }
+
+                    // The values table. This is the relief channel that makes the plots
+                    // legible without relying on colour, and it is where a reader gets an
+                    // exact number rather than a position on an axis.
+                    ui.add_space(8.0);
+                    ui.colored_label(palette.text_secondary, "current values");
+                    egui::Grid::new("values")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for series in self.history.series() {
+                                let Some(latest) = series.latest() else {
+                                    continue;
+                                };
+                                ui.colored_label(palette.text_secondary, short_name(&series.name));
+                                let color = if latest.is_finite() {
+                                    palette.text_primary
+                                } else {
+                                    palette.status(Status::Critical)
+                                };
+                                let scale = self.history.display_scale_for(series);
+                                ui.colored_label(
+                                    color,
+                                    format!(
+                                        "{} {}",
+                                        render::format_value_against(latest, scale),
+                                        unit_label(&series.unit)
+                                    ),
+                                );
+                                ui.end_row();
+                            }
+                        });
+
+                    // One plot per unit. Never two units on one pair of axes.
+                    let groups = self.history.by_unit();
+                    let plottable = groups.iter().any(|(_, members)| {
+                        members.iter().any(|s| self.history.is_worth_plotting(s))
+                    });
+                    if plottable {
+                        ui.add_space(10.0);
+                        ui.colored_label(palette.text_secondary, "over time");
+                        for (unit, members) in &groups {
+                            plot_group(ui, palette, &self.history, unit, members);
                         }
                     }
-                }
-                ui.checkbox(&mut self.show_report, "model report");
-                if self.show_report {
-                    ui.monospace(&loaded.report);
-                }
-                if !loaded.warnings.is_empty() {
-                    ui.add_space(6.0);
-                    ui.colored_label(palette.status(Status::Warning), "compiler warnings");
-                    ui.monospace(&loaded.warnings);
-                }
-                ui.add_space(12.0);
+
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut self.show_contracts, "solver contracts");
+                    if self.show_contracts {
+                        for spec in &loaded.simulation.model().domains {
+                            if let Some(contract) = spec.contract {
+                                ui.add_space(4.0);
+                                ui.monospace(contract.report());
+                            }
+                        }
+                    }
+                    ui.checkbox(&mut self.show_report, "model report");
+                    if self.show_report {
+                        ui.monospace(&loaded.report);
+                    }
+                    if !loaded.warnings.is_empty() {
+                        ui.add_space(6.0);
+                        ui.colored_label(palette.status(Status::Warning), "compiler warnings");
+                        ui.monospace(&loaded.warnings);
+                    }
+                    ui.add_space(12.0);
+                });
             });
-        });
     }
 
     fn central(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         containers::CentralPanel::default().show(ui, |ui| {
             let State::Ready(loaded) = &self.state else {
-                let State::Failed(message) = &self.state else { return };
+                let State::Failed(message) = &self.state else {
+                    return;
+                };
                 ui.add_space(12.0);
-                ui.colored_label(palette.status(Status::Critical), "this model did not compile");
+                ui.colored_label(
+                    palette.status(Status::Critical),
+                    "this model did not compile",
+                );
                 ui.add_space(6.0);
                 ui.monospace(message);
                 ui.add_space(6.0);
@@ -422,10 +467,11 @@ impl ViewerApp {
 
             // Contacts are drawn over the bodies rather than in a panel of their own,
             // so they must not claim a share of the height — otherwise a rigid scene
-            // gets half the picture it should and nothing says why.
+            // gets half the picture it should and nothing says why. Bonds sit over
+            // their particles for the same reason.
             let drawn = channels
                 .iter()
-                .filter(|c| !matches!(c, RenderChannel::Contacts { .. }))
+                .filter(|c| !matches!(c, RenderChannel::Contacts { .. } | RenderChannel::Bonds { .. }))
                 .count()
                 .max(1);
             let available = ui.available_height();
@@ -433,15 +479,24 @@ impl ViewerApp {
 
             // Contacts belong on top of the bodies they were found between, not in a
             // panel of their own where a reader would have to align two pictures by eye.
-            let contacts =
-                channels.iter().find(|c| matches!(c, RenderChannel::Contacts { .. }));
+            let contacts = channels
+                .iter()
+                .find(|c| matches!(c, RenderChannel::Contacts { .. }));
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for channel in &channels {
+                    // The bonds published under the same name as a particle channel
+                    // are drawn into its rectangle.
+                    let overlay = match channel {
+                        RenderChannel::Particles { name, .. } => channels
+                            .iter()
+                            .find(|c| matches!(c, RenderChannel::Bonds { name: bonds, .. } if bonds == name)),
+                        _ => contacts,
+                    };
                     draw_channel(
                         ui,
                         channel,
-                        contacts,
+                        overlay,
                         per_channel,
                         self.colormap,
                         self.mode,
@@ -454,7 +509,10 @@ impl ViewerApp {
                 // Colourmap controls belong to fields. A rigid scene has no continuous
                 // encoding to configure, and offering the choice anyway invites a reader
                 // to look for the field it applies to.
-                if channels.iter().any(|c| matches!(c, RenderChannel::Scalar { .. })) {
+                if channels
+                    .iter()
+                    .any(|c| matches!(c, RenderChannel::Scalar { .. }))
+                {
                     ui.horizontal(|ui| {
                         ui.colored_label(palette.text_secondary, "colour");
                         for map in [Colormap::Sequential, Colormap::Diverging] {
@@ -476,7 +534,8 @@ impl ViewerApp {
 fn draw_channel(
     ui: &mut egui::Ui,
     channel: &RenderChannel<'_>,
-    // The contacts published alongside a body channel, drawn into the same rectangle.
+    // The contacts published alongside a body channel, or the bonds published
+    // alongside a particle channel, drawn into the same rectangle.
     contacts: Option<&RenderChannel<'_>>,
     height: f32,
     colormap: Colormap,
@@ -484,9 +543,9 @@ fn draw_channel(
     palette: &Palette,
     textures: &mut BTreeMap<String, TextureHandle>,
 ) {
-    // Contacts are drawn over the bodies, so a heading of their own would sit above
-    // nothing.
-    if matches!(channel, RenderChannel::Contacts { .. }) {
+    // Contacts are drawn over the bodies and bonds over their particles, so a heading
+    // of their own would sit above nothing.
+    if matches!(channel, RenderChannel::Contacts { .. } | RenderChannel::Bonds { .. }) {
         return;
     }
 
@@ -497,7 +556,12 @@ fn draw_channel(
     });
 
     match channel {
-        RenderChannel::Scalar { name, field, grid, unit } => {
+        RenderChannel::Scalar {
+            name,
+            field,
+            grid,
+            unit,
+        } => {
             let rendered = render::field_to_image(field, colormap, mode, palette);
 
             let handle = match textures.get_mut(*name) {
@@ -506,7 +570,9 @@ fn draw_channel(
                     handle.clone()
                 }
                 None => {
-                    let handle = ui.ctx().load_texture(*name, rendered.image.clone(), TEXTURE);
+                    let handle = ui
+                        .ctx()
+                        .load_texture(*name, rendered.image.clone(), TEXTURE);
                     textures.insert((*name).to_string(), handle.clone());
                     handle
                 }
@@ -564,7 +630,9 @@ fn draw_channel(
             }
         }
 
-        RenderChannel::Bodies { x, origin, extent, .. } => {
+        RenderChannel::Bodies {
+            x, origin, extent, ..
+        } => {
             let aspect = (extent[0] / extent[1]) as f32;
             let plot_height = (height - 40.0).max(120.0);
             let width = (plot_height * aspect).min(ui.available_width() - 8.0);
@@ -607,10 +675,17 @@ fn draw_channel(
             ui.colored_label(palette.text_muted, caption);
         }
 
-        // Drawn over the bodies rather than on its own, so it never appears here.
-        RenderChannel::Contacts { .. } => {}
+        // Drawn over the bodies or particles rather than on their own, so these never
+        // appear here.
+        RenderChannel::Contacts { .. } | RenderChannel::Bonds { .. } => {}
 
-        RenderChannel::Particles { x, y, origin, extent, .. } => {
+        RenderChannel::Particles {
+            x,
+            y,
+            origin,
+            extent,
+            ..
+        } => {
             let aspect = (extent[0] / extent[1]) as f32;
             let plot_height = (height - 40.0).max(120.0);
             let width = (plot_height * aspect).min(ui.available_width() - 8.0);
@@ -618,7 +693,11 @@ fn draw_channel(
 
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             ui.painter().rect_filled(rect, 2.0, palette.plane);
-            let outside = render::draw_particles(ui.painter(), rect, x, y, *origin, *extent, palette);
+            // Bonds first, so a particle's mark sits on top of the lines meeting it.
+            let bonds = contacts.filter(|c| matches!(c, RenderChannel::Bonds { .. }));
+            let hidden = bonds.map_or(0, |b| render::draw_bonds(ui.painter(), rect, b, palette));
+            let outside =
+                render::draw_particles(ui.painter(), rect, x, y, *origin, *extent, palette);
             ui.painter().rect_stroke(
                 rect,
                 2.0,
@@ -632,6 +711,12 @@ fn draw_channel(
                 render::format_value(extent[0]),
                 render::format_value(extent[1])
             );
+            if let Some(RenderChannel::Bonds { pairs, .. }) = bonds {
+                caption.push_str(&format!(", {} bonds", pairs.len()));
+                if hidden > 0 {
+                    caption.push_str(&format!(" ({hidden} through a periodic wall, not drawn)"));
+                }
+            }
             if outside > 0 {
                 caption.push_str(&format!(", {outside} outside the view"));
             }
@@ -657,8 +742,11 @@ fn plot_group(
     // belongs anyway. A third case joins them: a quantity that is nothing against the
     // scale its domain published — a net momentum of 1e-13 where the momenta being
     // cancelled are of order 100.
-    let varying: Vec<&crate::history::Series> =
-        members.iter().copied().filter(|series| history.is_worth_plotting(series)).collect();
+    let varying: Vec<&crate::history::Series> = members
+        .iter()
+        .copied()
+        .filter(|series| history.is_worth_plotting(series))
+        .collect();
     if varying.is_empty() {
         return;
     }
@@ -690,8 +778,11 @@ fn plot_group(
         }
     });
 
-    let names: Vec<&str> =
-        varying.iter().take(shown).map(|series| short_name(&series.name)).collect();
+    let names: Vec<&str> = varying
+        .iter()
+        .take(shown)
+        .map(|series| short_name(&series.name))
+        .collect();
     render::legend_row(ui, palette, &names);
 
     if varying.len() > shown {
@@ -734,6 +825,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loading_a_coupled_model_preserves_its_energy_transfers() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chamber.lattice");
+        let State::Ready(mut loaded) = load(&path) else {
+            panic!("chamber should load")
+        };
+        for _ in 0..3 {
+            loaded.simulation.step(loaded.timestep);
+        }
+        assert!(loaded.simulation.coupling_faults().is_empty());
+        assert!(
+            !loaded.simulation.ledger().transfers().is_empty(),
+            "viewer must retain the compiler's coupling edges"
+        );
+    }
+
+    #[test]
     fn short_names_drop_the_domain_prefix() {
         assert_eq!(short_name("temperature.integral"), "integral");
         assert_eq!(short_name("bare"), "bare");
@@ -764,7 +871,10 @@ mod tests {
         match load(&path) {
             State::Failed(message) => {
                 assert!(message.contains("extent"), "{message}");
-                assert!(message.contains("-->"), "diagnostics should carry a position: {message}");
+                assert!(
+                    message.contains("-->"),
+                    "diagnostics should carry a position: {message}"
+                );
             }
             State::Ready(_) => panic!("this model should not compile"),
         }

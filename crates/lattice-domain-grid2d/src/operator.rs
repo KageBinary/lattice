@@ -334,6 +334,53 @@ mod tests {
         );
     }
 
+    /// `L(0) = 0` under insulated boundaries, and *identically* so — not to within a
+    /// rounding, but bit for bit, including the sign of the zero.
+    ///
+    /// This is the affine constant `c` that `HeatDomain::step_implicit` measures and moves
+    /// to the right-hand side. Insulated is the one boundary set where it vanishes: a zero
+    /// interior gives zero ghosts, so every flux is `face · (0 − 0)`, and face coefficients
+    /// are harmonic means and therefore non-negative, so not even a `−0.0` survives to
+    /// propagate.
+    ///
+    /// Asserted rather than assumed because `lattice-wgpu`'s `assemble_rhs` omits the term
+    /// entirely. The Dirichlet half of the test is the reason that omission cannot simply be
+    /// generalized: there, `c` is the boundary values and dropping it would produce a
+    /// converged, plausible, wrong answer.
+    #[test]
+    fn l_of_zero_is_identically_zero_under_insulated_boundaries() {
+        let (grid, mut zero, op) = setup(7, 5, 2.5);
+        zero.fill_interior(0.0);
+        apply_boundaries(&mut zero, &BoundarySet::INSULATED, grid.dx(), grid.dy(), HaloMode::Inhomogeneous);
+
+        let mut constant = ScalarField::filled(&grid, 1, f64::NAN);
+        op.apply(&zero, &mut constant);
+
+        for j in 0..grid.ny() {
+            for i in 0..grid.nx() {
+                let value = constant.get(i, j);
+                assert_eq!(
+                    value.to_bits(),
+                    0.0f64.to_bits(),
+                    "L(0) at ({i}, {j}) is {value}, not a positive zero"
+                );
+            }
+        }
+
+        // The contrast that makes the claim specific to insulated boundaries. A prescribed
+        // value is exactly what an affine constant is, and it does not vanish.
+        let mut dirichlet = ScalarField::new(&grid, 1);
+        dirichlet.fill_interior(0.0);
+        let boundaries = BoundarySet::uniform(Boundary::Dirichlet { value: 400.0 });
+        apply_boundaries(&mut dirichlet, &boundaries, grid.dx(), grid.dy(), HaloMode::Inhomogeneous);
+        op.apply(&dirichlet, &mut constant);
+        assert!(
+            constant.max_abs_interior() > 0.0,
+            "a Dirichlet boundary must leave a non-zero affine constant, or step_implicit \
+             would not need to measure one"
+        );
+    }
+
     #[test]
     fn harmonic_mean_behaves_at_the_extremes() {
         assert!((harmonic_mean(2.0, 2.0) - 2.0).abs() < 1e-15, "equal values pass through");

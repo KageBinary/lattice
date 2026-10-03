@@ -34,7 +34,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test                      # 1025 tests across 18 crates
+$ cargo test --workspace --all-features # 1062 tests including doctests across 18 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
@@ -53,7 +53,7 @@ does reach them, so run the whole workspace before committing.
 ### The GPU backend
 
 Off by default. §19.1's GPU cross-backend rows are *absent* from `lattice validate` without
-the feature — 45 cases rather than 48 — rather than reported as skipped-and-passing.
+the feature — 45 cases rather than 56 — rather than reported as skipped-and-passing.
 
 ```console
 $ cargo run -p lattice-wgpu --example probe    # what this machine's adapter offers
@@ -62,13 +62,17 @@ $ cargo run -p lattice-cli --features gpu -- validate --filter gpu
 
 $ cargo build --release -p lattice-cli --features gpu
 $ ./target/release/lattice bench heat-explicit --backend gpu --scale 4
+$ ./target/release/lattice bench particles-lj --backend gpu --scale 5
+$ cargo run --release -p lattice-wgpu --example render_bench
+$ cargo run --release -p lattice-wgpu --example startup_bench
+$ cargo run --release -p lattice-cli --example schedule_bench
 ```
 
 **Publishing a GPU timing needs more care than a CPU one.** Opening a device costs about
 0.8 s once per process and is printed separately for that reason; the first buffer round
 trip on a fresh device costs ~56 ms against a ~160 µs steady state; and `--compare` runs
 both backends in one process, which is fine for a check and wrong for a published figure.
-Separate processes, best of three, and read [backends.md](backends.md)'s "what the
+Separate processes, report all repeats and their median, and read [backends.md](backends.md)'s "what the
 measurement got wrong first" before trusting a surprising number — all three mistakes it
 records were reproducible.
 
@@ -104,9 +108,16 @@ all three have already been broken once:
   execution.md for what conflating them cost. Measure with `lattice bench <name>
   --threads auto --compare`, best of three — the noise floor is around ±20%, and a
   "regression" that justified a redesign here turned out to be nothing.
-- **No reductions.** A sum split into chunks is not the sum added in order, and the
-  difference would vary with the machine's core count. If a kernel needs one, it stays
-  sequential and says so.
+- **No reductions on the CPU.** A sum split into chunks is not the sum added in order, and
+  the difference would vary with the machine's core count. If a CPU kernel needs one, it
+  stays sequential and says so.
+
+  The GPU has no sequential path to retreat to, so the rule there is different and stricter
+  in its own way: a device reduction must have an association order that is **fixed and
+  written down**, not merely deterministic by accident. `reduction.wgsl` states its order in
+  the file header and `Interior::depth` turns it into the number a budget is handed. A
+  reduction that merely *differs* from the reference is a mechanism you can bound; one whose
+  order is unpredictable is not, and no amount of tolerance fixes it.
 
 Then add a case to `crates/lattice-validation/src/execution.rs`, sized **above** the
 grain's floor. A cross-backend case on a problem too small to be split compares the

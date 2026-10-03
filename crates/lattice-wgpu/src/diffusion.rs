@@ -58,7 +58,11 @@ pub enum DiffusionError {
     /// The device could not do something.
     Device(DeviceError),
     /// A buffer's length did not match the geometry it was described by.
-    Shape { what: &'static str, expected: usize, given: usize },
+    Shape {
+        what: &'static str,
+        expected: usize,
+        given: usize,
+    },
     /// A boundary condition this solver does not implement.
     UnsupportedBoundary(&'static str),
     /// Geometry that cannot be run: no cells, or no halo for the stencil to read.
@@ -69,7 +73,11 @@ impl core::fmt::Display for DiffusionError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             DiffusionError::Device(error) => write!(f, "{error}"),
-            DiffusionError::Shape { what, expected, given } => {
+            DiffusionError::Shape {
+                what,
+                expected,
+                given,
+            } => {
                 write!(f, "{what} should have {expected} elements but has {given}")
             }
             DiffusionError::UnsupportedBoundary(name) => write!(
@@ -116,25 +124,22 @@ pub struct GpuDiffusion {
 
 impl GpuDiffusion {
     /// Upload `setup` and prepare the pipelines.
-    pub fn new(device: &GpuDevice, setup: DiffusionSetup<'_>) -> Result<GpuDiffusion, DiffusionError> {
-        let DiffusionSetup { nx, ny, halo, stride, .. } = setup;
+    pub fn new(
+        device: &GpuDevice,
+        setup: DiffusionSetup<'_>,
+    ) -> Result<GpuDiffusion, DiffusionError> {
+        let DiffusionSetup {
+            nx,
+            ny,
+            halo,
+            stride,
+            ..
+        } = setup;
 
-        if nx == 0 || ny == 0 {
-            return Err(DiffusionError::Geometry("a field needs at least one cell".to_string()));
-        }
-        if halo < 1 {
-            return Err(DiffusionError::Geometry(
-                "the five-point stencil reads one ghost cell on each side, so halo must be >= 1"
-                    .to_string(),
-            ));
-        }
-        if stride != nx + 2 * halo {
-            return Err(DiffusionError::Geometry(format!(
-                "stride {stride} does not match nx {nx} with halo {halo}"
-            )));
-        }
-
-        let total = stride * (ny + 2 * halo);
+        let total = crate::geometry::grid(device, nx, ny, halo, stride)
+            .map_err(DiffusionError::Geometry)?;
+        crate::geometry::coefficients(setup.inv_dx2, setup.inv_dy2, setup.face_x, setup.face_y)
+            .map_err(DiffusionError::Geometry)?;
         check(setup.field.len(), total, "the field")?;
         check(setup.face_x.len(), (nx + 1) * ny, "face_x")?;
         check(setup.face_y.len(), nx * (ny + 1), "face_y")?;
@@ -157,39 +162,22 @@ impl GpuDiffusion {
             device.precision(),
             device.capabilities(),
         );
-        let module = device.shader_module(key, &source_key)?;
-
-        let layout = device.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("diffusion"),
-            entries: &[
-                uniform_entry(0),
-                storage_entry(1, false),
-                storage_entry(2, false),
-                storage_entry(3, true),
-                storage_entry(4, true),
-                storage_entry(5, true),
+        let kernels = device.pipeline_set(
+            key,
+            &source_key,
+            &[
+                crate::bindings::uniform(0),
+                crate::bindings::storage(1, false),
+                crate::bindings::storage(2, false),
+                crate::bindings::storage(3, true),
+                crate::bindings::storage(4, true),
+                crate::bindings::storage(5, true),
             ],
-        });
-
-        let pipeline_layout =
-            device.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("diffusion"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-
-        let make_pipeline = |entry: &str| {
-            device.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            })
-        };
-        let halo_pipeline = make_pipeline("halo_insulated");
-        let step_pipeline = make_pipeline("step");
+            &["halo_insulated", "step"],
+        )?;
+        let layout = kernels.layout;
+        let halo_pipeline = kernels.pipelines[0].clone();
+        let step_pipeline = kernels.pipelines[1].clone();
 
         // Buffers. `dt` is filled in per run, so params is written again in `run`.
         let params = device.device.create_buffer(&wgpu::BufferDescriptor {
@@ -217,8 +205,26 @@ impl GpuDiffusion {
 
         let buffers = [field_a.buffer, field_b.buffer];
         let bind_groups = [
-            bind_group(device, &layout, &params, &buffers[0], &buffers[1], &face_x.buffer, &face_y.buffer, &source.buffer),
-            bind_group(device, &layout, &params, &buffers[1], &buffers[0], &face_x.buffer, &face_y.buffer, &source.buffer),
+            bind_group(
+                device,
+                &layout,
+                &params,
+                &buffers[0],
+                &buffers[1],
+                &face_x.buffer,
+                &face_y.buffer,
+                &source.buffer,
+            ),
+            bind_group(
+                device,
+                &layout,
+                &params,
+                &buffers[1],
+                &buffers[0],
+                &face_x.buffer,
+                &face_y.buffer,
+                &source.buffer,
+            ),
         ];
 
         // The face and source buffers are owned by the bind groups from here on. wgpu
@@ -249,7 +255,28 @@ impl GpuDiffusion {
             return Ok(());
         }
 
-        device.queue.write_buffer(&self.params, 0, &self.params_bytes(dt));
+        let mut encoder = device
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("diffusion"),
+            });
+        self.encode(device, &mut encoder, dt, steps);
+        device.submit_and_wait(encoder)?;
+        Ok(())
+    }
+
+    /// Record compute into a shared command stream; submit before rendering on the
+    /// same queue. One timestep per submission: uniform writes precede all its commands.
+    pub fn encode(
+        &mut self,
+        device: &GpuDevice,
+        encoder: &mut wgpu::CommandEncoder,
+        dt: f64,
+        steps: usize,
+    ) {
+        device
+            .queue
+            .write_buffer(&self.params, 0, &self.params_bytes(dt));
 
         let halo_threads = (2 * self.nx + 2 * self.ny) as u32;
         let halo_groups = halo_threads.div_ceil(64);
@@ -258,9 +285,6 @@ impl GpuDiffusion {
 
         // One encoder for the whole run. Every step is two dispatches against the same
         // command buffer, so the per-step cost is a dispatch and not a submission.
-        let mut encoder = device
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("diffusion") });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("diffusion"),
@@ -280,9 +304,15 @@ impl GpuDiffusion {
                 self.parity ^= 1;
             }
         }
-        device.submit_and_wait(encoder)?;
         self.steps += steps;
-        Ok(())
+    }
+
+    /// Both ping-pong fields, for persistent renderer bind groups.
+    pub fn buffers(&self) -> [&wgpu::Buffer; 2] {
+        [&self.buffers[0], &self.buffers[1]]
+    }
+    pub fn parity(&self) -> usize {
+        self.parity
     }
 
     /// Read the field back, halo included, in the host's `f64`.
@@ -332,33 +362,11 @@ fn check(given: usize, expected: usize, what: &'static str) -> Result<(), Diffus
     if given == expected {
         Ok(())
     } else {
-        Err(DiffusionError::Shape { what, expected, given })
-    }
-}
-
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
+        Err(DiffusionError::Shape {
+            what,
+            expected,
+            given,
+        })
     }
 }
 
@@ -373,9 +381,7 @@ fn bind_group(
     face_y: &wgpu::Buffer,
     source: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
-    fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-        wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() }
-    }
+    use crate::bindings::entry;
     device.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("diffusion"),
         layout,

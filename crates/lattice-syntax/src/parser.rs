@@ -507,11 +507,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_argument(&mut self) -> Result<Argument, ()> {
-        // `name = value` when an identifier is immediately followed by `=`.
-        let named = self.peek().kind == TokenKind::Ident
+        // `name = value` when an identifier is immediately followed by `=`. A reserved
+        // word is accepted as the name too: `rdf(every=10)` reads the way `observe … every`
+        // does, and no expression can begin with a keyword followed by `=`, so it cannot
+        // be mistaken for anything else.
+        let token = self.peek();
+        let named = matches!(token.kind, TokenKind::Ident | TokenKind::Keyword(_))
             && self.peek_at(1).kind == TokenKind::Equals;
         if named {
-            let name = self.expect_ident("a parameter name")?;
+            self.advance();
+            let name = Ident::new(self.text(token.span), token.span);
             self.advance();
             let value = self.parse_expr()?;
             let span = name.span.merge(value.span);
@@ -1112,6 +1117,22 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_reserved_word_can_name_a_parameter() {
+        let expr = expr_of("rdf(bins=10, every=5)");
+        match expr.kind {
+            ExprKind::Call(_, args) => {
+                assert_eq!(args[1].name.as_ref().unwrap().text, "every");
+                assert_eq!(args[1].value.as_number(), Some(5.0));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Only before `=`: a bare keyword is still not a value.
+        let file = SourceFile::new("t.lattice", "project p { x: f(every); }");
+        let (_, diagnostics) = parse(&file);
+        assert!(diagnostics.has_errors());
     }
 
     #[test]

@@ -186,6 +186,35 @@ fn field_to_image_inner(
     FieldImage { image: ColorImage::new([nx, ny], pixels), min, max, mean, non_finite }
 }
 
+/// Draw the bonds of a channel as line segments into `rect`, over the particles they
+/// join. Uses the same world-to-screen mapping as [`draw_particles`].
+///
+/// A bond through a periodic wall is not drawn — see
+/// [`RenderChannel::bond_endpoints`] — and a bond with an end outside the view is
+/// clipped by the painter rather than dropped, so a chain half in the picture still
+/// reads as a chain. Returns how many bonds were hidden for crossing a wall.
+pub fn draw_bonds(painter: &egui::Painter, rect: Rect, channel: &RenderChannel<'_>, palette: &Palette) -> usize {
+    let RenderChannel::Bonds { pairs, origin, extent, .. } = channel else {
+        return 0;
+    };
+    let stroke = Stroke::new(1.5, palette.series(1));
+    let to_screen = |world: [f64; 2]| {
+        let fx = (world[0] - origin[0]) / extent[0];
+        let fy = (world[1] - origin[1]) / extent[1];
+        Pos2::new(rect.left() + fx as f32 * rect.width(), rect.bottom() - fy as f32 * rect.height())
+    };
+    let mut hidden = 0usize;
+    for index in 0..pairs.len() {
+        match channel.bond_endpoints(index) {
+            Some([from, to]) if from.iter().chain(&to).all(|v| v.is_finite()) => {
+                painter.line_segment([to_screen(from), to_screen(to)], stroke);
+            }
+            _ => hidden += 1,
+        }
+    }
+    hidden
+}
+
 /// Draw particles into `rect`, mapping world coordinates through `origin`/`extent`.
 ///
 /// Marks get a surface-coloured ring rather than a dark border: a border around every

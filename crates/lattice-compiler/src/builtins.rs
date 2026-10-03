@@ -19,6 +19,7 @@
 //! temperature field's initializer must produce kelvin — the initializer does not have
 //! an intrinsic dimension of its own.
 
+use lattice_domain_particle::Truncation;
 use lattice_ir::{Boundary, Grid2d};
 use lattice_syntax::{Argument, Diagnostic, Diagnostics, Expr, ExprKind, Span};
 use lattice_units::Dimension;
@@ -226,7 +227,7 @@ impl<'a> Call<'a> {
 }
 
 /// Report an unrecognized builtin, listing what is available.
-fn unknown(
+pub(crate) fn unknown(
     what: &str,
     name: &str,
     span: Span,
@@ -508,7 +509,7 @@ pub enum ForceSpec {
         /// Stiffness, N/m.
         stiffness: f64,
     },
-    /// Truncated-and-shifted Lennard-Jones.
+    /// Truncated Lennard-Jones.
     LennardJones {
         /// Well depth, J.
         epsilon: f64,
@@ -516,11 +517,20 @@ pub enum ForceSpec {
         sigma: f64,
         /// Cutoff, m.
         cutoff: f64,
+        /// How the potential is brought to zero at the cutoff.
+        truncation: Truncation,
+    },
+    /// A soft repulsive disc.
+    SoftRepulsion {
+        /// Stiffness, N/m.
+        stiffness: f64,
+        /// Range, m.
+        range: f64,
     },
 }
 
 /// Every force name.
-const FORCES: &[&str] = &["gravity", "drag", "harmonic_well", "lennard_jones"];
+const FORCES: &[&str] = &["gravity", "drag", "harmonic_well", "lennard_jones", "soft_repulsion"];
 
 impl ForceSpec {
     /// A one-line description for the model report.
@@ -533,9 +543,29 @@ impl ForceSpec {
             ForceSpec::HarmonicWell { center, stiffness } => {
                 format!("harmonic well k = {stiffness} N/m at {center:?}")
             }
-            ForceSpec::LennardJones { epsilon, sigma, cutoff } => {
-                format!("Lennard-Jones eps = {epsilon:.4e} J, sigma = {sigma:.4e} m, cutoff = {cutoff:.4e} m")
+            ForceSpec::LennardJones { epsilon, sigma, cutoff, truncation } => {
+                format!(
+                    "Lennard-Jones eps = {epsilon:.4e} J, sigma = {sigma:.4e} m, cutoff = {cutoff:.4e} m ({})",
+                    truncation.name()
+                )
             }
+            ForceSpec::SoftRepulsion { stiffness, range } => {
+                format!("soft repulsion k = {stiffness:.4e} N/m inside {range:.4e} m")
+            }
+        }
+    }
+
+    /// True for a pair law, which needs a region to bin particles into.
+    pub fn needs_region(&self) -> bool {
+        self.cutoff().is_some()
+    }
+
+    /// The interaction cutoff of a pair law, m.
+    pub fn cutoff(&self) -> Option<f64> {
+        match self {
+            ForceSpec::LennardJones { cutoff, .. } => Some(*cutoff),
+            ForceSpec::SoftRepulsion { range, .. } => Some(*range),
+            _ => None,
         }
     }
 }
@@ -615,7 +645,7 @@ pub fn force(
         }
 
         "lennard_jones" => {
-            call.reject_unknown(&["epsilon", "sigma", "cutoff"], diagnostics);
+            call.reject_unknown(&["epsilon", "sigma", "cutoff", "truncation"], diagnostics);
             let epsilon_expr = call.require("epsilon", 0, diagnostics);
             let sigma_expr = call.require("sigma", 1, diagnostics);
             let epsilon =
@@ -638,7 +668,47 @@ pub fn force(
                 );
                 return None;
             }
-            Some(ForceSpec::LennardJones { epsilon, sigma, cutoff })
+            // The two truncations are different potentials; the conventional energy
+            // shift is the default and the one the GPU kernel implements.
+            let truncation = match call.named("truncation") {
+                None => Truncation::EnergyShift,
+                Some(argument) => match argument.as_name() {
+                    Some("energy_shift") => Truncation::EnergyShift,
+                    Some("force_shift") => Truncation::ForceShift,
+                    _ => {
+                        diagnostics.push(
+                            Diagnostic::error("`truncation` must be `energy_shift` or `force_shift`")
+                                .with_code("E0208")
+                                .at(argument.span, "unknown keyword value"),
+                        );
+                        return None;
+                    }
+                },
+            };
+            Some(ForceSpec::LennardJones { epsilon, sigma, cutoff, truncation })
+        }
+
+        "soft_repulsion" => {
+            call.reject_unknown(&["stiffness", "range"], diagnostics);
+            let stiffness_expr = call.require("stiffness", 0, diagnostics);
+            let range_expr = call.require("range", 1, diagnostics);
+            let stiffness = evaluator.require(
+                stiffness_expr?,
+                Dimension::STIFFNESS,
+                "the repulsion stiffness",
+                diagnostics,
+            );
+            let range = evaluator.require(range_expr?, Dimension::LENGTH, "the repulsion range", diagnostics);
+            let (stiffness, range) = (stiffness?, range?);
+            if stiffness <= 0.0 || range <= 0.0 {
+                diagnostics.push(
+                    Diagnostic::error("soft repulsion needs a positive stiffness and range")
+                        .with_code("E0405")
+                        .at(call.span, format!("k = {stiffness}, range = {range}")),
+                );
+                return None;
+            }
+            Some(ForceSpec::SoftRepulsion { stiffness, range })
         }
 
         other => {
@@ -903,13 +973,45 @@ mod tests {
 
     #[test]
     fn lennard_jones_defaults_its_cutoff_to_two_and_a_half_sigma() {
-        let ForceSpec::LennardJones { sigma, cutoff, .. } =
+        let ForceSpec::LennardJones { sigma, cutoff, truncation, .. } =
             force_of("lennard_jones(epsilon=1 joule, sigma=2 meter)")
         else {
             panic!("wrong variant")
         };
         assert_eq!(sigma, 2.0);
         assert_eq!(cutoff, 5.0);
+        assert_eq!(truncation, Truncation::EnergyShift, "the conventional default");
+    }
+
+    #[test]
+    fn lennard_jones_names_its_truncation() {
+        let ForceSpec::LennardJones { truncation, .. } =
+            force_of("lennard_jones(epsilon=1 joule, sigma=1 meter, truncation=force_shift)")
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(truncation, Truncation::ForceShift);
+
+        let mut h = harness("lennard_jones(epsilon=1 joule, sigma=1 meter, truncation=smooth)");
+        let units = UnitRegistry::si();
+        let evaluator = Evaluator::new(&h.file, &units);
+        assert!(force(&h.expr, &evaluator, &mut h.diagnostics).is_none());
+        assert!(h.diagnostics.codes().contains(&"E0208"));
+    }
+
+    #[test]
+    fn soft_repulsion_checks_its_dimensions() {
+        assert_eq!(
+            force_of("soft_repulsion(stiffness=10 newton/meter, range=0.5 meter)"),
+            ForceSpec::SoftRepulsion { stiffness: 10.0, range: 0.5 }
+        );
+        assert!(ForceSpec::SoftRepulsion { stiffness: 1.0, range: 1.0 }.needs_region());
+        assert!(!ForceSpec::Gravity { acceleration: [0.0, -1.0] }.needs_region());
+        let mut h = harness("soft_repulsion(stiffness=10 newton/meter, range=0.5 second)");
+        let units = UnitRegistry::si();
+        let evaluator = Evaluator::new(&h.file, &units);
+        assert!(force(&h.expr, &evaluator, &mut h.diagnostics).is_none());
+        assert!(h.diagnostics.codes().contains(&"E0400"));
     }
 
     #[test]

@@ -64,7 +64,9 @@ impl FidelityProfile {
             FidelityProfile::Engineering2d => "quantitative small-scale models with validation",
             FidelityProfile::MolecularKinetic => "particle and stochastic molecular behaviour",
             FidelityProfile::ResearchCoupling => "inverse problems and complex coupled workflows",
-            FidelityProfile::ExternalQuantum => "electronic structure and reaction-path calculations",
+            FidelityProfile::ExternalQuantum => {
+                "electronic structure and reaction-path calculations"
+            }
         }
     }
 
@@ -172,12 +174,20 @@ pub struct StableStep {
 impl StableStep {
     /// A domain with no stability constraint of its own.
     pub const fn unconditional(preferred: f64) -> Self {
-        Self { preferred, max: f64::INFINITY, reason: StabilityReason::Unconditional }
+        Self {
+            preferred,
+            max: f64::INFINITY,
+            reason: StabilityReason::Unconditional,
+        }
     }
 
     /// An explicitly limited step.
     pub const fn limited(preferred: f64, max: f64, reason: StabilityReason) -> Self {
-        Self { preferred, max, reason }
+        Self {
+            preferred,
+            max,
+            reason,
+        }
     }
 
     /// How much headroom a proposed step has before instability, as a ratio.
@@ -185,7 +195,11 @@ impl StableStep {
     /// Values above 1 are unstable. The viewer plots this so a user can see a run
     /// approaching its limit before it blows up rather than after (NFR-007).
     pub fn margin(&self, dt: f64) -> f64 {
-        if self.max.is_infinite() { 0.0 } else { dt / self.max }
+        if self.max.is_infinite() {
+            0.0
+        } else {
+            dt / self.max
+        }
     }
 
     /// True if `dt` is within the stability limit.
@@ -261,7 +275,10 @@ impl SolverContract {
         let mut out = String::new();
         out.push_str(&format!("{} — {}\n", self.name, self.summary));
         out.push_str(&format!("  fidelity:       {}\n", self.fidelity));
-        out.push_str(&format!("  guarantee:      {}\n", self.fidelity.guarantee()));
+        out.push_str(&format!(
+            "  guarantee:      {}\n",
+            self.fidelity.guarantee()
+        ));
         out.push_str("  equations:\n");
         for eq in self.governing_equations {
             out.push_str(&format!("      {eq}\n"));
@@ -392,7 +409,12 @@ impl<'a> StepContext<'a> {
     /// path *"the executable specification for accelerated kernels"*, and a test that
     /// has not asked for threads should be measuring the specification.
     pub fn new(arena: &'a mut Arena) -> Self {
-        Self { time: 0.0, step: 0, arena, executor: Executor::shared_sequential() }
+        Self {
+            time: 0.0,
+            step: 0,
+            arena,
+            executor: Executor::shared_sequential(),
+        }
     }
 
     /// The same context, with loops split by `executor`.
@@ -408,7 +430,7 @@ impl<'a> StepContext<'a> {
 /// scheduling, diagnostics, and authoring — not the equations themselves."* A domain
 /// keeps its own state in whatever layout suits its mathematics; this trait only
 /// governs how it is driven and interrogated.
-pub trait Domain {
+pub trait Domain: Send + DomainType {
     /// Instance name, as written in the model.
     fn name(&self) -> &str;
 
@@ -474,6 +496,17 @@ pub trait Domain {
     /// into the total the ledger records.
     fn port_grid(&self) -> Option<crate::grid::Grid2d> {
         None
+    }
+}
+
+/// Typed backend adapters can inspect concrete solver configuration at setup.
+/// This blanket implementation does not add boilerplate to domain implementations.
+pub trait DomainType {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+impl<T: std::any::Any> DomainType for T {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

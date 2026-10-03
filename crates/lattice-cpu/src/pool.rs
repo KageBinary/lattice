@@ -465,6 +465,7 @@ impl<T: Send, F: Fn(usize, &mut [T]) + Sync> Task for ChunkWork<T, F> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn every_element_is_visited_exactly_once() {
@@ -520,17 +521,35 @@ mod tests {
         pool.for_each_chunk_mut(&mut data, 8, |_, _| panic!("should not be called"));
     }
 
+    /// Splitting is a *scheduling* property, and the only honest way to test one is to
+    /// make the work refuse to finish until the schedule has the shape being claimed.
+    ///
+    /// The earlier version of this test gave each chunk "enough work that the first
+    /// worker cannot plausibly take every chunk" and then asserted that two threads had
+    /// run one. That is a race, and a machine running the rest of the workspace's suites
+    /// alongside it wins the race often enough to matter: the calling thread drains all
+    /// 64 chunks before a parked worker is scheduled at all, and the test fails having
+    /// measured the load average.
+    ///
+    /// So each chunk now *waits* for a second thread to arrive, against a single deadline
+    /// shared by the whole dispatch. A pool that spreads satisfies that immediately and
+    /// the test costs nothing; a pool that does not spread cannot satisfy it at any load,
+    /// so the failure means what it says. The deadline is shared rather than per-chunk so
+    /// that a genuine regression costs one wait rather than one per chunk.
     #[test]
     fn work_is_actually_spread_across_threads() {
         let pool = ThreadPool::new(3);
         assert_eq!(pool.threads(), 4);
         let mut data = vec![0u64; 4096];
         let threads = Mutex::new(std::collections::HashSet::new());
+        let deadline = Instant::now() + Duration::from_secs(20);
         pool.for_each_chunk_mut(&mut data, 64, |_, chunk| {
             lock(&threads).insert(std::thread::current().id());
-            // Enough work that the first worker cannot plausibly take every chunk.
+            while lock(&threads).len() < 2 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
             for slot in chunk.iter_mut() {
-                *slot = (0..2000u64).sum();
+                *slot = 1;
             }
         });
         assert!(threads.into_inner().unwrap().len() > 1, "only one thread ran any chunk");

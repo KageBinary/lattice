@@ -13,7 +13,12 @@ A 2D-first multiphysics, chemistry, and quantum simulation runtime.
 
 ---
 
-## Status: M0 through M3 complete, M4 started
+## Status: M0 through M4 complete within the documented scope
+
+The M4 implementation now includes graph-driven CPU scheduling, resident gravity and
+Lennard–Jones particles, implicit Dirichlet faces, shared-device field rendering, and
+pipeline/layout caching. See [the M4 engineering report](docs/m4-engineering-report.md)
+for the current verification record, measured performance, and supported scope.
 
 The spec lays out nine milestones, M0 through M8.
 
@@ -28,11 +33,11 @@ The spec lays out nine milestones, M0 through M8.
   conservation checks."* [`examples/chamber.lattice`](examples/chamber.lattice) runs
   §20.3's reacting chamber and conserves mass and every element to round-off, with the
   coupling ledger accounting for the energy. 41 of 41 validation cases.
-- **M4 — Portable GPU.** Exit condition: *"selected CPU/GPU cross-validation and
-  performance goals."* One of its four parts is done: solvers now split their loops
-  across threads, with the promise that this changes the schedule and never the
-  numbers — parallel and scalar agree bit for bit, and the cross-validation *level*
-  §19.1 asks for exists with four passing cases. The `wgpu` backend does not.
+- **M4 — Portable GPU.** Graph execution retains deterministic CPU results. The GPU
+  supports explicit diffusion, implicit diffusion with insulated/Dirichlet faces, and
+  velocity-Verlet gravity/Lennard–Jones particles. `lattice-view --gpu` renders an
+  uncoupled heat field through a resident texture on the same device. Eleven GPU
+  validation cases compare the accelerated paths with CPU references.
 
 Being specific about that, in the spirit of design principle **P1 — scientific
 honesty over feature count**:
@@ -53,8 +58,8 @@ honesty over feature count**:
 | **Coupling** | Typed ports with units, coupling edges with compiler-derived unit conversions, cadence, and a conservation ledger | An exothermic reaction's energy arrives where the ledger says it was sent, to within the one exchange a staggered coupling always has in flight |
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
 | **Execution** | A worker pool and an explicit partitioning executor; parallel diffusion stencils and per-particle integration; `--threads` and a `--compare` mode that measures its own speedup | Parallel and scalar agree *bit for bit* — every cell, every particle, the CG iteration count, and the reproducibility hash. 4.8× at 512², 1.9× on 262k particles, and nothing slower than it was |
-| **Backends** | A dependency-free backend boundary — devices, buffers, §10.5 precision modes, a kernel cache keyed the way §15.5 asks — with the scalar CPU path and a portable `wgpu` compute backend behind it; `--backend gpu` on the benchmark harness | The GPU differs from the CPU reference by 4.3 `f32` ulps over 200 steps, using 0.3% of a budget *derived* from `f32` rounding rather than fitted — and agrees to the bit where nothing rounds. 130× the scalar CPU on a 1024² stencil, and 4.1× *slower* end-to-end at 256²; both are published, because neither is honest alone |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1025 tests across 18 crates |
+| **Backends** | A dependency-free backend boundary — devices, buffers, §10.5 precision modes, a kernel cache keyed the way §15.5 asks — with the scalar CPU path and a portable `wgpu` compute backend behind it; explicit diffusion and Crank–Nicolson both device-resident, the latter with a conjugate gradient whose reduction has a *stated* association order; `--backend gpu` on the benchmark harness | The GPU differs from the CPU reference by 4.3 `f32` ulps over 200 explicit steps, using 0.3% of a budget *derived* from `f32` rounding rather than fitted — and agrees to the bit where nothing rounds. 130× the scalar CPU on a 1024² stencil, and 4.1× *slower* end-to-end at 256²; both are published, because neither is honest alone. The implicit path refuses a residual tolerance below `ε·(1 + ‖A‖₂)` instead of failing to reach it, and its budget is dominated by the two solves' stopping criteria rather than by precision |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1062 tests including doctests across 18 crates with all features |
 | **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, conservation drift and the solver's contract | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
@@ -62,15 +67,22 @@ honesty over feature count**:
 Fluids, waves, electromagnetism, molecular dynamics beyond Lennard-Jones, the quantum
 module, and the Python SDK. Those are M5–M8.
 
-GPU execution has started rather than finished: the portable `wgpu` backend runs explicit
-diffusion device-resident and is cross-validated against the CPU reference, but the
-implicit solve, the particle kernels and zero-copy rendering are not on it. The constraint
+GPU execution is deliberately limited to the released kernels and boundary modes.
+General GPU execution of arbitrary coupled `.lattice` projects is not implemented;
+the CLI's `run` remains the CPU reference. The constraint
 that shapes the rest is that **WGSL has no `f64`** — so §15.4's product baseline cannot run
-§10.5's reference precision, and the cross-backend budget is dominated by that rather than
-by the FMA and reduction-order effects the design expected. See
-[docs/backends.md](docs/backends.md). The backend is off by default, because `wgpu` is a
-few hundred crates and the rest of the CLI has none: `--features gpu` turns
-`lattice validate`'s 45 cases into 48.
+§10.5's reference precision, and the explicit cross-backend budget is dominated by that
+rather than by the FMA and reduction-order effects the design expected. The implicit budget
+is dominated by something else again: two conjugate-gradient solves that stop at different
+residual tolerances disagree by four orders of magnitude more than `f32` storage costs, and
+an `f32` solve *cannot* be asked for the CPU's `1e-10` — the backend refuses it, naming the
+floor `ε·(1 + ‖A‖₂)` it came from. See [docs/backends.md](docs/backends.md). The backend is
+off by default, because `wgpu` is a few hundred crates and the rest of the CLI has none:
+`--features gpu` turns `lattice validate`'s 45 cases into 56 when an adapter is available.
+
+The measured lesson of the implicit path is that **the stall is the program**: the diffusion
+stencil runs 27× the CPU at 256², and a CG iteration runs 1.8×, because §10.3 requires the
+residual to be able to stop a run and so every iteration contains a device fence.
 
 CPU parallelism arrived with M4.1, and three things inside it stay sequential *on
 purpose*: all reductions, conjugate gradient's inner products, and Lennard-Jones pair
@@ -81,20 +93,24 @@ also changes the summation order. So the MD workload gets its integrator paralle
 and not its force loop, which is where its time goes. See
 [docs/execution.md](docs/execution.md).
 
+The GPU is where that first rule is deliberately relaxed, because there is no sequential
+fallback to retreat to. Its reduction has a *stated* association order instead of a
+sequential one — fixed at construction, bit-reproducible, and an accumulation depth of 16
+rather than 24 575 — so the disagreement it produces is a mechanism a budget can name.
+
 Stochastic kinetics (Gillespie) is not implemented, so its §19.2 row is *absent* from
 the validation report rather than present and skipped. Coupling supports one-way and
 loose staggered strategies; subcycling and fixed-point iteration are not there, because
 a fixed-point coupling needs a checkpoint mechanism this runtime does not have and a
-half-implemented one would claim a convergence it never checked. The viewer draws
-through a CPU texture upload, which is fine at 64×64 and will not be at 768×384; GPU
-rendering is the rest of M4. Rigid-body collision detection is discrete, so a fast thin
+half-implemented one would claim a convergence it never checked. The default viewer
+uses CPU uploads; `--gpu` uses resident textures for a single heat/diffusion domain.
+Rigid-body collision detection is discrete, so a fast thin
 projectile can pass through a thin wall — continuous collision detection is what §11.1
 lists under "later".
 
-Constructs the language accepts but cannot execute — `reaction`, `couple`,
-`domain quantum2d` — are **compile errors that name the milestone that will implement
-them**. Not warnings: a model whose chemistry was silently dropped would run and
-produce confident wrong numbers.
+`reaction` and `couple` execute on the CPU. `domain quantum2d` is still a compile error
+naming its implementation milestone. Unsupported GPU domains and boundary modes are
+refused rather than silently dropped.
 
 ### What this is not
 
@@ -237,6 +253,27 @@ one desktop CPU core, release build:
 A benchmark whose correctness condition fails has its throughput marked
 `RESULT INVALID` rather than published.
 
+`--backend gpu` runs all four workloads above. The following historical M4.4 heat
+measurements used an RTX 4070 Laptop GPU through Vulkan at 256². The
+[M4 engineering report](docs/m4-engineering-report.md) records the final measurements,
+including particles, rendering, scheduling and startup reuse.
+
+| Benchmark | CPU | GPU | Ratio |
+|---|---|---|---|
+| `heat-explicit`, steps/s | 3,354 | 90,705 | **27×** |
+| `heat-crank-nicolson`, steps/s | 200 | ~750 | 3.8× |
+| `heat-crank-nicolson`, CG iterations/s | 1,900 | ~3,430 | **1.8×** |
+
+The last two rows are the same run measured two ways, and the difference between them is
+the point. The two backends solve to different residual tolerances — an `f32` solve cannot
+be asked for the CPU's `1e-10` — so they take 4.57 and 9.5 iterations per step, and steps
+per second is not a unit that survives the comparison. Both benchmarks publish iterations
+per step for exactly that reason.
+
+What is left after normalizing is **1.8× on a kernel whose explicit form runs 27× faster**.
+The arithmetic per iteration is the same kind; the difference is that §10.3 requires the
+residual to be able to stop a run, so every iteration contains a device fence.
+
 ### `lattice inspect contracts`
 
 Every solver publishes its equations, assumptions, valid regime, and — the part that
@@ -351,15 +388,15 @@ lattice/
 
 ## Dependencies
 
-Fourteen of the sixteen crates have none. Everything from units through the compiler to
+Fifteen of the eighteen crates have no external dependencies. Everything from units through the compiler to
 the validation lab builds from `std` alone — including, somewhat to my own surprise, the
 whole M1 compiler and its diagnostics, and the M4 worker pool.
 
-The exceptions are `lattice-viewer` and `lattice-playground`, which need `eframe`/`egui`
+The exceptions are `lattice-wgpu`, `lattice-viewer` and `lattice-playground`. The windows need `eframe`/`egui`
 and `egui_plot` to have a window at all. Spec §24.1 permits mature libraries *"where they
 do not define the core semantics"*, and an immediate-mode widget set does not: the
 colourmaps, the drift arithmetic, and every rule in [docs/viewer.md](docs/viewer.md) are
-ours and are tested here. `cargo test` on the other fourteen crates does not build them.
+ours and are tested here. The CLI enables GPU dependencies with `--features gpu`.
 
 `lattice-cpu` could reasonably have been `rayon`, which §24.1 would permit and which
 offers a fixed-partition `par_chunks` that would satisfy the determinism promise in
@@ -379,7 +416,7 @@ reproducibility guarantee all *are* core semantics:
 - The parser is hand-written because FR-002's diagnostics are a *product surface*, not
   an implementation detail, and a generator's error messages are nobody's design.
 
-M4 (`wgpu`) and M6 (`pyo3`) will add more.
+M6's Python bindings will add more.
 
 ## Design principles in practice
 

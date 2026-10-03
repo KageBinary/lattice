@@ -1788,11 +1788,13 @@ dependencies = [
  "eframe",
  "egui_plot",
  "lattice-compiler",
+ "lattice-domain-grid2d",
  "lattice-ir",
  "lattice-observe",
  "lattice-runtime",
  "lattice-syntax",
  "lattice-units",
+ "lattice-wgpu",
 ]
 
 [[package]]

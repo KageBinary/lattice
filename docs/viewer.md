@@ -271,10 +271,29 @@ first in the project — spec §24.1 permits mature libraries *"where they do no
 the core semantics."* A window and an immediate-mode widget set do not; the colourmaps,
 the drift arithmetic, and every rule above are ours and are tested here.
 
+## Resident GPU heat fields
+
+Build `lattice-viewer`, then run `lattice-view examples/slab.lattice --gpu --play`.
+This path accepts one uncoupled heat/diffusion domain: explicit insulated diffusion,
+or implicit diffusion with insulated and Dirichlet faces. It shares egui's wgpu
+device and queue, colorizes the resident field into a persistent texture, and
+registers that texture directly with the renderer. Drawing performs no field or
+pixel readback. The CPU viewer remains the default for the full model repertoire.
+
+Colors use a labelled fixed range derived from initial and prescribed boundary
+values. Diagnostics are timestamped snapshots, sampled every 60 playing frames or
+by the sample button. Implicit solves report their f32 tolerance and convergence;
+an unsuccessful solve halts playback. The specialized GPU view currently offers
+play/pause, single stepping and speed, rather than every CPU viewer control.
+
+`--smoke-frames=4` exercises shared-device compute and actual presentation, samples
+diagnostics and closes the GPU window; failures return a nonzero process status.
+The offscreen texture test separately checks orientation, palette and halo exclusion.
+See [the M4 report](m4-engineering-report.md) for measurements and supported boundaries.
+
 ## What it does not do yet
 
-No GPU field rendering (M4 — this draws through a CPU texture upload, which is fine at
-64×64 and will not be at 768×384), no vector-field or streamline rendering, no particle
+No general GPU rendering of coupled models, no vector-field or streamline rendering, no particle
 colouring by a per-particle quantity, no probe or measurement tools, no export of the
 figure. §17's flux arrows, constraint visualization, and uncertainty bands arrive with
 the domains that produce them.

@@ -27,10 +27,11 @@ use lattice_domain_chemistry::{ReactingMixture, ReactionNetwork, Species as Chem
 use lattice_domain_rigid2d::{Collider, RigidDomain, SolverConfig};
 use lattice_coupling::{Coupler, CouplingEdge, Mapping, PortRef};
 
-use crate::{chemistry, rigid};
+use crate::{chemistry, molecular, rigid};
 use lattice_domain_particle::{
-    BoundaryBox, HarmonicWell, Integrator, LennardJones, LinearDrag, ParticleBoundary,
-    ParticleDomain, ParticleSpec, UniformAcceleration,
+    analysis, Angle, Bond, BoundaryBox, HarmonicAngle, HarmonicBond, HarmonicWell, Integrator,
+    LennardJones, LinearDrag, ParticleBoundary, ParticleDomain, ParticleId, ParticleSpec,
+    RdfRequest, SoftRepulsion, Thermostat, UniformAcceleration,
 };
 use lattice_ir::{
     BodySpec, BoundarySet, BufferKind, BufferPlan, CompiledModel, Domain, DomainId, DomainSpec,
@@ -46,6 +47,18 @@ use lattice_units::{Dimension, UnitRegistry};
 
 use crate::builtins::{self, ForceSpec, Initializer};
 use crate::eval::Evaluator;
+use crate::molecular::{AngleSpec, BondSpec};
+
+/// How a particle set is laid out at the start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Layout {
+    /// Row by row, every row left to right.
+    #[default]
+    Lattice,
+    /// Row by row, alternating direction, so consecutive indices are always one
+    /// spacing apart — what a bonded chain needs to start unstrained.
+    Serpentine,
+}
 
 /// A compiled, runnable project.
 pub struct Compiled {
@@ -129,8 +142,16 @@ struct ParticlesInfo {
     boundary: ParticleBoundary,
     spacing: Option<f64>,
     speed: f64,
+    /// An initial temperature, an alternative to `speed`.
+    temperature: Option<f64>,
     seed: u64,
     forces: Vec<ForceSpec>,
+    skin: Option<f64>,
+    thermostat: Option<Thermostat>,
+    bonds: Vec<BondSpec>,
+    angles: Vec<AngleSpec>,
+    analyses: Vec<RdfRequest>,
+    layout: Layout,
     span: Span,
     solved: bool,
 }
@@ -756,7 +777,8 @@ impl<'a> Compiler<'a> {
             decl,
             &[
                 "count", "region", "origin", "mass", "radius", "boundary", "spacing", "speed",
-                "seed", "force",
+                "temperature", "seed", "force", "skin", "thermostat", "bonds", "angles",
+                "analysis", "layout",
             ],
         );
 
@@ -842,6 +864,103 @@ impl<'a> Compiler<'a> {
             );
         }
 
+        // --- the molecular settings (spec §12.4) ---
+        let temperature = decl.setting("temperature").and_then(|setting| {
+            let value = evaluator.require(
+                &setting.value,
+                Dimension::TEMPERATURE,
+                "the initial temperature",
+                &mut self.diagnostics,
+            )?;
+            if value < 0.0 || !value.is_finite() {
+                self.error(
+                    Diagnostic::error("the initial temperature cannot be negative")
+                        .with_code("E0405")
+                        .at(setting.value.span, format!("{value} K")),
+                );
+                return None;
+            }
+            Some(value)
+        });
+        if let (Some(temperature), Some(speed_setting)) = (decl.setting("temperature"), decl.setting("speed")) {
+            self.error(
+                Diagnostic::error("`temperature` and `speed` both set the initial velocities")
+                    .with_code("E0209")
+                    .at(temperature.key.span, "sets a Maxwell distribution")
+                    .also(speed_setting.key.span, "sets a velocity spread")
+                    .help("keep one: `temperature:` for a thermal start, `speed:` for a plain spread"),
+            );
+        }
+        if let (Some(_), Some(setting)) = (temperature, decl.setting("temperature"))
+            && count < 2
+        {
+            self.error(
+                Diagnostic::error("a temperature needs at least two particles")
+                    .with_code("E0405")
+                    .at(setting.value.span, format!("the set has {count}"))
+                    .note("temperature is defined over 2N - 2 thermal degrees of freedom, and one \
+                           particle has none"),
+            );
+        }
+        let skin = decl.setting("skin").and_then(|setting| {
+            let value =
+                evaluator.require(&setting.value, Dimension::LENGTH, "the Verlet skin", &mut self.diagnostics)?;
+            if value <= 0.0 || !value.is_finite() {
+                self.error(
+                    Diagnostic::error("the Verlet skin must be positive")
+                        .with_code("E0405")
+                        .at(setting.value.span, format!("{value} m"))
+                        .help("leave `skin` out to rebuild the cell list every step"),
+                );
+                return None;
+            }
+            Some(value)
+        });
+        let thermostat = decl
+            .setting("thermostat")
+            .and_then(|setting| molecular::thermostat(&setting.value, &evaluator, &mut self.diagnostics));
+        let mut bonds = Vec::new();
+        for setting in decl.settings.iter().filter(|s| s.key.text == "bonds") {
+            if let Some(bond) = molecular::bonds(&setting.value, &evaluator, &mut self.diagnostics) {
+                bonds.push(bond);
+            }
+        }
+        let mut angles = Vec::new();
+        for setting in decl.settings.iter().filter(|s| s.key.text == "angles") {
+            if let Some(angle) = molecular::angles(&setting.value, &evaluator, &mut self.diagnostics) {
+                angles.push(angle);
+            }
+        }
+        let mut analyses = Vec::new();
+        for setting in decl.settings.iter().filter(|s| s.key.text == "analysis") {
+            if let Some(request) = molecular::analysis(&setting.value, &evaluator, &mut self.diagnostics) {
+                analyses.push(request);
+            }
+        }
+        let layout = match decl.setting("layout").and_then(|s| s.value.as_name()) {
+            None | Some("lattice") => Layout::Lattice,
+            Some("serpentine") => Layout::Serpentine,
+            Some(other) => {
+                let span = decl.setting("layout").unwrap().value.span;
+                self.error(
+                    Diagnostic::error(format!("`{other}` is not a particle layout"))
+                        .with_code("E0208")
+                        .at(span, "unknown layout")
+                        .help("one of: lattice, serpentine"),
+                );
+                Layout::Lattice
+            }
+        };
+        if bonds.iter().any(|b| b.length.is_none()) && spacing.is_none() {
+            let span = decl.settings.iter().find(|s| s.key.text == "bonds").map_or(decl.name.span, |s| s.value.span);
+            self.error(
+                Diagnostic::error("a bond without a `length` takes the placement `spacing`, and none is declared")
+                    .with_code("E0203")
+                    .at(span, "no rest length")
+                    .help("add `length=… meter` to the bond, or a `spacing:` to the set"),
+            );
+        }
+
         self.particles.insert(
             decl.name.text.clone(),
             ParticlesInfo {
@@ -854,8 +973,15 @@ impl<'a> Compiler<'a> {
                 boundary,
                 spacing,
                 speed,
+                temperature,
                 seed,
                 forces,
+                skin,
+                thermostat,
+                bonds,
+                angles,
+                analyses,
+                layout,
                 span: decl.name.span,
                 solved: false,
             },
@@ -1853,26 +1979,80 @@ impl<'a> Compiler<'a> {
             }
         };
 
-        let needs_region = set.forces.iter().any(|f| matches!(f, ForceSpec::LennardJones { .. }))
-            || set.boundary != ParticleBoundary::Open;
+        if matches!(set.thermostat, Some(Thermostat::Langevin { .. })) && integrator != Integrator::VelocityVerlet {
+            self.error(
+                Diagnostic::error("a Langevin thermostat needs the velocity_verlet integrator")
+                    .with_code("E0207")
+                    .at(method.span, format!("`{}` has no Langevin form", method.name))
+                    .note(
+                        "the BAOAB splitting is built on velocity Verlet's kick-drift structure; \
+                         the first-order schemes have no such pairing",
+                    )
+                    .help("solve with `velocity_verlet(dt=…)`, or use `velocity_rescale`"),
+            );
+            return;
+        }
+
+        let needs_region = set.forces.iter().any(ForceSpec::needs_region)
+            || set.boundary != ParticleBoundary::Open
+            || !set.analyses.is_empty();
         if needs_region && set.region.is_none() {
             self.error(
                 Diagnostic::error(format!("particle set `{name}` needs a `region`"))
                     .with_code("E0203")
                     .at(set.span, "no region declared")
                     .note(
-                        "a pair force with a cutoff needs a region to bin particles into, and a \
-                         periodic or reflective boundary needs one to wrap or bounce against",
+                        "a pair force with a cutoff needs a region to bin particles into, a \
+                         periodic or reflective boundary needs one to wrap or bounce against, \
+                         and a radial distribution needs one to normalize by",
                     )
                     .help("add `region: [10 meter, 10 meter];`"),
             );
             return;
         }
+        if let (Some(region), Some(skin)) = (set.region, set.skin)
+            && let Some(cutoff) = set.forces.iter().filter_map(ForceSpec::cutoff).fold(None, |m: Option<f64>, c| Some(m.map_or(c, |m| m.max(c))))
+            && set.boundary == ParticleBoundary::Periodic
+            && 2.0 * (cutoff + skin) > region[0].min(region[1])
+        {
+            self.error(
+                Diagnostic::error("the cutoff plus skin exceeds half the periodic region")
+                    .with_code("E0405")
+                    .at(set.span, format!("cutoff {cutoff} m + skin {skin} m against a region of {region:?} m"))
+                    .note("the minimum-image convention needs the box to be at least twice the list radius"),
+            );
+            return;
+        }
+        for request in &set.analyses
+        {
+            if let Some(region) = set.region
+                && set.boundary == ParticleBoundary::Periodic
+                && request.range > 0.5 * region[0].min(region[1])
+            {
+                self.error(
+                    Diagnostic::error("the RDF range exceeds half the periodic region")
+                        .with_code("E0405")
+                        .at(set.span, format!("range {} m against a region of {region:?} m", request.range))
+                        .note("beyond half the box a pair and its image are both counted"),
+                );
+                return;
+            }
+        }
 
         let mut domain = ParticleDomain::new(set.name.clone(), set.count.max(1))
-            .with_integrator(integrator);
+            .with_integrator(integrator)
+            .with_seed(set.seed);
         if let Some(dt) = method.timestep {
             domain = domain.with_preferred_step(dt);
+        }
+        if let Some(skin) = set.skin {
+            domain = domain.with_skin(skin);
+        }
+        if let Some(thermostat) = set.thermostat {
+            domain = domain.with_thermostat(thermostat);
+        }
+        for request in &set.analyses {
+            domain = domain.with_rdf(*request);
         }
         // Attach the region only when something needs it. An `open` boundary does
         // nothing, and binding the domain to a box anyway would crop the viewer's
@@ -1896,14 +2076,23 @@ impl<'a> Compiler<'a> {
                 ForceSpec::HarmonicWell { center, stiffness } => {
                     domain.with_force(HarmonicWell::new(center, stiffness))
                 }
-                ForceSpec::LennardJones { epsilon, sigma, cutoff } => {
-                    domain.with_force(LennardJones::new(epsilon, sigma, cutoff))
+                ForceSpec::LennardJones { epsilon, sigma, cutoff, truncation } => {
+                    domain.with_force(LennardJones::with_truncation(epsilon, sigma, cutoff, truncation))
+                }
+                ForceSpec::SoftRepulsion { stiffness, range } => {
+                    domain.with_force(SoftRepulsion::new(stiffness, range))
                 }
             };
         }
 
-        self.populate(&set, &mut domain);
+        let ids = self.populate(&set, &mut domain);
+        if ids.len() != set.count {
+            return;
+        }
+        let Some(domain) = self.attach_topology(&set, domain, &ids) else { return };
+        let mut domain = domain;
         domain.initialize();
+        self.warn_about_strained_bonds(&set, &domain);
 
         let buffer = out
             .buffers
@@ -1924,16 +2113,30 @@ impl<'a> Compiler<'a> {
                 .costing(set.count as f64),
         );
 
-        let forces = if set.forces.is_empty() {
-            "no forces".to_string()
-        } else {
-            set.forces.iter().map(ForceSpec::describe).collect::<Vec<_>>().join("; ")
-        };
+        let mut parts: Vec<String> = set.forces.iter().map(ForceSpec::describe).collect();
+        parts.extend(set.bonds.iter().map(|b| b.describe(set.count)));
+        parts.extend(set.angles.iter().map(|a| a.describe(set.count)));
+        if let Some(thermostat) = set.thermostat {
+            parts.push(thermostat.describe());
+        }
+        if let Some(skin) = set.skin {
+            parts.push(format!("Verlet skin {skin:.4e} m"));
+        }
+        if let Some(temperature) = set.temperature {
+            parts.push(format!("started at {temperature} K"));
+        }
+        for request in &set.analyses {
+            parts.push(format!(
+                "RDF: {} bins to {:.4e} m every {} steps",
+                request.bins, request.range, request.every
+            ));
+        }
+        let forces = if parts.is_empty() { "no forces".to_string() } else { parts.join("; ") };
         self.domain_index.insert(set.name.clone(), out.specs.len());
         out.specs.push(DomainSpec {
             id,
             name: set.name.clone(),
-            family: format!("particles2d[{}]", integrator.name()),
+            family: domain.contract().name.to_string(),
             summary: format!(
                 "{} particles, mass {} kg, {:?} boundary, {forces}",
                 set.count, set.mass, set.boundary
@@ -1942,6 +2145,86 @@ impl<'a> Compiler<'a> {
             contract: Some(domain.contract()),
         });
         out.domains.push(Box::new(domain));
+    }
+
+    /// Expand the declared bonds and angles into laws over the spawned handles.
+    ///
+    /// Returns `None` after reporting when a topology does not fit the set.
+    fn attach_topology(
+        &mut self,
+        set: &ParticlesInfo,
+        mut domain: ParticleDomain,
+        ids: &[ParticleId],
+    ) -> Option<ParticleDomain> {
+        let count = ids.len();
+        for spec in &set.bonds {
+            let pairs = molecular::expand(&spec.topology, 2, count, "bond", spec.span, &mut self.diagnostics)?;
+            let length = spec.length.or(set.spacing)?;
+            let bonds = pairs
+                .iter()
+                .map(|pair| Bond::new(ids[pair[0]], ids[pair[1]], length, spec.stiffness))
+                .collect();
+            domain = domain.with_force(HarmonicBond::new(bonds).with_pair_forces(spec.keep_pair_forces));
+        }
+        for spec in &set.angles {
+            let triples = molecular::expand(&spec.topology, 3, count, "angle", spec.span, &mut self.diagnostics)?;
+            let angles = triples
+                .iter()
+                .map(|t| Angle::new(ids[t[0]], ids[t[1]], ids[t[2]], spec.angle, spec.stiffness))
+                .collect();
+            domain = domain.with_force(HarmonicAngle::new(angles));
+        }
+        Some(domain)
+    }
+
+    /// A bond that starts far from its rest length stores a lot of energy the model
+    /// never asked for. That is a legitimate thing to want and an easy thing to do by
+    /// accident — a `chain` over a square lattice jumps a row every `sqrt(count)`
+    /// particles — so it is a warning that names the bond, not an error.
+    fn warn_about_strained_bonds(&mut self, set: &ParticlesInfo, domain: &ParticleDomain) {
+        let (xs, ys) = (domain.store().pos_x(), domain.store().pos_y());
+        let image = domain.bounds().map_or(lattice_domain_particle::MinimumImage::open(), |b| b.image());
+        let mut worst: Option<(usize, f64, f64)> = None;
+        for (index, &[a, b]) in domain.bonded_pairs().iter().enumerate() {
+            let (a, b) = (a as usize, b as usize);
+            let (dx, dy) = image.separation(xs[b] - xs[a], ys[b] - ys[a]);
+            let length = (dx * dx + dy * dy).sqrt();
+            // Every bond spec contributes its own rest length; find the one this
+            // pair came from by walking the specs in the order they were attached.
+            let mut offset = 0;
+            let mut rest = None;
+            for spec in &set.bonds {
+                let n = match &spec.topology {
+                    molecular::Topology::Chain => set.count.saturating_sub(1),
+                    molecular::Topology::Ring => set.count,
+                    molecular::Topology::Explicit(t) => t.len(),
+                };
+                if index < offset + n {
+                    rest = spec.length.or(set.spacing);
+                    break;
+                }
+                offset += n;
+            }
+            let Some(rest) = rest else { continue };
+            let strain = (length - rest).abs() / rest;
+            if strain > 0.5 && worst.is_none_or(|(_, _, s)| strain > s) {
+                worst = Some((index, length, strain));
+            }
+        }
+        if let Some((index, length, strain)) = worst {
+            self.error(
+                Diagnostic::warning(format!(
+                    "bond {index} of `{}` starts at {:.3e} m, {:.0}% away from its rest length",
+                    set.name,
+                    length,
+                    strain * 100.0
+                ))
+                .with_code("W0307")
+                .at(set.span, "strained at the start")
+                .note("the stored spring energy is released into the dynamics on the first step")
+                .help("use `layout: serpentine;` so consecutive particles start one spacing apart"),
+            );
+        }
     }
 
     /// Turn every `body` and `joint` declaration into one rigid world.
@@ -2150,12 +2433,14 @@ impl<'a> Compiler<'a> {
         out.domains.push(Box::new(world));
     }
 
-    /// Place particles and give them initial velocities.
+    /// Place particles and give them initial velocities, returning their handles in
+    /// placement order.
     ///
     /// The velocity distribution is shifted so total momentum is exactly zero. Without
     /// that, a "conserved" momentum starts at some arbitrary value and the diagnostic
-    /// is far less useful.
-    fn populate(&mut self, set: &ParticlesInfo, domain: &mut ParticleDomain) {
+    /// is far less useful. A `temperature` draws from the Maxwell distribution instead
+    /// and rescales so the instantaneous temperature is exactly the one written.
+    fn populate(&mut self, set: &ParticlesInfo, domain: &mut ParticleDomain) -> Vec<ParticleId> {
         let region = set.region.unwrap_or([1.0, 1.0]);
         let mut rng = Pcg32::seed_from_u64(set.seed);
 
@@ -2181,11 +2466,19 @@ impl<'a> Compiler<'a> {
             .spacing
             .unwrap_or_else(|| (region[0] / per_side as f64).min(region[1] / per_side as f64));
 
+        let mut ids = Vec::with_capacity(set.count);
         for (index, velocity) in velocities.iter().enumerate() {
-            let (i, j) = (index % per_side, index / per_side);
+            let (column, row) = (index % per_side, index / per_side);
+            // A serpentine fill reverses every other row, so index `i + 1` is always
+            // one spacing from index `i` — including across the row boundary.
+            let i = match set.layout {
+                Layout::Lattice => column,
+                Layout::Serpentine if row % 2 == 1 => per_side - 1 - column,
+                Layout::Serpentine => column,
+            };
             let position = [
                 set.origin[0] + (i as f64 + 0.5) * spacing,
-                set.origin[1] + (j as f64 + 0.5) * spacing,
+                set.origin[1] + (row as f64 + 0.5) * spacing,
             ];
             let velocity = [velocity[0] - mean[0], velocity[1] - mean[1]];
             let spawned = domain.spawn(
@@ -2194,18 +2487,25 @@ impl<'a> Compiler<'a> {
                     .with_mass(set.mass)
                     .with_radius(set.radius),
             );
-            if spawned.is_none() {
-                self.error(
-                    Diagnostic::error(format!(
-                        "particle set `{}` could not be filled to {} particles",
-                        set.name, set.count
-                    ))
-                    .with_code("E0405")
-                    .at(set.span, "capacity exhausted"),
-                );
-                return;
+            match spawned {
+                Some(id) => ids.push(id),
+                None => {
+                    self.error(
+                        Diagnostic::error(format!(
+                            "particle set `{}` could not be filled to {} particles",
+                            set.name, set.count
+                        ))
+                        .with_code("E0405")
+                        .at(set.span, "capacity exhausted"),
+                    );
+                    return ids;
+                }
             }
         }
+        if let Some(temperature) = set.temperature {
+            analysis::thermalize(domain.store_mut(), temperature, &mut rng);
+        }
+        ids
     }
 
     fn lower_observers(&mut self, project: &Project) -> Vec<ObserverSpec> {

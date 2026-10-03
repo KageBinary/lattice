@@ -27,7 +27,24 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if let Err(error) = lattice_viewer::run_with(&path, play) {
+    let result = if arguments.iter().any(|a| a == "--gpu") {
+        let smoke = arguments
+            .iter()
+            .find_map(|a| a.strip_prefix("--smoke-frames="))
+            .map(str::parse::<u64>)
+            .transpose();
+        let smoke = match smoke {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("invalid smoke frame count: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        lattice_viewer::gpu::run_with_smoke(&path, play || smoke.is_some(), smoke)
+    } else {
+        lattice_viewer::run_with(&path, play)
+    };
+    if let Err(error) = result {
         eprintln!("error: {error}");
         return ExitCode::FAILURE;
     }
@@ -40,9 +57,10 @@ fn usage() -> String {
 lattice-view {version} — open a .lattice model in a window
 
 USAGE
-  lattice-view <file.lattice> [--play]
+  lattice-view <file.lattice> [--play] [--gpu]
 
   --play    start running immediately instead of opening paused
+  --gpu     resident heat field with direct GPU texture rendering
 
 The window shows the model's fields and particles, transport controls, live plots of
 every observed quantity, conservation drift, the timestep against its stability limit,

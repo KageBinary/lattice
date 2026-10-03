@@ -27,6 +27,8 @@
 
 use lattice_ir::ParticleStore;
 
+use crate::image::MinimumImage;
+
 /// Uniform spatial binning over a rectangular region.
 #[derive(Clone, Debug)]
 pub struct CellList {
@@ -37,6 +39,8 @@ pub struct CellList {
     origin: [f64; 2],
     extent: [f64; 2],
     periodic: [bool; 2],
+    /// The minimum-image rule for this box, applied to every reported separation.
+    image: MinimumImage,
     /// CSR offsets, length `nx*ny + 1`.
     starts: Vec<u32>,
     /// Particle slots grouped by cell.
@@ -86,6 +90,7 @@ impl CellList {
             origin,
             extent,
             periodic,
+            image: MinimumImage::new(extent, periodic),
             starts: vec![0; cells + 1],
             items: vec![0; capacity],
             cursor: vec![0; cells],
@@ -120,6 +125,21 @@ impl CellList {
     /// Which axes wrap.
     pub fn periodic(&self) -> [bool; 2] {
         self.periodic
+    }
+    /// How many particles the list was sized for.
+    pub fn capacity(&self) -> usize {
+        self.items.len()
+    }
+    /// The minimum-image rule this list measures separations with.
+    pub fn image(&self) -> MinimumImage {
+        self.image
+    }
+    /// Bytes held, for the memory report (§19.3).
+    pub fn memory_bytes(&self) -> usize {
+        // CSR offsets, item list, per-cell cursor, and the 3×3 neighbour table.
+        (self.starts.len() + self.items.len() + self.cursor.len() + self.neighbor_cells.len())
+            * size_of::<u32>()
+            + self.neighbor_counts.len()
     }
 
     /// Precompute each cell's deduplicated 3×3 neighbourhood.
@@ -254,16 +274,10 @@ impl CellList {
     ///
     /// On a periodic axis the shortest image may be through the boundary, so a raw
     /// difference is wrong for any particle near an edge. Applied here once, rather
-    /// than remembered separately by every force law.
+    /// than remembered separately by every force law — see [`MinimumImage`].
     #[inline]
-    fn minimum_image(&self, mut dx: f64, mut dy: f64) -> (f64, f64) {
-        if self.periodic[0] {
-            dx -= self.extent[0] * (dx / self.extent[0]).round();
-        }
-        if self.periodic[1] {
-            dy -= self.extent[1] * (dy / self.extent[1]).round();
-        }
-        (dx, dy)
+    fn minimum_image(&self, dx: f64, dy: f64) -> (f64, f64) {
+        self.image.separation(dx, dy)
     }
 
     /// Visit every distinct pair closer than the cutoff.

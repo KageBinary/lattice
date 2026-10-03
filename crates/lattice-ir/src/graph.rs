@@ -120,10 +120,15 @@ impl Operation {
 
     /// True if this operation and `other` touch a buffer in a way that orders them.
     fn conflicts_with(&self, other: &Operation) -> bool {
+        // Domain-owned caches and scratch are mutable resources too. Buffer sets
+        // alone cannot make two exclusive calls on the same domain independent.
+        let domain = self.domain.is_some()
+            && self.domain == other.domain
+            && (!self.kind.is_read_only() || !other.kind.is_read_only());
         let raw = self.writes.iter().any(|b| other.reads.contains(b));
         let waw = self.writes.iter().any(|b| other.writes.contains(b));
         let war = self.reads.iter().any(|b| other.writes.contains(b));
-        raw || waw || war
+        domain || raw || waw || war
     }
 }
 
@@ -151,7 +156,10 @@ impl fmt::Display for GraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GraphError::UnknownOperation { index, count } => {
-                write!(f, "dependency refers to operation #{index}, but only {count} exist")
+                write!(
+                    f,
+                    "dependency refers to operation #{index}, but only {count} exist"
+                )
             }
             GraphError::Cycle { names } => write!(
                 f,
@@ -268,7 +276,13 @@ impl OperationGraph {
             return Err(GraphError::Cycle { names });
         }
 
-        Ok(OperationGraph { operations, successors, predecessor_counts, order, levels })
+        Ok(OperationGraph {
+            operations,
+            successors,
+            predecessor_counts,
+            order,
+            levels,
+        })
     }
 
     /// All operations, in declaration order.
@@ -293,7 +307,9 @@ impl OperationGraph {
 
     /// A valid sequential execution order.
     pub fn order(&self) -> impl Iterator<Item = OperatorId> + '_ {
-        self.order.iter().map(|&index| OperatorId::from_index(index as u32))
+        self.order
+            .iter()
+            .map(|&index| OperatorId::from_index(index as u32))
     }
 
     /// Operations grouped so everything within a group may run concurrently.
@@ -304,13 +320,20 @@ impl OperationGraph {
     pub fn levels(&self) -> Vec<Vec<OperatorId>> {
         self.levels
             .iter()
-            .map(|level| level.iter().map(|&i| OperatorId::from_index(i as u32)).collect())
+            .map(|level| {
+                level
+                    .iter()
+                    .map(|&i| OperatorId::from_index(i as u32))
+                    .collect()
+            })
             .collect()
     }
 
     /// Operations that must run after this one.
     pub fn successors(&self, id: OperatorId) -> impl Iterator<Item = OperatorId> + '_ {
-        self.successors[id.index()].iter().map(|&i| OperatorId::from_index(i as u32))
+        self.successors[id.index()]
+            .iter()
+            .map(|&i| OperatorId::from_index(i as u32))
     }
 
     /// How many operations this one waits for.
@@ -373,8 +396,11 @@ impl OperationGraph {
                 out.push('\n');
             }
         }
-        let speedup =
-            if self.critical_cost() > 0.0 { self.total_cost() / self.critical_cost() } else { 1.0 };
+        let speedup = if self.critical_cost() > 0.0 {
+            self.total_cost() / self.critical_cost()
+        } else {
+            1.0
+        };
         out.push_str(&format!(
             "  total cost {:.1}, critical path {:.1} (ideal speedup {speedup:.2}x)\n",
             self.total_cost(),
@@ -427,8 +453,14 @@ fn find_cycle(successors: &[Vec<usize>], candidates: &[usize]) -> Vec<usize> {
 
     for &start in candidates {
         if !visited[start]
-            && let Some(cycle) =
-                walk(start, successors, candidates, &mut visited, &mut on_stack, &mut stack)
+            && let Some(cycle) = walk(
+                start,
+                successors,
+                candidates,
+                &mut visited,
+                &mut on_stack,
+                &mut stack,
+            )
         {
             return cycle;
         }
@@ -462,7 +494,11 @@ mod tests {
             op("b", &[2], &[3]),
             op("c", &[4], &[5]),
         ]);
-        assert_eq!(graph.depth(), 1, "nothing conflicts, so everything runs at once");
+        assert_eq!(
+            graph.depth(),
+            1,
+            "nothing conflicts, so everything runs at once"
+        );
         assert_eq!(graph.max_width(), 3);
         assert!((graph.critical_cost() - 1.0).abs() < 1e-12);
     }
@@ -470,10 +506,8 @@ mod tests {
     /// Read-after-write: the consumer must wait for the producer.
     #[test]
     fn read_after_write_creates_an_edge() {
-        let graph = OperationGraph::build(vec![
-            op("produce", &[], &[7]),
-            op("consume", &[7], &[8]),
-        ]);
+        let graph =
+            OperationGraph::build(vec![op("produce", &[], &[7]), op("consume", &[7], &[8])]);
         assert_eq!(graph.depth(), 2);
         let order: Vec<OperatorId> = graph.order().collect();
         assert_eq!(graph.operation(order[0]).name, "produce");
@@ -568,9 +602,11 @@ mod tests {
     #[test]
     fn explicit_dependencies_add_ordering_without_hazards() {
         // No buffer conflict at all, but the model insists on an order.
-        let graph =
-            OperationGraph::with_dependencies(vec![op("a", &[], &[]), op("b", &[], &[])], &[(0, 1)])
-                .unwrap();
+        let graph = OperationGraph::with_dependencies(
+            vec![op("a", &[], &[]), op("b", &[], &[])],
+            &[(0, 1)],
+        )
+        .unwrap();
         assert_eq!(graph.depth(), 2);
     }
 
@@ -626,7 +662,10 @@ mod tests {
         assert!(text.contains("[observe]"), "{text}");
         // One `level N:` heading per level. Counting bare "level" would also match
         // the "N levels" in the summary line.
-        let headings = text.lines().filter(|line| line.trim_start().starts_with("level ")).count();
+        let headings = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("level "))
+            .count();
         assert_eq!(headings, graph.depth(), "{text}");
     }
 
@@ -643,7 +682,9 @@ mod tests {
     fn a_realistic_frame_schedules_sensibly() {
         let (heat_field, species_field, source) = (buffer(0), buffer(1), buffer(2));
         let graph = OperationGraph::build(vec![
-            Operation::new("prepare heat", OperationKind::Prepare).writing(heat_field).costing(1.0),
+            Operation::new("prepare heat", OperationKind::Prepare)
+                .writing(heat_field)
+                .costing(1.0),
             Operation::new("prepare species", OperationKind::Prepare)
                 .writing(species_field)
                 .costing(1.0),
@@ -669,8 +710,10 @@ mod tests {
         // The two prepares are independent and go first together.
         assert_eq!(graph.levels()[0].len(), 2);
         // The observer must come last: it reads what the advances write.
-        let order: Vec<String> =
-            graph.order().map(|id| graph.operation(id).name.clone()).collect();
+        let order: Vec<String> = graph
+            .order()
+            .map(|id| graph.operation(id).name.clone())
+            .collect();
         assert_eq!(order.last().unwrap(), "total energy");
         // And the coupling sits between the species advance and the heat advance.
         let position = |name: &str| order.iter().position(|n| n == name).unwrap();

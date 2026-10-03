@@ -83,4 +83,4 @@ pub use device::{
     Backend, Buffer, Capabilities, Device, DeviceError, Usage, require_precision,
 };
 pub use precision::Precision;
-pub use tolerance::{Comparison, Mechanism, Term, Tolerance};
+pub use tolerance::{Comparison, ImplicitSolve, Mechanism, Norm, Term, Tolerance};
