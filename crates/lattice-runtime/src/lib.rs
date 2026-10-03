@@ -527,11 +527,18 @@ impl Simulation {
                 stop = StopReason::DurationReached;
             }
 
+            // A sample is due at the step nearest its time, which is the same half-step
+            // rule the duration uses. An absolute slack — this was `1e-12` seconds — is
+            // wrong at every scale but one: a femtosecond model, stepping 1e-18 s at a
+            // time, found every step "due" and sampled two thousand times instead of
+            // thirty.
             let due = match config.sample_interval {
                 None => true,
                 Some(interval) => {
-                    if self.clock.time + 1e-12 >= next_sample {
-                        next_sample += interval;
+                    if self.clock.time + 0.5 * timestep >= next_sample {
+                        while next_sample <= self.clock.time + 0.5 * timestep {
+                            next_sample += interval;
+                        }
                         true
                     } else {
                         false
@@ -854,6 +861,19 @@ mod tests {
         simulation.observe();
         assert_eq!(simulation.observations().value("a.count"), Some(4.0));
         assert_eq!(simulation.observations().value("b.count"), Some(4.0));
+    }
+
+    /// The cadence must not depend on the units' scale: a femtosecond model samples
+    /// exactly as often as the same model in seconds.
+    #[test]
+    fn the_cadence_holds_at_femtosecond_scale() {
+        for scale in [1.0, 1e-15] {
+            let mut simulation = simulation(vec![Box::new(Counter::new("a"))]);
+            let mut config = RunConfig::new().with_duration(1.0 * scale).with_timestep(0.01 * scale);
+            config.sample_interval = Some(0.1 * scale);
+            let samples = simulation.run(&config).artifact.timeline().len();
+            assert_eq!(samples, 11, "at scale {scale:e}: the initial state and ten more");
+        }
     }
 
     #[test]

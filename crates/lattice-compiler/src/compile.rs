@@ -27,7 +27,8 @@ use lattice_domain_chemistry::{ReactingMixture, ReactionNetwork, Species as Chem
 use lattice_domain_rigid2d::{Collider, RigidDomain, SolverConfig};
 use lattice_coupling::{Coupler, CouplingEdge, Mapping, PortRef};
 
-use crate::{chemistry, molecular, rigid};
+use crate::{chemistry, molecular, quantum, rigid};
+use lattice_domain_quantum2d::Scheme as QuantumScheme;
 use lattice_domain_particle::{
     analysis, Angle, Bond, BoundaryBox, HarmonicAngle, HarmonicBond, HarmonicWell, Integrator,
     LennardJones, LinearDrag, ParticleBoundary, ParticleDomain, ParticleId, ParticleSpec,
@@ -306,6 +307,9 @@ impl<'a> Compiler<'a> {
         for solve in project.solves() {
             self.lower_solve(solve, &mut lowering);
         }
+        // A quantum domain carries its integrator in its own block (spec §25.2), so
+        // there is no `solve` statement to lower it from.
+        self.lower_quantum(project, &mut lowering);
 
         self.warn_about_unsolved_state();
 
@@ -1037,13 +1041,13 @@ impl<'a> Compiler<'a> {
     // --- unsupported constructs ---------------------------------------------
 
     fn reject_unsupported(&mut self, project: &Project) {
-        const KNOWN_KINDS: &[&str] =
-            &["grid", "particles", "material", "body", "joint", "reaction"];
-        const PLANNED: &[(&str, &str, &str)] = &[
-            ("potential", "M5", "quantum potentials"),
-            ("wavepacket", "M5", "quantum wave packets"),
-            ("detector", "M5", "detectors"),
+        const KNOWN_KINDS: &[&str] = &[
+            "grid", "particles", "material", "body", "joint", "reaction", "potential", "wavepacket",
+            "detector",
         ];
+        // Declaration kinds the spec names whose module does not exist yet, as
+        // `(kind, milestone, what)`. Empty since M5; kept so the next one has a place.
+        const PLANNED: &[(&str, &str, &str)] = &[];
 
         for decl in project.declarations() {
             let kind = decl.kind.text.as_str();
@@ -1071,11 +1075,10 @@ impl<'a> Compiler<'a> {
 
         for domain in project.domains() {
             // These were handled by their own declaration passes.
-            if matches!(domain.family.text.as_str(), "rigid2d" | "chemistry") {
+            if matches!(domain.family.text.as_str(), "rigid2d" | "chemistry" | "quantum2d") {
                 continue;
             }
             let milestone = match domain.family.text.as_str() {
-                "quantum2d" => "M5",
                 "fluid2d" => "M2",
                 _ => {
                     self.error(
@@ -1756,10 +1759,16 @@ impl<'a> Compiler<'a> {
             }
             "rigid" | "bodies" | "contacts" => self.lower_rigid(solve, &method, out),
             "reactions" | "kinetics" | "chemistry" => self.lower_reactions(solve, &method, out),
+            "schrodinger" | "quantum" => self.error(
+                Diagnostic::error("a quantum domain is not lowered from a `solve` statement")
+                    .with_code("E0206")
+                    .at(solve.solver.span, "not a solve")
+                    .note("its integrator is part of its block, as in spec §25.2")
+                    .help("write `domain quantum2d q { ...; integrator: split_step_fourier(dt=...); }`"),
+            ),
             other => {
                 let planned = match other {
                     "flow" | "fluid" => Some("M2"),
-                    "schrodinger" | "quantum" => Some("M5"),
                     _ => None,
                 };
                 match planned {
@@ -1934,6 +1943,95 @@ impl<'a> Compiler<'a> {
             ));
         }
         out.domains.push(Box::new(heat));
+    }
+
+    fn lower_quantum(&mut self, project: &Project, out: &mut Lowering) {
+        let blocks: Vec<_> = project.domains().filter(|d| d.family.text == "quantum2d").collect();
+        let furnishings: Vec<&Decl> = ["potential", "wavepacket", "detector"]
+            .iter()
+            .flat_map(|kind| project.declarations_of(kind))
+            .collect();
+        let Some(block) = blocks.first() else {
+            if let Some(decl) = furnishings.first() {
+                self.error(
+                    Diagnostic::error(format!("a `{}` needs a quantum domain to belong to", decl.kind.text))
+                        .with_code("E0203")
+                        .at(decl.kind.span, "no `domain quantum2d` in this project")
+                        .help("declare `domain quantum2d q { grid: ...; extent: ...; mass: ...; }`"),
+                );
+            }
+            return;
+        };
+        for extra in &blocks[1..] {
+            self.error(
+                Diagnostic::error("a project holds one quantum2d domain")
+                    .with_code("E0209")
+                    .at(extra.name.span, "a second one")
+                    .also(block.name.span, "the first")
+                    .note(
+                        "potentials, wave packets and detectors are not addressed to a domain, so a \
+                         second would be ambiguous",
+                    ),
+            );
+        }
+
+        let evaluator = self.evaluator();
+        let Some(plan) = quantum::domain(block, &evaluator, &mut self.diagnostics) else { return };
+        let potentials: Vec<_> = project
+            .declarations_of("potential")
+            .filter_map(|decl| quantum::potential(decl, plan.mass, &evaluator, &mut self.diagnostics))
+            .collect();
+        let packets: Vec<_> = project
+            .declarations_of("wavepacket")
+            .filter_map(|decl| quantum::wavepacket(decl, &evaluator, &mut self.diagnostics))
+            .collect();
+        let detectors: Vec<_> = project
+            .declarations_of("detector")
+            .filter_map(|decl| {
+                quantum::detector(decl, &evaluator, &mut self.diagnostics).map(|(name, x)| (name, x, decl.name.span))
+            })
+            .collect();
+        let assembly =
+            quantum::Assembly { plan: &plan, potentials: &potentials, packets: &packets, detectors: &detectors };
+        let Some(domain) = assembly.build(&mut self.diagnostics) else { return };
+
+        let (nx, ny) = (plan.grid.nx(), plan.grid.ny());
+        let cells = nx * ny;
+        let state = out.buffers.allocate(plan.name.clone(), BufferKind::VectorField { nx, ny, halo: 0 });
+        // Split-step keeps two phase tables, a loss table and an observation transform;
+        // Crank-Nicolson its Krylov vectors. In f64 elements, a complex value being two.
+        let (workspace, per_cell) = match plan.scheme {
+            QuantumScheme::SplitStepFourier => (2 * 3 * cells + cells, 2.0 * (cells as f64).log2() + 6.0),
+            QuantumScheme::CrankNicolson => (2 * 12 * cells, 60.0),
+        };
+        let scratch =
+            out.buffers.allocate(format!("{} workspace", plan.name), BufferKind::Scratch { elements: workspace });
+
+        let id = DomainId::from_index(out.specs.len() as u32);
+        out.operations.push(
+            Operation::new(format!("prepare {}", plan.name), OperationKind::Prepare)
+                .in_domain(id)
+                .writing(state)
+                .costing(0.1),
+        );
+        out.operations.push(
+            Operation::new(format!("advance {}", plan.name), OperationKind::Advance)
+                .in_domain(id)
+                .reading(state)
+                .writing(state)
+                .writing(scratch)
+                .costing(cells as f64 * per_cell),
+        );
+        self.domain_index.insert(plan.name.clone(), out.specs.len());
+        out.specs.push(DomainSpec {
+            id,
+            name: plan.name.clone(),
+            family: domain.contract().name.to_string(),
+            summary: assembly.describe(),
+            buffers: vec![state, scratch],
+            contract: Some(domain.contract()),
+        });
+        out.domains.push(Box::new(domain));
     }
 
     fn lower_dynamics(&mut self, target: &Expr, method: &builtins::Method, out: &mut Lowering) {

@@ -90,6 +90,12 @@ impl<'a> Evaluator<'a> {
         if value.dimension() == expected {
             return Some(value.value());
         }
+        // A bare zero is zero in every unit, so spec §25.2's `x=0` and `[-4 nanometer, 0]`
+        // mean what they say. Temperature is the exception: zero kelvin and zero celsius
+        // are different temperatures, and a bare 0 cannot say which.
+        if is_literal_zero(expr) && expected != Dimension::TEMPERATURE {
+            return Some(0.0);
+        }
         diagnostics.push(
             Diagnostic::error(format!("{what} has the wrong dimension"))
                 .with_code("E0400")
@@ -396,10 +402,40 @@ impl<'a> Evaluator<'a> {
     }
 }
 
+/// Whether an expression is the number zero as written, `0` or `-0.0`, with no unit.
+fn is_literal_zero(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Number(value) => *value == 0.0,
+        ExprKind::Unary(_, inner) => is_literal_zero(inner),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use lattice_syntax::{parse, Item};
+
+    #[test]
+    fn a_bare_zero_is_zero_of_any_dimension_but_temperature() {
+        let file = SourceFile::new("t.lattice", "project p { a: 0; b: -0.0; c: 2; }");
+        let (project, _) = parse(&file);
+        let project = project.unwrap();
+        let units = UnitRegistry::si();
+        let evaluator = Evaluator::new(&file, &units);
+        let value = |k: usize| match &project.items[k] {
+            Item::Setting(s) => s.value.clone(),
+            _ => panic!(),
+        };
+        let mut diagnostics = Diagnostics::default();
+        assert_eq!(evaluator.require(&value(0), Dimension::LENGTH, "x", &mut diagnostics), Some(0.0));
+        assert_eq!(evaluator.require(&value(1), Dimension::MOMENTUM, "p", &mut diagnostics), Some(0.0));
+        assert!(!diagnostics.has_errors());
+        assert_eq!(evaluator.require(&value(2), Dimension::LENGTH, "x", &mut diagnostics), None, "2 is not 2 m");
+        let mut diagnostics = Diagnostics::default();
+        assert_eq!(evaluator.require(&value(0), Dimension::TEMPERATURE, "T", &mut diagnostics), None);
+        assert!(diagnostics.codes().contains(&"E0400"), "0 K or 0 °C? A bare zero cannot say");
+    }
 
     /// Evaluate the value of `x: <source>;` in a throwaway project.
     fn eval_setting(source: &str) -> (Option<Quantity>, Diagnostics, SourceFile) {

@@ -15,6 +15,7 @@ lattice-domain-rigid2d.workspace = true
 lattice-domain-chemistry.workspace = true
 lattice-coupling.workspace = true
 lattice-domain-particle.workspace = true
+lattice-domain-quantum2d.workspace = true
 
 [dev-dependencies]
 # The fixture test compiles every example *and runs it*, which is the only way to

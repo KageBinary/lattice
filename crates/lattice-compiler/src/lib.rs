@@ -62,6 +62,7 @@ pub mod chemistry;
 pub mod compile;
 pub mod eval;
 pub mod molecular;
+pub mod quantum;
 pub mod rigid;
 
 pub use compile::{compile, Compiled};
@@ -378,14 +379,110 @@ project hot_reaction {
     }
 
     #[test]
-    fn a_quantum_domain_names_its_milestone() {
+    fn a_fluid_domain_names_its_milestone() {
         let (text, codes) = err(r#"
-project q {
-  domain quantum2d psi { grid: [64, 64]; mass: electron_mass; }
+project f {
+  domain fluid2d air { grid: [64, 64]; }
 }
 "#);
-        assert!(codes.contains(&"E0900".to_string()));
-        assert!(text.contains("M5"), "{text}");
+        assert!(codes.contains(&"E0900".to_string()), "{text}");
+        assert!(text.contains("not implemented yet"), "{text}");
+    }
+
+    /// Spec §25.2, exactly as the spec writes it.
+    const SPEC_DOUBLE_SLIT: &str = r#"
+project double_slit {
+  domain quantum2d q {
+    grid: [768, 384];
+    extent: [12 nanometer, 6 nanometer];
+    mass: electron_mass;
+    boundary: absorbing(width=0.8 nanometer);
+    integrator: split_step_fourier(dt=0.002 femtosecond);
+  }
+
+  potential barrier {
+    shape: vertical_wall(x=0, thickness=0.15 nanometer);
+    slits: [(-1.0, 0.35), (1.0, 0.35)] nanometer;
+    height: 20 electronvolt;
+  }
+
+  wavepacket initial {
+    center: [-4 nanometer, 0];
+    momentum: [6.5e-24 kilogram*meter/second, 0];
+    sigma: 0.45 nanometer;
+  }
+
+  detector screen at x=4.5 nanometer;
+  observe probability_norm every step;
+  visualize probability_density;
+  visualize phase;
+}
+"#;
+
+    #[test]
+    fn the_spec_double_slit_compiles_and_says_what_is_wrong_with_it() {
+        let file = SourceFile::new("double_slit.lattice", SPEC_DOUBLE_SLIT);
+        let (compiled, diagnostics) = compile_source(&file);
+        assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+        let compiled = compiled.unwrap();
+        assert_eq!(compiled.domains.len(), 1);
+        assert_eq!(compiled.model.domains[0].family, "quantum2d[split_step_fourier+absorbing]");
+        let codes = diagnostics.codes();
+        // 145 eV against a 20 eV wall, and 9.4 radians per step against sharp edges.
+        assert!(codes.contains(&"W0308"), "{}", diagnostics.render(&file));
+        assert!(codes.contains(&"W0310"), "{}", diagnostics.render(&file));
+        assert!(!codes.contains(&"W0309"), "its momentum is well inside the grid's Nyquist");
+        let report = compiled.model.report();
+        assert!(report.contains("2 slits") && report.contains("detector `screen`"), "{report}");
+    }
+
+    #[test]
+    fn quantum_declarations_without_a_domain_are_rejected() {
+        let (text, codes) = err("project p { wavepacket w { center: [0, 0]; sigma: 1 nanometer; } }");
+        assert!(codes.contains(&"E0203".to_string()), "{text}");
+        assert!(text.contains("needs a quantum domain"), "{text}");
+    }
+
+    #[test]
+    fn a_quantum_domain_needs_a_state_and_its_edges_must_suit_its_integrator() {
+        let (text, codes) = err(r#"
+project p {
+  domain quantum2d q { grid: [16, 16]; extent: [1 nanometer, 1 nanometer]; mass: electron_mass; }
+}
+"#);
+        assert!(codes.contains(&"E0203".to_string()) && text.contains("no wave packet"), "{text}");
+
+        let (text, codes) = err(r#"
+project p {
+  domain quantum2d q {
+    grid: [16, 16]; extent: [1 nanometer, 1 nanometer]; mass: electron_mass;
+    boundary: periodic; integrator: crank_nicolson(dt=1 attosecond);
+  }
+  wavepacket w { center: [0, 0]; sigma: 0.1 nanometer; }
+}
+"#);
+        assert!(codes.contains(&"E0208".to_string()), "{text}");
+    }
+
+    #[test]
+    fn a_harmonic_trap_and_a_box_compile_under_crank_nicolson() {
+        let file = SourceFile::new(
+            "trap.lattice",
+            r#"
+project trap {
+  duration: 1 femtosecond;
+  domain quantum2d q {
+    grid: [32, 32]; extent: [4 nanometer, 4 nanometer]; mass: electron_mass;
+    integrator: crank_nicolson(dt=0.01 femtosecond, tolerance=1e-11);
+  }
+  potential well { shape: harmonic(omega=1.5e14 / second); }
+  wavepacket w { center: [0.3 nanometer, 0]; sigma: [0.4 nanometer, 0.3 nanometer]; }
+}
+"#,
+        );
+        let (compiled, diagnostics) = compile_source(&file);
+        assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+        assert_eq!(compiled.unwrap().model.domains[0].family, "quantum2d[crank_nicolson]");
     }
 
     #[test]

@@ -73,6 +73,13 @@ names is ordinary arithmetic and needs no advice.
 
 ---
 
+### A bare zero has every dimension but one
+
+`0` with no unit is accepted wherever a quantity is expected, because zero is zero in
+every unit: §25.2 writes `x=0` for a wall and `[-4 nanometer, 0]` for a centre.
+Temperature is the exception — `0` could be 0 K or 0 °C, which differ by 273.15 — so a
+bare zero temperature is still a dimension error.
+
 ## Grammar
 
 ```text
@@ -465,6 +472,77 @@ the latest state it was given, so the final step's transfer is recorded and neve
 delivered. The shortfall is first order in the timestep, and the validation suite
 measures it rather than tolerating it.
 
+## Quantum
+
+Spec §13.1's built-in module: one particle's wavefunction on a 2D grid, under
+`iħ ∂ψ/∂t = −(ħ²/2m)∇²ψ + Vψ`. A complete scene is
+[`examples/double_slit.lattice`](../examples/double_slit.lattice); spec §25.2's own
+version compiles as written.
+
+```
+domain quantum2d q {
+  grid: [256, 128];
+  extent: [12 nanometer, 6 nanometer];
+  mass: electron_mass;
+  boundary: absorbing(width=0.8 nanometer);
+  integrator: split_step_fourier;
+}
+
+potential barrier {
+  shape: vertical_wall(x=0, thickness=0.15 nanometer);
+  slits: [(-1.0, 0.35), (1.0, 0.35)] nanometer;
+  height: 20 electronvolt;
+}
+
+wavepacket initial {
+  center: [-3 nanometer, 0];
+  momentum: [1.3e-24 kilogram*meter/second, 0];
+  sigma: [0.6 nanometer, 1.5 nanometer];
+}
+
+detector screen at x=4.5 nanometer;
+```
+
+The grid is **centred on the origin** unless an `origin:` is given — §25.2 puts its
+wall at `x = 0` and its packet at `x = −4 nm` on a 12 nm grid. A quantum domain carries
+its integrator in its own block, so there is no `solve` statement for it, and a project
+holds at most one: potentials, packets and detectors belong to it without naming it.
+
+| Domain setting | Meaning |
+|---|---|
+| `grid:` | cells along x and y. One row (`[n, 1]`) is a line, and the y direction drops out |
+| `extent:`, `origin:` | size, and the lower-left corner (default: centred) |
+| `mass:` | the particle's mass |
+| `integrator:` | `split_step_fourier(dt=…)` — spectral, periodic, the default — or `crank_nicolson(dt=…, tolerance=…)` — finite difference, a box with `ψ = 0` walls. Leave `dt` out to get one sized for the grid |
+| `boundary:` | `periodic` (split-step's own), `walls` (Crank–Nicolson's own), or `absorbing(width=…, strength=…)` in front of either. The strength defaults to `10ħv/width`, with `v` a packet's group velocity plus three of its velocity spreads |
+
+| Potential `shape:` | Settings |
+|---|---|
+| `vertical_wall(x=, thickness=)` | `height:`; optional `slits:` as `(centre, width)` pairs |
+| `rectangle(x=[a, b], y=[c, d])` | `height:` — positive for a barrier, negative for a well |
+| `harmonic(center=[…], omega=…)` | none; the stiffness is `m ω²` for the domain's mass |
+
+Potentials add. A `wavepacket` is a minimum-uncertainty Gaussian with position spread
+`sigma` (one value or `[σx, σy]`) and mean `momentum`; several superpose, and their sum
+is normalized. A `detector` is a screen parallel to y that integrates the probability
+current through it; `lattice run` plots what it collected — the interference pattern —
+and the run artifact stores it as a curve.
+
+With an absorbing boundary the norm falls on purpose. The domain publishes
+`probability_norm` and `probability_absorbed` as metrics and their sum,
+`probability_accounted`, as the invariant.
+
+### Three warnings
+
+Each of these describes an experiment someone might run on purpose, so they warn
+rather than refuse. Spec §25.2's own example triggers two of them.
+
+| Code | When | Why it matters |
+|---|---|---|
+| `W0308` | a packet's mean kinetic energy is above a barrier's height | it mostly passes over, rather than tunnelling or diffracting |
+| `W0309` | a packet's wavenumbers reach the grid's Nyquist limit `π/Δ` | those momenta alias onto the opposite direction |
+| `W0310` | split-step's `dt` puts more than 2 radians of kinetic phase per step on the grid's top mode, with a wall or rectangle present | sharp edges reach the top modes, where the splitting error lives; a validated tunnelling case was 1.9% wrong at 7.5 radians |
+
 ## Solving
 
 ```
@@ -510,7 +588,7 @@ visualize probability_density;         // the domain picks an encoding
 | `E021x` | geometry and chemistry: unknown builtin (`E0210`), invalid shape or formula (`E0211`), unbalanced reaction (`E0212`) |
 | `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range |
 | `E09xx` | not implemented yet — the message names the milestone |
-| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state |
+| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, and the quantum module's physics checks (`W0308`–`W0310`) |
 
 Every rejection carries a source position and either a suggested fix or the rule it
 enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the
@@ -528,7 +606,6 @@ numbers.
 | Construct | Milestone |
 |---|---|
 | `domain fluid2d` | M4 |
-| `domain quantum2d`, `potential`, `wavepacket`, `detector` | M5 |
 | user-defined expressions and force laws (spec §8.3) | M6 |
 
 Stochastic kinetics (Gillespie) is not implemented either, but it has no syntax of its

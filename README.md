@@ -13,7 +13,7 @@ A 2D-first multiphysics, chemistry, and quantum simulation runtime.
 
 ---
 
-## Status: M0 through M4 complete; M5's molecular half complete, `quantum2d` next
+## Status: M0 through M5 complete within the documented scope
 
 The M4 implementation now includes graph-driven CPU scheduling, resident gravity and
 Lennard–Jones particles, implicit Dirichlet faces, shared-device field rendering, and
@@ -39,9 +39,13 @@ The spec lays out nine milestones, M0 through M8.
   uncoupled heat field through a resident texture on the same device. Eleven GPU
   validation cases compare the accelerated paths with CPU references.
 - **M5 — Molecular and quantum.** Exit condition: *"energy/norm tests and visual
-  examples."* The molecular half is done: bonds, angles, thermostats, Verlet lists and
-  trajectory analysis, with nine validation cases and
-  [`examples/argon.lattice`](examples/argon.lattice). `quantum2d` is next.
+  examples."* Molecular dynamics — bonds, angles, thermostats, Verlet lists and
+  trajectory analysis — and `quantum2d`, a wavefunction solver by split-step Fourier
+  and Crank–Nicolson with absorbing boundaries, eigenstates and detectors. Eighteen
+  validation cases between them, and [`examples/argon.lattice`](examples/argon.lattice),
+  [`examples/polymer.lattice`](examples/polymer.lattice) and
+  [`examples/double_slit.lattice`](examples/double_slit.lattice), which is spec §25.2's
+  scene. §25.2's own text compiles as written, with two warnings about its physics.
 
 Being specific about that, in the spirit of design principle **P1 — scientific
 honesty over feature count**:
@@ -57,6 +61,7 @@ honesty over feature count**:
 | **Storage** | Structure-of-arrays particles with stable handles, halo'd grid fields, bump arenas, reproducible RNG | 112 tests; no allocation in stepping loops |
 | **Particles** | Explicit Euler, semi-implicit Euler, velocity Verlet; gravity, drag, harmonic wells, Lennard-Jones; uniform cell list | Free fall, oscillator period, energy drift, convergence order, momentum conservation |
 | **Molecular dynamics** | Harmonic bonds and angles on declared topology; energy- and force-shifted Lennard-Jones, soft repulsion; Verlet lists with skin and bonded exclusions; Langevin (BAOAB) and velocity-rescaling thermostats; temperature, virial pressure, RDF and MSD | Bond period at the reduced mass; force-shifted energy error order 2.00; Verlet list equals a fresh cell list to 2e-16; empty RDF core and a first shell 4% inside the pair minimum 2^(1/6)σ; bath temperature and Ornstein–Uhlenbeck diffusion within their sampling error; Berendsen relaxation exact to 3e-15 |
+| **Quantum** | One particle's wavefunction on a 2D grid: split-step Fourier (spectral, periodic) and Crank–Nicolson (five-point, walls); an in-house radix-2 and Bluestein FFT; complex absorbing layers with the absorbed probability accounted; imaginary-time eigenstates; walls with slits, barriers, harmonic traps; detectors integrating the probability current | Box spectrum to 4e-15 and its continuum limit at order 2.00; oscillator levels to 2e-7 ħω; free-packet spreading to 1e-13; tunnelling within 0.09% of the analytic transmission; double-slit norm plus absorbed probability to 1.5e-14; Crank–Nicolson converging to split-step at order 2.02 |
 | **Rigid bodies** | Circles, boxes, convex polygons, segments; sweep-and-prune broadphase, SAT narrowphase, friction and restitution; distance, rope, pin, spring and motor joints; sequential-impulse solver with warm starting | Elastic collision exchanges velocities exactly; inelastic loses exactly the predicted energy; pendulum period within 0.008% of analytic; Coulomb friction threshold to the digit |
 | **Heat / diffusion** | Finite-volume `∇·(D∇u)`, explicit / Crank–Nicolson / backward Euler, matrix-free conjugate gradient, Dirichlet / Neumann / Robin / periodic boundaries, variable diffusivity | Analytic heat kernel, manufactured solutions, convergence orders, conservation, series conduction |
 | **Chemistry** | Species with formulas, charges and diffusion; reaction networks with atom and charge balance checking; mass-action kinetics with Arrhenius temperature dependence; reaction-diffusion by Strang splitting | First-order decay to 1e-9 of analytic; equilibrium to the constant it declares; RK4 order 4.05; splitting order 2.00; mass and every element to round-off |
@@ -64,14 +69,15 @@ honesty over feature count**:
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
 | **Execution** | A worker pool and an explicit partitioning executor; parallel diffusion stencils and per-particle integration; `--threads` and a `--compare` mode that measures its own speedup | Parallel and scalar agree *bit for bit* — every cell, every particle, the CG iteration count, and the reproducibility hash. 4.8× at 512², 1.9× on 262k particles, and nothing slower than it was |
 | **Backends** | A dependency-free backend boundary — devices, buffers, §10.5 precision modes, a kernel cache keyed the way §15.5 asks — with the scalar CPU path and a portable `wgpu` compute backend behind it; explicit diffusion and Crank–Nicolson both device-resident, the latter with a conjugate gradient whose reduction has a *stated* association order; `--backend gpu` on the benchmark harness | The GPU differs from the CPU reference by 4.3 `f32` ulps over 200 explicit steps, using 0.3% of a budget *derived* from `f32` rounding rather than fitted — and agrees to the bit where nothing rounds. 130× the scalar CPU on a 1024² stencil, and 4.1× *slower* end-to-end at 256²; both are published, because neither is honest alone. The implicit path refuses a residual tolerance below `ε·(1 + ‖A‖₂)` instead of failing to reach it, and its budget is dominated by the two solves' stopping criteria rather than by precision |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1135 tests including doctests across 18 crates with all features |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1178 tests including doctests across 19 crates with all features |
 | **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, conservation drift and the solver's contract | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
 
-Fluids, waves, electromagnetism, Coulomb interactions, the quantum module, and the
-Python SDK. The quantum module finishes M5; the rest are M6–M8 or outside the
-milestones.
+Fluids, waves, electromagnetism, Coulomb interactions, and the Python SDK — M6–M8,
+or outside the milestones. In the quantum module: measurement-inspired sampling, a
+drawn probability current, and a phase wheel in the viewer, which also does not plot
+curves yet. See [the roadmap](docs/roadmap.md#what-m5-leaves-out).
 
 GPU execution is deliberately limited to the released kernels and boundary modes.
 General GPU execution of arbitrary coupled `.lattice` projects is not implemented;
@@ -84,7 +90,7 @@ residual tolerances disagree by four orders of magnitude more than `f32` storage
 an `f32` solve *cannot* be asked for the CPU's `1e-10` — the backend refuses it, naming the
 floor `ε·(1 + ‖A‖₂)` it came from. See [docs/backends.md](docs/backends.md). The backend is
 off by default, because `wgpu` is a few hundred crates and the rest of the CLI has none:
-`--features gpu` turns `lattice validate`'s 54 cases into 65 when an adapter is available.
+`--features gpu` turns `lattice validate`'s 63 cases into 74 when an adapter is available.
 
 The measured lesson of the implicit path is that **the stall is the program**: the diffusion
 stencil runs 27× the CPU at 256², and a CG iteration runs 1.8×, because §10.3 requires the
@@ -114,9 +120,8 @@ Rigid-body collision detection is discrete, so a fast thin
 projectile can pass through a thin wall — continuous collision detection is what §11.1
 lists under "later".
 
-`reaction` and `couple` execute on the CPU. `domain quantum2d` is still a compile error
-naming its implementation milestone. Unsupported GPU domains and boundary modes are
-refused rather than silently dropped.
+`reaction`, `couple` and `quantum2d` execute on the CPU. Unsupported GPU domains and
+boundary modes are refused rather than silently dropped.
 
 ### What this is not
 
@@ -149,7 +154,7 @@ $ ./target/release/lattice-view examples/diffusing_pulse.lattice --play
 ### A model
 
 Models are written in the `.lattice` language — see
-[docs/language.md](docs/language.md) for the reference, and `examples/` for ten
+[docs/language.md](docs/language.md) for the reference, and `examples/` for eleven
 working scenes.
 
 ```
@@ -369,6 +374,8 @@ lattice/
     lattice-domain-grid2d/    diffusion operator, boundaries, conjugate gradient
     lattice-domain-rigid2d/   shapes, broadphase, contacts, joints, impulse solver
     lattice-domain-chemistry/ species, reaction networks, kinetics, reaction-diffusion
+    lattice-domain-quantum2d/ wavefunctions, FFT, split-step and Crank–Nicolson,
+                              absorbers, eigenstates, detectors
     lattice-coupling/         typed ports, coupling edges, the conservation ledger
     lattice-observe/          JSON, timing profiles, run artifacts
     lattice-validation/       the validation lab
@@ -394,7 +401,7 @@ lattice/
 
 ## Dependencies
 
-Fifteen of the eighteen crates have no external dependencies. Everything from units through the compiler to
+Sixteen of the nineteen crates have no external dependencies. Everything from units through the compiler to
 the validation lab builds from `std` alone — including, somewhat to my own surprise, the
 whole M1 compiler and its diagnostics, and the M4 worker pool.
 

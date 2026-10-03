@@ -445,8 +445,8 @@ GPU number produced by the CPU would be the most misleading thing the harness co
 `particles-gravity` and `particles-lj` still have no GPU kernels; §15.6's "local particles"
 and "Lennard-Jones MD" are GPU targets and the pair-force question is still open.
 
-Without `--features gpu` the GPU rows are **absent** from `lattice validate` — 54 cases
-rather than 65 — rather than reported as skipped-and-passing, which is how M3 handles the
+Without `--features gpu` the GPU rows are **absent** from `lattice validate` — 63 cases
+rather than 74 — rather than reported as skipped-and-passing, which is how M3 handles the
 Gillespie statistics and for the same reason. A machine with no adapter produces no rows
 either: `GpuDevice::open` returns `Unavailable`, and `gpu::cases()` returns an empty list. A
 case that could not run must not report as passing.

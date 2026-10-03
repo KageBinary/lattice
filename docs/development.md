@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-Rust 1.85 or newer (edition 2024). No other tools are needed. Fifteen of the eighteen
+Rust 1.85 or newer (edition 2024). No other tools are needed. Sixteen of the nineteen
 crates have no external dependencies at all: the two that open a window, and the portable
 GPU backend, are the exceptions.
 
@@ -34,7 +34,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test --workspace --all-features # 1135 tests including doctests across 18 crates
+$ cargo test --workspace --all-features # 1178 tests including doctests across 19 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
@@ -53,7 +53,7 @@ does reach them, so run the whole workspace before committing.
 ### The GPU backend
 
 Off by default. §19.1's GPU cross-backend rows are *absent* from `lattice validate` without
-the feature — 54 cases rather than 65 — rather than reported as skipped-and-passing.
+the feature — 63 cases rather than 74 — rather than reported as skipped-and-passing.
 
 ```console
 $ cargo run -p lattice-wgpu --example probe    # what this machine's adapter offers

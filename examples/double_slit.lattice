@@ -1,0 +1,50 @@
+// An electron through two slits: spec §25.2's scene, with numbers that make it work.
+//
+// The spec's own example compiles as written, and the compiler warns about it twice:
+// its 145 eV electron is seven times higher in energy than the 20 eV wall meant to stop
+// it (W0308), and its step is too long for a wall's sharp edges (W0310). Here the
+// electron has 5.8 eV, so the wall stops it everywhere but the slits, and the step is
+// left to the domain, which sizes it for the edges.
+//
+// The packet is wider in y than the slits are apart, so both slits are lit. Past the
+// wall the two diffracted waves overlap and interfere; the detector at x = 4.5 nm
+// integrates the probability current through it, and `lattice run` plots what it
+// collected — the interference pattern — at the end. Fringe spacing is about
+// λL/d = 0.51 nm · 4.5 nm / 2 nm ≈ 1.1 nm.
+//
+// The absorbing layer removes what reaches the edges, and the run reports how much:
+// the norm falls on purpose, and the norm plus the absorbed probability is the
+// invariant, held to round-off.
+//
+//   lattice run examples/double_slit.lattice
+
+project double_slit {
+  fidelity: engineering_2d;
+  duration: 8 femtosecond;
+
+  domain quantum2d q {
+    grid: [256, 128];
+    extent: [12 nanometer, 6 nanometer];
+    mass: electron_mass;
+    boundary: absorbing(width=0.8 nanometer);
+    integrator: split_step_fourier;
+  }
+
+  potential barrier {
+    shape: vertical_wall(x=0, thickness=0.15 nanometer);
+    slits: [(-1.0, 0.35), (1.0, 0.35)] nanometer;
+    height: 20 electronvolt;
+  }
+
+  wavepacket initial {
+    center: [-3 nanometer, 0];
+    momentum: [1.3e-24 kilogram*meter/second, 0];
+    sigma: [0.6 nanometer, 1.5 nanometer];
+  }
+
+  detector screen at x=4.5 nanometer;
+
+  observe q every 0.25 femtosecond;
+  visualize probability_density;
+  visualize phase;
+}

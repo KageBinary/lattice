@@ -841,6 +841,24 @@ mod tests {
     }
 
     #[test]
+    fn the_double_slit_loads_and_draws_density_phase_and_potential() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/double_slit.lattice");
+        let State::Ready(mut loaded) = load(&path) else {
+            panic!("double_slit should load")
+        };
+        for _ in 0..3 {
+            loaded.simulation.step(loaded.timestep);
+        }
+        let channels = loaded.simulation.render_channels();
+        let names: Vec<&str> = channels.iter().map(|c| c.name()).collect();
+        assert_eq!(names, ["q.probability_density", "q.phase", "q.potential"]);
+        for channel in &channels {
+            let RenderChannel::Scalar { field, .. } = channel else { panic!("{} is not a field", channel.name()) };
+            assert!(field.first_non_finite().is_none(), "{} has a non-finite cell", channel.name());
+        }
+    }
+
+    #[test]
     fn short_names_drop_the_domain_prefix() {
         assert_eq!(short_name("temperature.integral"), "integral");
         assert_eq!(short_name("bare"), "bare");

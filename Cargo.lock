@@ -1660,6 +1660,7 @@ dependencies = [
  "lattice-domain-chemistry",
  "lattice-domain-grid2d",
  "lattice-domain-particle",
+ "lattice-domain-quantum2d",
  "lattice-domain-rigid2d",
  "lattice-ir",
  "lattice-runtime",

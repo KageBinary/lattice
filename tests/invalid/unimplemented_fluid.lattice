@@ -1,0 +1,11 @@
+// expect: E0900
+// The spec names a fluid module (§11.5) but no milestone has built it. The declaration
+// parses and its settings are checked, but nothing can execute it — so this is an
+// error rather than a silent omission. A model whose physics was quietly dropped would
+// run and produce confident wrong numbers.
+
+project unimplemented_fluid {
+  domain fluid2d air {
+    grid: [64, 64];
+  }
+}

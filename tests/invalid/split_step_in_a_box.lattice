@@ -1,0 +1,21 @@
+// expect: E0208
+// Split-step Fourier applies the kinetic operator in Fourier space, which makes the
+// grid periodic by construction. A box with walls is Crank–Nicolson's; asking for
+// both would silently run a torus and call it a box.
+
+project split_step_in_a_box {
+  duration: 1 femtosecond;
+
+  domain quantum2d q {
+    grid: [64, 64];
+    extent: [4 nanometer, 4 nanometer];
+    mass: electron_mass;
+    boundary: walls;
+    integrator: split_step_fourier(dt=0.001 femtosecond);
+  }
+
+  wavepacket initial {
+    center: [0, 0];
+    sigma: 0.4 nanometer;
+  }
+}

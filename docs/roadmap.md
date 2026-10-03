@@ -489,11 +489,11 @@ available for uncoupled heat fields, and GPU particle execution is available thr
 the Rust backend API and benchmark harness. Arbitrary mixed-domain GPU execution,
 GPU rigid bodies, and GPU chemistry remain outside the released backend scope.
 
-## M5 — Molecular and quantum (in progress)
+## M5 — Molecular and quantum ✅
 
 **Spec exit condition:** *"energy/norm tests and visual examples."* Two halves: the
 molecular module of §12.4, whose tests are energy tests, and `quantum2d` of §13.1, whose
-tests are norm tests. The molecular half is done.
+tests are norm tests. Both are done; what each leaves out is listed under it.
 
 ### M5.1 — Classical molecular dynamics ✅
 
@@ -545,7 +545,74 @@ and `lattice run` plots them.
   but over two τ of a 100-atom fluid the energy-shifted error still converges at order
   1.89. The case reports that number rather than the story it was expected to tell.
 
-### Where M5.2 starts
+### M5.2 — `quantum2d` ✅
+
+A new crate, `lattice-domain-quantum2d`, named as §24 names it: one particle's
+wavefunction on a 2D grid, by both of §13.1's methods.
+
+| §13.1 capability | Built | Validated by |
+|---|---|---|
+| Time evolution | split-step Fourier (spectral, periodic) and Crank–Nicolson (five-point, walls); a quadratic complex absorbing layer for either | free packet spreading to 1e-13; tunnelling within 0.09% of the momentum-averaged analytic T; Crank–Nicolson converging to split-step at order 2.02; norm and `⟨H⟩` to the solver tolerance |
+| Eigenstates | imaginary-time propagation of a block with Rayleigh–Ritz | the box's discrete spectrum to 4e-15 and its continuum limit at order 2.00; the 2D oscillator's six lowest levels to 2e-7 ħω |
+| Potential | walls with slits, rectangles, harmonic traps; anything else through `Potential::from_fn` | — |
+| Observables | norm, absorbed probability, position, momentum and energy; detectors integrating the probability current | the double slit's norm plus absorbed probability to 1.5e-14; absorber reflection 1.4e-5 |
+| Visualization | probability density, phase and potential as render channels; the detector's arrival pattern as a curve | the viewer loads, steps and draws the double slit |
+
+The FFT is written here — iterative radix-2, plus Bluestein's chirp-z for any other
+length, because §25.2's grid is 768 wide and refusing the spec's own example for an
+implementation reason would be the wrong trade. In the language: `domain quantum2d`,
+`potential`, `wavepacket` and `detector`, documented in [language.md](language.md).
+§25.2 compiles as written, and [`examples/double_slit.lattice`](../examples/double_slit.lattice)
+is the same scene with numbers that work.
+
+### What M5.2 taught us
+
+- **The spec's own example is wrong, and the compiler can say how.** §25.2's electron
+  has 145 eV; its wall is 20 eV high. It would sail over the barrier rather than pass
+  through the slits. Its step puts 9.4 radians of phase per step on the grid's top mode
+  against a wall's sharp edges. Both are now warnings (`W0308`, `W0310`), and the
+  example that ships uses 5.8 eV and the domain's own step.
+- **Sharp edges set split-step's step, not the physics.** A rectangular barrier came out
+  1.9% too transmissive at a step that resolved every phase the packet itself had. The
+  barrier's edges have Fourier content up to the grid's Nyquist wavenumber, and the
+  splitting commutator lives there. Holding the top mode's phase to 2 radians per step
+  brought it within 0.06%; that is the default now.
+- **A method that is stable in real time can be backwards in imaginary time.**
+  Crank–Nicolson multiplies an eigencomponent by `(1 − x)/(1 + x)`, which tends to −1 as
+  `x` grows: at a useful step the grid's *highest* states decayed slowest, and the first
+  eigenstate search converged onto 43 eV in a box whose ground state is 0.28 eV.
+  Imaginary time is backward Euler, whose factor falls monotonically.
+- **COCG breaks down; the system did not need it.** The Crank–Nicolson matrix is complex
+  symmetric, the textbook case for COCG, and COCG blew up on the 23rd step of a free
+  packet when its unconjugated inner product passed through zero. The matrix is also
+  positive real — every eigenvalue at least 1 from the origin — so restarted BiCGSTAB
+  converges in two to eight iterations and has not failed since.
+- **An absolute tolerance is a unit choice in disguise.** The runtime's sampling test
+  added 1e-12 *seconds* of slack, harmless at the scale of seconds. A femtosecond model
+  found every step due and sampled two thousand times instead of thirty. The slack is
+  half a step now, the rule the duration already used.
+- **Drawing cost as much as stepping.** The phase channel is an `atan2` per cell, and on
+  a 512² grid that took as long as the two FFTs. The channels are now computed when
+  drawn rather than when stepped.
+
+### What M5 leaves out
+
+- **Coulomb with a declared cutoff** — the one §12.4 potential not built. A plain cutoff
+  on `1/r` is a poor approximation the contract would have to say a great deal about;
+  doing it properly is Ewald-shaped work.
+- **Measurement-inspired sampling and the probability current as a picture** — §13.1 and
+  §17.1. The current is computed (the detectors integrate it) but not drawn, and there is
+  no sampling of detection events.
+- **A phase wheel** — §17.1 asks for one. The viewer draws phase with its ordinary
+  colourmaps, which are monotone and therefore wrong for a cyclic quantity; and it does
+  not draw curves yet, so the interference pattern is in `lattice run` and the artifact
+  but not the window.
+- **Speed.** A 512² split step is 12 ms on one core — about 80 steps a second, under
+  §15.6's "interactive/near-interactive" for that size. The row and column transforms
+  are independent and would split across the worker pool without changing a bit; that
+  has not been done, nor a GPU path.
+
+### Where M5.2 started (historical)
 
 - **`quantum2d`** — §13.1: a complex wavefunction on a grid, split-step Fourier where the
   boundaries permit and Crank–Nicolson where they do not, imaginary-time eigenstates,
@@ -586,7 +653,6 @@ Three engine bugs came out of building it, which is the argument for having buil
 
 | Milestone | Result | Blocked on |
 |---|---|---|
-| M5 — Molecular and quantum | LJ MD proper, bonds, `quantum2d` | M2, done |
 | M6 — Extensibility | expression compiler (§8.3), Python API, plugin SDK | M1, done |
 | M7 — Productization | packages, report export, reproducibility artifacts | M3, done |
 | M8 — External solvers | quantum/FMI adapters with provenance | M7 |
