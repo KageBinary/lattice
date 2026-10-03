@@ -42,6 +42,7 @@ mod gpu;
 mod heat;
 mod molecular;
 mod particles;
+mod quantum;
 mod rigid;
 
 use std::time::{Duration, Instant};
@@ -222,6 +223,17 @@ impl Outcome {
     }
 }
 
+/// A measured value for the report: fixed-point where that shows its digits, and
+/// scientific where fixed-point would print a round-off-level residual as `0.000000` —
+/// which reads as "not measured" rather than "measured, and tiny".
+fn format_observed(value: f64) -> String {
+    if value == 0.0 || !value.is_finite() || (1e-3..1e6).contains(&value.abs()) {
+        format!("{value:.6}")
+    } else {
+        format!("{value:.3e}")
+    }
+}
+
 /// One named validation case.
 #[derive(Clone, Copy)]
 pub struct Case {
@@ -248,6 +260,7 @@ pub fn all_cases() -> Vec<Case> {
     let mut cases = Vec::new();
     cases.extend_from_slice(particles::CASES);
     cases.extend_from_slice(molecular::CASES);
+    cases.extend_from_slice(quantum::CASES);
     cases.extend_from_slice(heat::CASES);
     cases.extend_from_slice(rigid::CASES);
     cases.extend_from_slice(chemistry::CASES);
@@ -354,9 +367,9 @@ impl ValidationReport {
             for result in self.results.iter().filter(|r| r.case.level == level) {
                 let mark = if result.passed() { "PASS" } else { "FAIL" };
                 out.push_str(&format!(
-                    "  [{mark}] {:<42} {:>12.6} {:<10} (want {})\n",
+                    "  [{mark}] {:<42} {:>12} {:<10} (want {})\n",
                     result.case.name,
-                    result.outcome.observed,
+                    format_observed(result.outcome.observed),
                     result.outcome.unit,
                     result.outcome.criterion.describe()
                 ));

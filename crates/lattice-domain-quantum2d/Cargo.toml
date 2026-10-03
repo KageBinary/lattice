@@ -1,0 +1,14 @@
+[package]
+name = "lattice-domain-quantum2d"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A single particle's wavefunction on a 2D grid: split-step Fourier and Crank–Nicolson"
+
+[dependencies]
+lattice-ir.workspace = true
+lattice-units.workspace = true
+
+[lints]
+workspace = true

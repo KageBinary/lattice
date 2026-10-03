@@ -24,6 +24,7 @@ lattice-domain-particle = { path = "crates/lattice-domain-particle", version = "
 lattice-domain-grid2d = { path = "crates/lattice-domain-grid2d", version = "0.1.0" }
 lattice-domain-rigid2d = { path = "crates/lattice-domain-rigid2d", version = "0.1.0" }
 lattice-domain-chemistry = { path = "crates/lattice-domain-chemistry", version = "0.1.0" }
+lattice-domain-quantum2d = { path = "crates/lattice-domain-quantum2d", version = "0.1.0" }
 lattice-coupling = { path = "crates/lattice-coupling", version = "0.1.0" }
 lattice-wgpu = { path = "crates/lattice-wgpu", version = "0.1.0" }
 lattice-viewer = { path = "crates/lattice-viewer", version = "0.1.0" }
