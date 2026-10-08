@@ -107,8 +107,9 @@ pub struct QuantumDomain {
     spectral: Mutex<Spectral>,
     density: LazyField,
     phase: LazyField,
+    current: [LazyField; 2],
     potential_field: ScalarField,
-    channel_names: [String; 3],
+    channel_names: [String; 4],
 }
 
 impl QuantumDomain {
@@ -148,6 +149,7 @@ impl QuantumDomain {
             channel_names: [
                 format!("{name}.probability_density"),
                 format!("{name}.phase"),
+                format!("{name}.probability_current"),
                 format!("{name}.potential"),
             ],
             name,
@@ -162,6 +164,7 @@ impl QuantumDomain {
             spectral: Mutex::new(Spectral::new(grid)),
             density: LazyField::default(),
             phase: LazyField::default(),
+            current: [LazyField::default(), LazyField::default()],
             potential_field,
             hamiltonian,
         }
@@ -195,8 +198,19 @@ impl QuantumDomain {
     }
 
     /// Add a screen at `x` metres.
-    pub fn with_detector(mut self, name: impl Into<String>, x: f64) -> Self {
-        let mut detector = Detector::new(name, self.hamiltonian.grid(), x);
+    pub fn with_detector(self, name: impl Into<String>, x: f64) -> Self {
+        let detector = Detector::new(name, self.hamiltonian.grid(), x);
+        self.with_screen(detector)
+    }
+
+    /// Add a screen at `x` metres that also counts `fired` particles' individual
+    /// arrivals, drawn with `seed` — see [`crate::sampling`].
+    pub fn with_clicking_detector(self, name: impl Into<String>, x: f64, fired: u64, seed: u64) -> Self {
+        let detector = Detector::new(name, self.hamiltonian.grid(), x).with_clicks(fired, seed);
+        self.with_screen(detector)
+    }
+
+    fn with_screen(mut self, mut detector: Detector) -> Self {
         detector.reset(&self.hamiltonian, &self.psi);
         self.detectors.push(detector);
         self
@@ -216,6 +230,19 @@ impl QuantumDomain {
     fn refresh_channels(&mut self) {
         self.density.invalidate();
         self.phase.invalidate();
+        for component in &mut self.current {
+            component.invalidate();
+        }
+    }
+
+    /// One component of the probability current, drawn on demand like the others.
+    fn draw_current(&self, axis: usize) -> &ScalarField {
+        let grid = self.hamiltonian.grid();
+        self.current[axis].get(grid, |out| {
+            for j in 0..grid.ny() {
+                self.psi.current_row(&self.hamiltonian, axis, j, out.row_mut(j));
+            }
+        })
     }
 
     /// `|ψ|²` or `arg ψ`, row by row. The fields have no halo, so a row of the field and
@@ -269,6 +296,25 @@ impl QuantumDomain {
     /// How the last Crank–Nicolson solve went.
     pub fn last_solve(&self) -> Option<Solve> {
         self.last_solve
+    }
+
+    /// Approximate bytes of runtime state, for the memory report (§19.3).
+    ///
+    /// Counts the cell-sized arrays: the state; the propagator's phase factors and FFT
+    /// buffer, or Crank–Nicolson's eleven solver vectors; the observation workspace;
+    /// the potential, the absorber's profile, and the three drawable fields.
+    pub fn memory_bytes(&self) -> usize {
+        let cells = self.grid().nx() * self.grid().ny();
+        let complex = size_of::<Complex>();
+        let real = size_of::<f64>();
+        let absorbing = usize::from(self.hamiltonian.absorber().is_some());
+        let propagator = match self.propagator {
+            Propagator::Split(_) => 3 * complex + absorbing * real,
+            Propagator::Crank(_) => 11 * complex,
+        };
+        let observation = 2 * complex;
+        let fields = (1 + absorbing + 3) * real;
+        cells * (complex + propagator + observation + fields)
     }
 
     /// Norm, momentum and energy of the current state.
@@ -431,10 +477,10 @@ impl Domain for QuantumDomain {
 
     fn prepare(&mut self, _ctx: &mut StepContext<'_>) {}
 
-    fn advance(&mut self, dt: f64, _ctx: &mut StepContext<'_>) {
+    fn advance(&mut self, dt: f64, ctx: &mut StepContext<'_>) {
         match &mut self.propagator {
             Propagator::Split(propagator) => {
-                self.absorbed += propagator.step(&self.hamiltonian, &mut self.psi, dt);
+                self.absorbed += propagator.step_with(&self.hamiltonian, &mut self.psi, dt, ctx.executor);
             }
             Propagator::Crank(propagator) => {
                 let (absorbed, solve) = propagator.step(&self.hamiltonian, &mut self.psi, dt);
@@ -483,6 +529,14 @@ impl Domain for QuantumDomain {
         let grid = self.hamiltonian.grid();
         for detector in &self.detectors {
             out.record_metric(format!("{prefix}.{}.arrived", detector.name()), detector.arrived(grid), "1");
+            if let Some(clicks) = detector.clicks() {
+                out.record(
+                    format!("{prefix}.{}.clicks", detector.name()),
+                    clicks.positions().len() as f64,
+                    "1",
+                    ObservationKind::Count,
+                );
+            }
         }
 
         if self.scheme == Scheme::CrankNicolson {
@@ -494,20 +548,37 @@ impl Domain for QuantumDomain {
 
     fn curves(&self) -> Vec<Curve> {
         let grid = self.hamiltonian.grid();
-        self.detectors
-            .iter()
-            .map(|detector| {
-                let (y, density) = detector.pattern(grid);
-                Curve::new(format!("{}.{}", self.name, detector.name()), ("y", "m"), ("arrivals", "1/m"), y, density)
+        let mut curves = Vec::new();
+        for detector in &self.detectors {
+            let (y, density) = detector.pattern(grid);
+            curves.push(
+                Curve::new(format!("{}.{}", self.name, detector.name()), ("y", "m"), ("arrivals", "1/m"), y.clone(), density)
                     .note(format!(
                         "time-integrated probability current through x = {:.4e} m (the cell face nearest \
                          the requested {:.4e} m)",
                         detector.face_x(grid),
                         detector.x()
                     ))
-                    .note(format!("{:.6} of the probability has arrived", detector.arrived(grid)))
-            })
-            .collect()
+                    .note(format!("{:.6} of the probability has arrived", detector.arrived(grid))),
+            );
+            if let Some(clicks) = detector.clicks() {
+                // Counts per row as a density in the same units as the pattern, so the
+                // two share an axis: clicks / (fired · Δy) estimates ∫J⁺ dt.
+                let scale = 1.0 / (clicks.fired().max(1) as f64 * grid.dy());
+                let estimate = clicks.counts(grid).iter().map(|&c| c as f64 * scale).collect();
+                curves.push(
+                    Curve::new(format!("{}.{}.clicks", self.name, detector.name()), ("y", "m"), ("arrivals", "1/m"), y, estimate)
+                        .note(format!(
+                            "{} of {} fired particles detected, drawn with seed {} from the forward current",
+                            clicks.positions().len(),
+                            clicks.fired(),
+                            clicks.seed()
+                        ))
+                        .note("counts per row over fired · Δy: a sample of the forward part of the pattern"),
+                );
+            }
+        }
+        curves
     }
 
     fn render_channels(&self) -> Vec<lattice_ir::RenderChannel<'_>> {
@@ -519,14 +590,22 @@ impl Domain for QuantumDomain {
                 grid,
                 unit: "1/m^2",
             },
-            lattice_ir::RenderChannel::Scalar {
+            lattice_ir::RenderChannel::Phase {
                 name: &self.channel_names[1],
                 field: self.draw(&self.phase, Complex::arg),
+                weight: self.draw(&self.density, Complex::norm_sqr),
                 grid,
-                unit: "rad",
+                weight_unit: "1/m^2",
+            },
+            lattice_ir::RenderChannel::Vector {
+                name: &self.channel_names[2],
+                x: self.draw_current(0),
+                y: self.draw_current(1),
+                grid,
+                unit: "1/(m*s)",
             },
             lattice_ir::RenderChannel::Scalar {
-                name: &self.channel_names[2],
+                name: &self.channel_names[3],
                 field: &self.potential_field,
                 grid,
                 unit: "J",
@@ -591,13 +670,13 @@ mod tests {
     }
 
     #[test]
-    fn render_channels_show_density_phase_and_potential() {
+    fn render_channels_show_density_phase_current_and_potential() {
         let h = Hamiltonian::new(grid(), 1.0, HBAR, Kinetic::FiniteDifference);
         let psi = Wavefunction::gaussian(grid(), [0.0, 0.0], [1.0, 1.0], [1.0, 0.0], HBAR);
         let domain = QuantumDomain::new("q", h).with_state(psi);
         let channels = domain.render_channels();
         let names: Vec<&str> = channels.iter().map(|c| c.name()).collect();
-        assert_eq!(names, ["q.probability_density", "q.phase", "q.potential"]);
+        assert_eq!(names, ["q.probability_density", "q.phase", "q.probability_current", "q.potential"]);
         let lattice_ir::RenderChannel::Scalar { field, .. } = &channels[0] else { panic!() };
         let integral = field.sum_interior() * grid().cell_area();
         assert!((integral - 1.0).abs() < 1e-12);

@@ -30,7 +30,7 @@ use lattice_coupling::{Coupler, CouplingEdge, Mapping, PortRef};
 use crate::{chemistry, molecular, quantum, rigid};
 use lattice_domain_quantum2d::Scheme as QuantumScheme;
 use lattice_domain_particle::{
-    analysis, Angle, Bond, BoundaryBox, HarmonicAngle, HarmonicBond, HarmonicWell, Integrator,
+    analysis, Angle, Bond, BoundaryBox, Coulomb, HarmonicAngle, HarmonicBond, HarmonicWell, Integrator,
     LennardJones, LinearDrag, ParticleBoundary, ParticleDomain, ParticleId, ParticleSpec,
     RdfRequest, SoftRepulsion, Thermostat, UniformAcceleration,
 };
@@ -59,6 +59,43 @@ enum Layout {
     /// Row by row, alternating direction, so consecutive indices are always one
     /// spacing apart — what a bonded chain needs to start unstrained.
     Serpentine,
+}
+
+/// The charges a particle set is given.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+enum Charges {
+    /// None at all.
+    #[default]
+    Neutral,
+    /// Every particle carries this charge, C.
+    Uniform(f64),
+    /// `+q` and `−q` on alternate sites of the placement lattice: a checkerboard, which
+    /// on a square lattice is the 2D rock-salt structure.
+    Alternating(f64),
+}
+
+/// The lattice site of the `index`-th particle placed, as `(column, row)`.
+///
+/// A serpentine fill reverses every other row, so index `i + 1` is always one spacing
+/// from index `i` — including across the row boundary.
+fn placement_site(layout: Layout, per_side: usize, index: usize) -> (usize, usize) {
+    let (column, row) = (index % per_side, index / per_side);
+    match layout {
+        Layout::Serpentine if row % 2 == 1 => (per_side - 1 - column, row),
+        _ => (column, row),
+    }
+}
+
+impl Charges {
+    /// The charge on the site at `column`, `row` of the placement lattice.
+    fn at(self, column: usize, row: usize) -> f64 {
+        match self {
+            Charges::Neutral => 0.0,
+            Charges::Uniform(q) => q,
+            Charges::Alternating(q) if (column + row) % 2 == 0 => q,
+            Charges::Alternating(q) => -q,
+        }
+    }
 }
 
 /// A compiled, runnable project.
@@ -153,6 +190,7 @@ struct ParticlesInfo {
     angles: Vec<AngleSpec>,
     analyses: Vec<RdfRequest>,
     layout: Layout,
+    charges: Charges,
     span: Span,
     solved: bool,
 }
@@ -782,7 +820,7 @@ impl<'a> Compiler<'a> {
             &[
                 "count", "region", "origin", "mass", "radius", "boundary", "spacing", "speed",
                 "temperature", "seed", "force", "skin", "thermostat", "bonds", "angles",
-                "analysis", "layout",
+                "analysis", "layout", "charge",
             ],
         );
 
@@ -955,6 +993,20 @@ impl<'a> Compiler<'a> {
                 Layout::Lattice
             }
         };
+        let charges = decl.setting("charge").map_or(Charges::Neutral, |setting| {
+            let value = &setting.value;
+            match builtins::Call::match_expr(value) {
+                Some(call) if call.name == "alternating" => {
+                    call.reject_unknown(&["charge"], &mut self.diagnostics);
+                    call.require("charge", 0, &mut self.diagnostics)
+                        .and_then(|q| evaluator.require(q, Dimension::CHARGE, "the alternating charge", &mut self.diagnostics))
+                        .map_or(Charges::Neutral, Charges::Alternating)
+                }
+                _ => evaluator
+                    .require(value, Dimension::CHARGE, "`charge`", &mut self.diagnostics)
+                    .map_or(Charges::Neutral, Charges::Uniform),
+            }
+        });
         if bonds.iter().any(|b| b.length.is_none()) && spacing.is_none() {
             let span = decl.settings.iter().find(|s| s.key.text == "bonds").map_or(decl.name.span, |s| s.value.span);
             self.error(
@@ -986,6 +1038,7 @@ impl<'a> Compiler<'a> {
                 angles,
                 analyses,
                 layout,
+                charges,
                 span: decl.name.span,
                 solved: false,
             },
@@ -1987,9 +2040,7 @@ impl<'a> Compiler<'a> {
             .collect();
         let detectors: Vec<_> = project
             .declarations_of("detector")
-            .filter_map(|decl| {
-                quantum::detector(decl, &evaluator, &mut self.diagnostics).map(|(name, x)| (name, x, decl.name.span))
-            })
+            .filter_map(|decl| quantum::detector(decl, &evaluator, &mut self.diagnostics))
             .collect();
         let assembly =
             quantum::Assembly { plan: &plan, potentials: &potentials, packets: &packets, detectors: &detectors };
@@ -2180,8 +2231,12 @@ impl<'a> Compiler<'a> {
                 ForceSpec::SoftRepulsion { stiffness, range } => {
                     domain.with_force(SoftRepulsion::new(stiffness, range))
                 }
+                ForceSpec::Coulomb { cutoff, damping } => {
+                    domain.with_force(Coulomb::damped_shifted_force(cutoff, damping))
+                }
             };
         }
+        self.warn_about_charges(&set);
 
         let ids = self.populate(&set, &mut domain);
         if ids.len() != set.count {
@@ -2280,6 +2335,58 @@ impl<'a> Compiler<'a> {
     /// never asked for. That is a legitimate thing to want and an easy thing to do by
     /// accident — a `chain` over a square lattice jumps a row every `sqrt(count)`
     /// particles — so it is a warning that names the bond, not an error.
+    /// The three ways charges and a Coulomb law fail to make sense together, each of
+    /// which compiles and runs and gives a result nobody asked for.
+    fn warn_about_charges(&mut self, set: &ParticlesInfo) {
+        let coulomb = set.forces.iter().any(|f| matches!(f, ForceSpec::Coulomb { .. }));
+        let core = set
+            .forces
+            .iter()
+            .any(|f| matches!(f, ForceSpec::LennardJones { .. } | ForceSpec::SoftRepulsion { .. }));
+        let per_side = (set.count as f64).sqrt().ceil().max(1.0) as usize;
+        let net: f64 = (0..set.count)
+            .map(|index| {
+                let (column, row) = placement_site(set.layout, per_side, index);
+                set.charges.at(column, row)
+            })
+            .sum();
+        match set.charges {
+            Charges::Neutral if coulomb => self.diagnostics.push(
+                Diagnostic::warning(format!("particle set `{}` has a Coulomb force and no charges", set.name))
+                    .with_code("W0311")
+                    .at(set.span, "every charge is zero")
+                    .help("add `charge: alternating(1 elementary_charge);` or a uniform `charge:`"),
+            ),
+            Charges::Alternating(q) if coulomb && net.abs() > 0.5 * q.abs() => self.diagnostics.push(
+                Diagnostic::warning(format!("particle set `{}` is not neutral", set.name))
+                    .with_code("W0311")
+                    .at(set.span, format!("net charge {net:e} C"))
+                    .note(
+                        "the damped shifted force sum assumes the system is neutral on the scale of its \
+                         cutoff; an odd count on the checkerboard leaves one charge over",
+                    ),
+            ),
+            Charges::Uniform(q) if coulomb && q != 0.0 => self.diagnostics.push(
+                Diagnostic::warning(format!("particle set `{}` carries a net charge", set.name))
+                    .with_code("W0311")
+                    .at(set.span, format!("{} charges of {q:e} C", set.count))
+                    .note(
+                        "the damped shifted force sum assumes the system is neutral on the scale of its \
+                         cutoff; a uniformly charged set is a one-component plasma, whose energy it does \
+                         not give without a neutralizing background",
+                    ),
+            ),
+            Charges::Alternating(_) if coulomb && !core => self.diagnostics.push(
+                Diagnostic::warning(format!("opposite charges in `{}` have nothing keeping them apart", set.name))
+                    .with_code("W0312")
+                    .at(set.span, "Coulomb attraction with no repulsive core")
+                    .note("the attraction grows without limit as two opposite charges approach, so they collapse onto each other")
+                    .help("add a `lennard_jones` or `soft_repulsion` force"),
+            ),
+            _ => {}
+        }
+    }
+
     fn warn_about_strained_bonds(&mut self, set: &ParticlesInfo, domain: &ParticleDomain) {
         let (xs, ys) = (domain.store().pos_x(), domain.store().pos_y());
         let image = domain.bounds().map_or(lattice_domain_particle::MinimumImage::open(), |b| b.image());
@@ -2567,14 +2674,7 @@ impl<'a> Compiler<'a> {
 
         let mut ids = Vec::with_capacity(set.count);
         for (index, velocity) in velocities.iter().enumerate() {
-            let (column, row) = (index % per_side, index / per_side);
-            // A serpentine fill reverses every other row, so index `i + 1` is always
-            // one spacing from index `i` — including across the row boundary.
-            let i = match set.layout {
-                Layout::Lattice => column,
-                Layout::Serpentine if row % 2 == 1 => per_side - 1 - column,
-                Layout::Serpentine => column,
-            };
+            let (i, row) = placement_site(set.layout, per_side, index);
             let position = [
                 set.origin[0] + (i as f64 + 0.5) * spacing,
                 set.origin[1] + (row as f64 + 0.5) * spacing,
@@ -2584,7 +2684,8 @@ impl<'a> Compiler<'a> {
                 ParticleSpec::at(position)
                     .with_velocity(velocity)
                     .with_mass(set.mass)
-                    .with_radius(set.radius),
+                    .with_radius(set.radius)
+                    .with_charge(set.charges.at(i, row)),
             );
             match spawned {
                 Some(id) => ids.push(id),

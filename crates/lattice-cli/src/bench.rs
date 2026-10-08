@@ -18,6 +18,7 @@ use lattice_domain_grid2d::{gaussian, Diffusivity, HeatDomain, TimeScheme};
 use lattice_domain_particle::{
     BoundaryBox, Integrator, LennardJones, ParticleDomain, ParticleSpec, UniformAcceleration,
 };
+use lattice_domain_quantum2d::{Hamiltonian, Kinetic, Potential, QuantumDomain, Shape, Wavefunction};
 use lattice_ir::{Arena, BoundarySet, Domain, Executor, Grid2d, Pcg32, StepContext};
 use lattice_observe::{phase, Json, MemoryReport, Profile, Throughput};
 
@@ -170,6 +171,14 @@ pub fn all() -> &'static [Benchmark] {
                           times the explicit stability limit",
             correctness: "the integral is conserved and every linear solve converged",
             run: bench_heat_implicit,
+        },
+        Benchmark {
+            name: "quantum-split-step",
+            description: "a wave packet through a barrier by split-step Fourier, two \
+                          complex FFTs per step — the §15.6 'quantum wave packet' target",
+            correctness: "probability norm drift below the declared round-off limit, and \
+                          no non-finite amplitude",
+            run: bench_quantum_split_step,
         },
     ]
 }
@@ -432,6 +441,64 @@ fn bench_heat_explicit(scale: usize, executor: &Executor) -> BenchOutcome {
 fn bench_heat_implicit(scale: usize, executor: &Executor) -> BenchOutcome {
     // Ten times the explicit limit, which is the whole reason to pay for a solve.
     run_heat(256 * scale, TimeScheme::CrankNicolson, 100, 10.0, executor)
+}
+
+// ---------------------------------------------------------------------------
+// Quantum benchmark
+// ---------------------------------------------------------------------------
+
+fn bench_quantum_split_step(scale: usize, executor: &Executor) -> BenchOutcome {
+    // §15.6's baseline is a 512² complex grid; scale 2 is that.
+    let side = 256 * scale;
+    let steps = 100;
+
+    let mut profile = Profile::new();
+    let mut domain = profile.time(phase::SETUP, || {
+        // Natural units: ħ = m = 1, on a 40 × 40 periodic box.
+        let grid = Grid2d::with_origin(side, side, [40.0, 40.0], [-20.0, -20.0]);
+        let mut potential = Potential::zero(grid);
+        potential.add(&Shape::Rectangle { x: [2.0, 3.0], y: [-20.0, 20.0], height: 4.0 });
+        let h = Hamiltonian::new(grid, 1.0, 1.0, Kinetic::Spectral).with_potential(potential);
+        let packet = Wavefunction::gaussian(grid, [-5.0, 0.0], [1.5, 1.5], [3.0, 0.0], 1.0);
+        QuantumDomain::new("packet", h).with_state(packet)
+    });
+    let dt = domain.stable_step().preferred;
+
+    let compute_start = Instant::now();
+    {
+        let mut arena = Arena::with_capacity(0);
+        let mut ctx = StepContext::new(&mut arena).with_executor(executor);
+        for _ in 0..steps {
+            domain.advance(dt, &mut ctx);
+        }
+    }
+    let compute = compute_start.elapsed();
+    profile.record(phase::COMPUTE, compute);
+
+    // The contract's own statement: the norm holds to the round-off of two FFTs a
+    // step. Measured, 100 steps of the 512² grid drift by 1e-14; the limit leaves four
+    // orders of magnitude for longer runs and other machines, and is still far below
+    // anything a lost amplitude or an aliasing blow-up would produce.
+    let drift = (domain.state().norm() - 1.0).abs();
+    let non_finite = f64::from(u8::from(domain.state().first_non_finite().is_some()));
+
+    let mut memory = MemoryReport::new();
+    memory.record("wavefunction + propagator + workspace", domain.memory_bytes());
+
+    BenchOutcome {
+        throughput: Throughput {
+            steps: steps as u64,
+            simulated_seconds: dt * steps as f64,
+            wall_clock: compute,
+            elements: (side * side) as u64,
+        },
+        profile,
+        memory,
+        checks: vec![
+            Check::new("probability norm drift", drift, 1e-10),
+            Check::new("cells holding a non-finite amplitude", non_finite, 0.0),
+        ],
+    }
 }
 
 // ---------------------------------------------------------------------------

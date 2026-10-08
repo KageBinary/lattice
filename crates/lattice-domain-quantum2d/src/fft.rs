@@ -22,6 +22,8 @@
 //! unreduced angle is already ~2000 radians and would carry eleven bits of error into
 //! every chirp.
 
+use lattice_ir::{Executor, Grain};
+
 use crate::complex::Complex;
 
 /// A one-dimensional transform plan for a fixed length.
@@ -36,8 +38,13 @@ enum Kind {
     /// Lengths 0 and 1, which are their own transforms.
     Trivial,
     Radix2 {
-        /// `e^{−2πik/n}` for `k < n/2`.
-        twiddles: Vec<Complex>,
+        /// Each stage's twiddles laid end to end: for the stage that combines
+        /// half-length `h`, the `h` values `e^{−2πik/2h}`, starting at offset `h − 1`.
+        /// The same values a single `n/2` table indexed at stride `n/2h` holds — so the
+        /// same bits — read contiguously instead of a cache line per butterfly.
+        forward: Vec<Complex>,
+        /// `forward`, conjugated.
+        inverse: Vec<Complex>,
         /// The bit-reversal permutation.
         reversed: Vec<u32>,
     },
@@ -57,12 +64,20 @@ impl Fft {
         let kind = if n <= 1 {
             Kind::Trivial
         } else if n.is_power_of_two() {
-            let twiddles = (0..n / 2)
+            let twiddles: Vec<Complex> = (0..n / 2)
                 .map(|k| Complex::cis(-core::f64::consts::TAU * k as f64 / n as f64))
                 .collect();
+            let mut forward = Vec::with_capacity(n - 1);
+            let mut half = 1;
+            while half < n {
+                let stride = n / (2 * half);
+                forward.extend((0..half).map(|k| twiddles[k * stride]));
+                half *= 2;
+            }
+            let inverse = forward.iter().map(|w| w.conj()).collect();
             let bits = n.trailing_zeros();
             let reversed = (0..n as u32).map(|i| i.reverse_bits() >> (32 - bits)).collect();
-            Kind::Radix2 { twiddles, reversed }
+            Kind::Radix2 { forward, inverse, reversed }
         } else {
             let m = (2 * n - 1).next_power_of_two();
             let modulus = 2 * n as u64;
@@ -113,7 +128,7 @@ impl Fft {
         assert_eq!(data.len(), self.n, "an FFT plan for {} was handed {} values", self.n, data.len());
         match &self.kind {
             Kind::Trivial => {}
-            Kind::Radix2 { twiddles, reversed } => radix2(data, twiddles, reversed, false),
+            Kind::Radix2 { forward, reversed, .. } => radix2(data, forward, reversed),
             Kind::Bluestein { chirp, kernel, inner } => bluestein(data, chirp, kernel, inner, scratch),
         }
     }
@@ -127,7 +142,7 @@ impl Fft {
         assert_eq!(data.len(), self.n, "an FFT plan for {} was handed {} values", self.n, data.len());
         match &self.kind {
             Kind::Trivial => return,
-            Kind::Radix2 { twiddles, reversed } => radix2(data, twiddles, reversed, true),
+            Kind::Radix2 { inverse, reversed, .. } => radix2(data, inverse, reversed),
             Kind::Bluestein { chirp, kernel, inner } => {
                 // inverse(x) = conj(forward(conj(x))) / n
                 for z in data.iter_mut() {
@@ -146,9 +161,9 @@ impl Fft {
     }
 }
 
-/// The iterative Cooley–Tukey butterfly network. `inverse` conjugates the twiddles and
-/// leaves the scaling to the caller.
-fn radix2(data: &mut [Complex], twiddles: &[Complex], reversed: &[u32], inverse: bool) {
+/// The iterative Cooley–Tukey butterfly network over per-stage twiddle tables — the
+/// conjugated ones for the inverse, which leaves the scaling to the caller.
+fn radix2(data: &mut [Complex], stages: &[Complex], reversed: &[u32]) {
     let n = data.len();
     for (i, &r) in reversed.iter().enumerate() {
         let r = r as usize;
@@ -158,15 +173,14 @@ fn radix2(data: &mut [Complex], twiddles: &[Complex], reversed: &[u32], inverse:
     }
     let mut half = 1;
     while half < n {
-        let stride = n / (2 * half);
-        for start in (0..n).step_by(2 * half) {
-            for k in 0..half {
-                let w = twiddles[k * stride];
-                let w = if inverse { w.conj() } else { w };
-                let a = data[start + k];
-                let b = data[start + k + half] * w;
-                data[start + k] = a + b;
-                data[start + k + half] = a - b;
+        let twiddles = &stages[half - 1..2 * half - 1];
+        for block in data.chunks_exact_mut(2 * half) {
+            let (low, high) = block.split_at_mut(half);
+            for ((a, b), w) in low.iter_mut().zip(high.iter_mut()).zip(twiddles) {
+                let top = *a;
+                let bottom = *b * *w;
+                *a = top + bottom;
+                *b = top - bottom;
             }
         }
         half *= 2;
@@ -193,28 +207,62 @@ fn bluestein(data: &mut [Complex], chirp: &[Complex], kernel: &[Complex], inner:
     }
 }
 
+/// How much transform work is worth a dispatch, in cells.
+///
+/// A row transform is `O(n log n)` flops rather than a stencil's handful per cell, so the
+/// floor sits well below the grid crate's `BAND_GRAIN`. Measured with no floor at all on a
+/// 20-thread laptop: a 32² transform (1k cells) ran a quarter slower split across the
+/// pool, a 64² one (4k cells) 1.5× faster, and 128² 1.6×.
+pub const FFT_GRAIN: Grain = Grain::new(4_096, 512);
+
 /// A two-dimensional transform over a row-major `nx × ny` array.
 ///
-/// Rows are transformed in place; columns are gathered into a contiguous buffer,
-/// transformed and scattered back, which keeps the inner transform cache-friendly at
-/// the cost of one copy per column.
+/// Rows are transformed in place. Columns are transposed into a second buffer, where
+/// they are rows, transformed there, and transposed back — two copies of the array per
+/// transform, the same traffic the column-at-a-time gather it replaced paid, and it
+/// turns the column pass into independent contiguous rows.
+///
+/// # Parallelism
+///
+/// [`Fft2::forward_with`] splits both passes, and both transposes, into bands of rows
+/// across an [`Executor`]. Every row's transform is the same arithmetic on the same
+/// inputs whichever thread runs it and however the rows are banded, and a transpose
+/// is a copy, so the result is bit-for-bit the sequential one (`docs/execution.md`).
+/// There is no reduction anywhere in an FFT to make that promise expensive.
 #[derive(Clone, Debug)]
 pub struct Fft2 {
     nx: usize,
     ny: usize,
     rows: Fft,
     columns: Fft,
-    column: Vec<Complex>,
-    scratch: Vec<Complex>,
+    /// The array column-major, `ny`-long rows one per column, during the column pass.
+    transposed: Vec<Complex>,
+}
+
+thread_local! {
+    /// Bluestein's convolution buffer, one per thread that runs transforms, so a band
+    /// running on a worker needs no allocation once that worker has run one.
+    static SCRATCH: core::cell::RefCell<Vec<Complex>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with at least `len` elements of this thread's scratch.
+fn with_scratch(len: usize, f: impl FnOnce(&mut [Complex])) {
+    if len == 0 {
+        return f(&mut []);
+    }
+    SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < len {
+            scratch.resize(len, Complex::ZERO);
+        }
+        f(&mut scratch[..len]);
+    });
 }
 
 impl Fft2 {
     /// A plan for `nx × ny` arrays.
     pub fn new(nx: usize, ny: usize) -> Self {
-        let rows = Fft::new(nx);
-        let columns = Fft::new(ny);
-        let scratch = vec![Complex::ZERO; rows.scratch_len().max(columns.scratch_len())];
-        Self { nx, ny, rows, columns, column: vec![Complex::ZERO; ny], scratch }
+        Self { nx, ny, rows: Fft::new(nx), columns: Fft::new(ny), transposed: vec![Complex::ZERO; nx * ny] }
     }
 
     /// The array shape, `[nx, ny]`.
@@ -222,48 +270,86 @@ impl Fft2 {
         [self.nx, self.ny]
     }
 
-    /// Forward transform in place.
+    /// Forward transform in place, on the calling thread.
     ///
     /// # Panics
     ///
     /// If `data` is not `nx × ny` long.
     pub fn forward(&mut self, data: &mut [Complex]) {
-        self.transform(data, false);
+        self.transform(data, false, Executor::shared_sequential());
     }
 
-    /// Inverse transform in place, including the `1/(nx·ny)`.
+    /// Inverse transform in place, including the `1/(nx·ny)`, on the calling thread.
     ///
     /// # Panics
     ///
     /// If `data` is not `nx × ny` long.
     pub fn inverse(&mut self, data: &mut [Complex]) {
-        self.transform(data, true);
+        self.transform(data, true, Executor::shared_sequential());
     }
 
-    fn transform(&mut self, data: &mut [Complex], inverse: bool) {
+    /// [`Fft2::forward`], split across `executor`. The same bits either way.
+    pub fn forward_with(&mut self, data: &mut [Complex], executor: &Executor) {
+        self.transform(data, false, executor);
+    }
+
+    /// [`Fft2::inverse`], split across `executor`. The same bits either way.
+    pub fn inverse_with(&mut self, data: &mut [Complex], executor: &Executor) {
+        self.transform(data, true, executor);
+    }
+
+    fn transform(&mut self, data: &mut [Complex], inverse: bool, executor: &Executor) {
         let (nx, ny) = (self.nx, self.ny);
         assert_eq!(data.len(), nx * ny, "a {nx}x{ny} FFT was handed {} values", data.len());
-        for row in data.chunks_exact_mut(nx) {
-            if inverse {
-                self.rows.inverse(row, &mut self.scratch);
-            } else {
-                self.rows.forward(row, &mut self.scratch);
-            }
+        if data.is_empty() {
+            return;
         }
-        for i in 0..nx {
-            for (j, slot) in self.column.iter_mut().enumerate() {
-                *slot = data[j * nx + i];
-            }
-            if inverse {
-                self.columns.inverse(&mut self.column, &mut self.scratch);
-            } else {
-                self.columns.forward(&mut self.column, &mut self.scratch);
-            }
-            for (j, value) in self.column.iter().enumerate() {
-                data[j * nx + i] = *value;
-            }
-        }
+        rows_in_place(&self.rows, data, inverse, executor);
+        transpose(data, nx, &mut self.transposed, executor);
+        rows_in_place(&self.columns, &mut self.transposed, inverse, executor);
+        transpose(&self.transposed, ny, data, executor);
     }
+}
+
+/// Transform every `plan.len()`-long row of `data`, in bands across `executor`.
+fn rows_in_place(plan: &Fft, data: &mut [Complex], inverse: bool, executor: &Executor) {
+    let width = plan.len();
+    executor.for_each_row_band_mut(data, width, FFT_GRAIN.per_row(width), |_, band| {
+        with_scratch(plan.scratch_len(), |scratch| {
+            for row in band.chunks_exact_mut(width) {
+                if inverse {
+                    plan.inverse(row, scratch);
+                } else {
+                    plan.forward(row, scratch);
+                }
+            }
+        });
+    });
+}
+
+/// `out = sourceᵀ`, where `source` is row-major with rows `width` long; `out`'s rows
+/// are therefore `source.len() / width` long. Split by bands of `out`'s rows, each of
+/// which reads a strip of `source`'s columns, and done in square tiles so that both
+/// sides are touched a cache line at a time: measured at 512², 0.64 ms against 1.5 ms
+/// for the untiled loop.
+fn transpose(source: &[Complex], width: usize, out: &mut [Complex], executor: &Executor) {
+    const BLOCK: usize = 16;
+    let height = source.len() / width;
+    executor.for_each_row_band_mut(out, height, FFT_GRAIN.per_row(height), |first, band| {
+        let rows = band.len() / height;
+        for tile_r in (0..rows).step_by(BLOCK) {
+            for tile_j in (0..height).step_by(BLOCK) {
+                let j_end = (tile_j + BLOCK).min(height);
+                for r in tile_r..(tile_r + BLOCK).min(rows) {
+                    let column = first + r;
+                    let target = &mut band[r * height + tile_j..r * height + j_end];
+                    for (j, slot) in (tile_j..j_end).zip(target) {
+                        *slot = source[j * width + column];
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// The angular wavenumbers of an `n`-point transform over length `extent`, in FFT
@@ -366,6 +452,29 @@ mod tests {
         }
         plan.inverse(&mut data);
         assert!(worst(&data, &original) < 1e-13);
+    }
+
+    #[test]
+    fn a_split_transform_has_the_sequential_transforms_bits() {
+        let bits = |data: &[Complex]| data.iter().flat_map(|z| [z.re.to_bits(), z.im.to_bits()]).collect::<Vec<_>>();
+        let pool = Executor::with_threads(4);
+        // Radix-2, and Bluestein both ways with a short final band.
+        for (nx, ny) in [(128, 64), (96, 75)] {
+            assert!(pool.partition(ny, FFT_GRAIN.per_row(nx)).count() > 1, "{nx}x{ny} rows are not split");
+            assert!(pool.partition(nx, FFT_GRAIN.per_row(ny)).count() > 1, "{nx}x{ny} columns are not split");
+            let mut sequential = signal(nx * ny);
+            let mut split = sequential.clone();
+            let (mut a, mut b) = (Fft2::new(nx, ny), Fft2::new(nx, ny));
+            a.forward(&mut sequential);
+            b.forward_with(&mut split, &pool);
+            assert_eq!(bits(&sequential), bits(&split), "{nx}x{ny} forward");
+            a.inverse(&mut sequential);
+            b.inverse_with(&mut split, &pool);
+            assert_eq!(bits(&sequential), bits(&split), "{nx}x{ny} inverse");
+            let original = signal(nx * ny);
+            let scale = original.iter().map(|z| z.abs()).fold(1.0, f64::max);
+            assert!(worst(&sequential, &original) < 1e-12 * scale, "{nx}x{ny} round trip");
+        }
     }
 
     #[test]

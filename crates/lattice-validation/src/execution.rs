@@ -30,6 +30,8 @@
 //! its own that says so.
 
 use lattice_domain_grid2d::{gaussian, Diffusivity, HeatDomain, TimeScheme, BAND_GRAIN};
+use lattice_domain_quantum2d::fft::FFT_GRAIN;
+use lattice_domain_quantum2d::{Absorber, Hamiltonian, Kinetic, Potential, QuantumDomain, Shape, Wavefunction};
 use lattice_domain_particle::{
     HarmonicWell, Integrator, ParticleDomain, UniformAcceleration, PARTICLE_GRAIN,
 };
@@ -59,6 +61,13 @@ pub(crate) static CASES: &[Case] = &[
         level: Level::CrossBackend,
         claim: "per-particle force laws and every integrator give bit-identical trajectories on 1, 2, 3 and 8 threads",
         run: particle_trajectories_match,
+    },
+    Case {
+        name: "quantum_split_step_matches_across_thread_counts",
+        domain: "cpu",
+        level: Level::CrossBackend,
+        claim: "split-step Fourier, transforms and phase factors split across the pool, gives a bit-identical wavefunction and absorbed probability on 1, 2, 3 and 8 threads",
+        run: quantum_split_step_matches,
     },
     Case {
         name: "run_artifacts_hash_identically_across_thread_counts",
@@ -287,6 +296,71 @@ fn particle_trajectories_match() -> Outcome {
     outcome
 }
 
+/// The quantum grid: above [`FFT_GRAIN`]'s floor in both passes, and neither side a
+/// power of two, so the Bluestein path — the one with per-thread scratch — runs in both.
+const QUANTUM_GRID: (usize, usize) = (96, 75);
+
+/// FFT bands at a given thread count, for the row pass and the column pass.
+fn fft_band_counts(threads: usize) -> (usize, usize) {
+    let executor = Executor::with_threads(threads);
+    let (nx, ny) = QUANTUM_GRID;
+    (executor.partition(ny, FFT_GRAIN.per_row(nx)).count(), executor.partition(nx, FFT_GRAIN.per_row(ny)).count())
+}
+
+/// A packet through a barrier into an absorbing layer, so the sequential absorbed sum is
+/// exercised beside the split transforms.
+fn run_quantum(executor: &Executor, steps: usize) -> (Vec<u64>, u64) {
+    let (nx, ny) = QUANTUM_GRID;
+    let grid = Grid2d::with_origin(nx, ny, [24.0, 18.0], [-12.0, -9.0]);
+    let mut potential = Potential::zero(grid);
+    potential.add(&Shape::Rectangle { x: [1.0, 2.0], y: [-9.0, 9.0], height: 2.0 });
+    let h = Hamiltonian::new(grid, 1.0, 1.0, Kinetic::Spectral)
+        .with_potential(potential)
+        .with_absorber(Absorber::for_speed(grid, 3.0, 2.0, 1.0));
+    let psi = Wavefunction::gaussian(grid, [-3.0, 0.5], [1.2, 1.0], [2.0, 0.3], 1.0);
+    let mut domain = QuantumDomain::new("q", h).with_state(psi);
+    let dt = domain.stable_step().preferred;
+    let mut arena = Arena::with_capacity(0);
+    let mut ctx = StepContext::new(&mut arena).with_executor(executor);
+    for _ in 0..steps {
+        domain.advance(dt, &mut ctx);
+    }
+    let bits = domain.state().as_slice().iter().flat_map(|z| [z.re.to_bits(), z.im.to_bits()]).collect();
+    (bits, domain.absorbed().to_bits())
+}
+
+fn quantum_split_step_matches() -> Outcome {
+    let steps = 150;
+    let (reference, reference_absorbed) = run_quantum(Executor::shared_sequential(), steps);
+    let (rows, columns) = fft_band_counts(2);
+    let mut worst = 0usize;
+    let mut notes = vec![format!(
+        "{}x{} grid (Bluestein both ways), split into {rows} row bands and {columns} column bands on 2 threads",
+        QUANTUM_GRID.0, QUANTUM_GRID.1
+    )];
+    for threads in THREAD_COUNTS {
+        let (observed, absorbed) = run_quantum(&Executor::with_threads(threads), steps);
+        let differing = observed.iter().zip(&reference).filter(|(a, b)| a != b).count()
+            + usize::from(absorbed != reference_absorbed);
+        worst = worst.max(differing);
+        notes.push(format!("{threads} threads: {differing} values differ"));
+    }
+    let mut outcome = Outcome::at_most(
+        format!("differing amplitudes, plus the absorbed total, after {steps} steps"),
+        "values",
+        worst as f64,
+        0.0,
+    )
+    .note(format!(
+        "absorbed probability {:.6} — the layer is doing work",
+        f64::from_bits(reference_absorbed)
+    ));
+    for note in notes {
+        outcome = outcome.note(note);
+    }
+    outcome
+}
+
 /// The end-to-end statement: FR-011's hash does not move.
 ///
 /// This is what makes the promise usable rather than merely true. A regression baseline
@@ -360,6 +434,13 @@ mod tests {
                 GRID.0,
                 GRID.1,
                 BAND_GRAIN.per_row(GRID.0).floor
+            );
+            let (rows, columns) = fft_band_counts(threads);
+            assert!(
+                rows > 1 && columns > 1,
+                "the {:?} quantum grid is not split on {threads} threads: {rows} row bands, \
+                 {columns} column bands",
+                QUANTUM_GRID
             );
             assert!(
                 particle_chunk_count(threads) > 1,

@@ -1643,6 +1643,7 @@ dependencies = [
  "lattice-compute",
  "lattice-domain-grid2d",
  "lattice-domain-particle",
+ "lattice-domain-quantum2d",
  "lattice-ir",
  "lattice-observe",
  "lattice-runtime",

@@ -8,6 +8,10 @@
 //!   legend and exact numbers in the panel. Colour alone never carries a value.
 //! - **Particles** become a scatter, drawn with a surface-coloured ring so overlapping
 //!   marks stay countable without a border.
+//! - An **angle** becomes an image on the phase wheel, faded by the magnitude it
+//!   belongs to, with the wheel itself as its legend.
+//! - A **vector field** becomes its magnitude as a sequential image, with arrows on a
+//!   coarse lattice for direction.
 //!
 //! Non-finite cells are painted in the reserved *critical* status colour rather than
 //! being clamped into the ramp. A `NaN` is the single most important thing a field can
@@ -179,11 +183,162 @@ fn field_to_image_inner(
                 }
                 Colormap::Diverging => (value - neutral) / extreme,
             };
-            pixels.push(palette::sample(map, mode, t));
+            pixels.push(palette::sample_fast(map, mode, t));
         }
     }
 
     FieldImage { image: ColorImage::new([nx, ny], pixels), min, max, mean, non_finite }
+}
+
+/// A rendered angle, with what its fading was measured against.
+#[derive(Clone, Debug)]
+pub struct PhaseImage {
+    /// The pixels.
+    pub image: ColorImage,
+    /// The largest weight, which draws at full strength.
+    pub max_weight: f64,
+    /// How many cells held a non-finite angle or weight.
+    pub non_finite: usize,
+}
+
+/// Render an angle on the phase wheel, each cell faded toward `background` by
+/// `√(weight / max weight)`.
+///
+/// The square root because the weight of a wavefunction's phase is `|ψ|²`, and its
+/// root `|ψ|` is the amplitude the phase belongs to: fading by the amplitude keeps the
+/// fringes of a packet's tail visible, where fading by the density would hide all but
+/// its core. Either way, an angle where there is nothing is drawn as nothing.
+pub fn phase_to_image(field: &ScalarField, weight: &ScalarField, background: egui::Color32, palette: &Palette) -> PhaseImage {
+    let (nx, ny) = (field.nx(), field.ny());
+    let mut max_weight = 0.0f64;
+    for j in 0..ny {
+        for &w in weight.row(j) {
+            if w.is_finite() {
+                max_weight = max_weight.max(w);
+            }
+        }
+    }
+    thread_local! {
+        static TABLE: std::cell::RefCell<Option<palette::PhaseTable>> = const { std::cell::RefCell::new(None) };
+    }
+    let critical = palette.status(Status::Critical);
+    let mut non_finite = 0;
+    let mut pixels = Vec::with_capacity(nx * ny);
+    TABLE.with(|cell| {
+        let mut cached = cell.borrow_mut();
+        if cached.as_ref().is_none_or(|table| table.background() != background) {
+            *cached = Some(palette::PhaseTable::new(background));
+        }
+        let table = cached.as_ref().expect("filled above");
+        for row in 0..ny {
+            let j = ny - 1 - row;
+            for (&theta, &w) in field.row(j).iter().zip(weight.row(j)) {
+                if !theta.is_finite() || !w.is_finite() {
+                    non_finite += 1;
+                    pixels.push(critical);
+                    continue;
+                }
+                let strength = if max_weight > 0.0 { (w.max(0.0) / max_weight).sqrt() } else { 0.0 };
+                pixels.push(table.get(theta, strength));
+            }
+        }
+    });
+    PhaseImage { image: ColorImage::new([nx, ny], pixels), max_weight, non_finite }
+}
+
+/// Draw the phase wheel as the legend of an angle: a ring of the wheel's colours with
+/// the four quarter angles marked, so a colour can be read back as a number.
+pub fn phase_wheel_legend(ui: &mut egui::Ui, palette: &Palette) {
+    let size = 64.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(size + 64.0, size + 8.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let centre = Pos2::new(rect.left() + 32.0 + size / 2.0, rect.center().y);
+    let (outer, inner) = (size / 2.0, size / 2.0 - 10.0);
+    let segments = 96;
+    for k in 0..segments {
+        let a0 = core::f64::consts::TAU * k as f64 / segments as f64;
+        let a1 = core::f64::consts::TAU * (k + 1) as f64 / segments as f64;
+        let at = |angle: f64, radius: f32| centre + Vec2::new(angle.cos() as f32, -angle.sin() as f32) * radius;
+        let quad = vec![at(a0, inner), at(a0, outer), at(a1, outer), at(a1, inner)];
+        let colour = palette::phase_wheel(0.5 * (a0 + a1));
+        painter.add(egui::Shape::convex_polygon(quad, colour, Stroke::NONE));
+    }
+    let font = egui::FontId::proportional(11.0);
+    for (angle, label, align) in [
+        (0.0, "0", egui::Align2::LEFT_CENTER),
+        (core::f64::consts::FRAC_PI_2, "π/2", egui::Align2::CENTER_BOTTOM),
+        (core::f64::consts::PI, "±π", egui::Align2::RIGHT_CENTER),
+        (-core::f64::consts::FRAC_PI_2, "−π/2", egui::Align2::CENTER_TOP),
+    ] {
+        let at = centre + Vec2::new(angle.cos() as f32, -angle.sin() as f32) * (outer + 3.0);
+        painter.text(at, align, label, font.clone(), palette.text_muted);
+    }
+}
+
+/// How many arrows the longer side of a vector field gets: few enough that an arrow
+/// at a panel's usual size is long enough to have a readable head.
+const ARROWS_ALONG: usize = 16;
+
+/// Draw a vector field's directions as arrows over `rect`, one per block of cells.
+///
+/// Each arrow is the mean of its block, so a downsampled view cannot miss a strong
+/// cell by landing between samples. Length is proportional to magnitude, with the
+/// largest block's arrow filling its block; blocks under 2% of that are left empty
+/// rather than drawn as a field of dots that all say "nothing". Returns the largest
+/// block magnitude, which is the scale a reader needs to read the lengths.
+pub fn draw_arrows(painter: &egui::Painter, rect: Rect, x: &ScalarField, y: &ScalarField, palette: &Palette) -> f64 {
+    let (nx, ny) = (x.nx(), x.ny());
+    let block = nx.max(ny).div_ceil(ARROWS_ALONG).max(1);
+    let (bx, by) = (nx.div_ceil(block), ny.div_ceil(block));
+    let mut means = Vec::with_capacity(bx * by);
+    let mut largest = 0.0f64;
+    for b in 0..by {
+        for a in 0..bx {
+            let (mut sx, mut sy, mut count) = (0.0, 0.0, 0.0);
+            for j in b * block..((b + 1) * block).min(ny) {
+                for i in a * block..((a + 1) * block).min(nx) {
+                    let (vx, vy) = (x.get(i, j), y.get(i, j));
+                    if vx.is_finite() && vy.is_finite() {
+                        sx += vx;
+                        sy += vy;
+                        count += 1.0;
+                    }
+                }
+            }
+            let mean = if count > 0.0 { [sx / count, sy / count] } else { [0.0, 0.0] };
+            largest = largest.max(mean[0].hypot(mean[1]));
+            means.push(mean);
+        }
+    }
+    if largest <= 0.0 {
+        return 0.0;
+    }
+    let cell = Vec2::new(rect.width() / nx as f32, rect.height() / ny as f32);
+    let reach = (cell * block as f32).min_elem() * 0.9;
+    let stroke = Stroke::new(1.2, palette.text_primary);
+    for b in 0..by {
+        for a in 0..bx {
+            let [vx, vy] = means[b * bx + a];
+            let magnitude = vx.hypot(vy);
+            if magnitude < 0.02 * largest {
+                continue;
+            }
+            // Block centre, with y flipped so increasing y draws upward.
+            let cx = ((a * block) as f32 + 0.5 * (((a + 1) * block).min(nx) - a * block) as f32) * cell.x;
+            let cy = ((b * block) as f32 + 0.5 * (((b + 1) * block).min(ny) - b * block) as f32) * cell.y;
+            let centre = Pos2::new(rect.left() + cx, rect.bottom() - cy);
+            let direction = Vec2::new(vx as f32, -vy as f32) / magnitude as f32;
+            let length = reach * (magnitude / largest) as f32;
+            let tail = centre - direction * (0.5 * length);
+            let tip = centre + direction * (0.5 * length);
+            painter.line_segment([tail, tip], stroke);
+            let head = (0.35 * length).min(6.0);
+            let side = Vec2::new(-direction.y, direction.x);
+            painter.line_segment([tip, tip - direction * head + side * (0.5 * head)], stroke);
+            painter.line_segment([tip, tip - direction * head - side * (0.5 * head)], stroke);
+        }
+    }
+    largest
 }
 
 /// Draw the bonds of a channel as line segments into `rect`, over the particles they

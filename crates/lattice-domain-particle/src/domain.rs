@@ -743,6 +743,12 @@ const fn contract_for(integrator: Integrator, coupling: Coupling) -> SolverContr
              velocity, which is first-order accurate for those terms only",
             "temperature is defined from velocities relative to the centre of mass over 2N-2 \
              degrees of freedom",
+            "charges interact by the three-dimensional Coulomb law k q_i q_j / r confined to \
+             the plane, not by two-dimensional electrostatics, whose potential is logarithmic",
+            "Coulomb interactions are the damped shifted force sum: the real-space Ewald term \
+             erfc(alpha r)/r shifted to zero in energy and force at the cutoff, with no \
+             reciprocal-space part; this assumes the system is locally neutral on the scale of \
+             the cutoff",
         ],
         valid_regime: match (integrator, coupling) {
             (Integrator::ExplicitEuler, _) => {
@@ -825,6 +831,8 @@ const fn contract_for(integrator: Integrator, coupling: Coupling) -> SolverContr
                 "harmonic bond vibration period at the reduced mass",
                 "bonded-chain energy conservation with bonds and angles",
                 "force-shifted Lennard-Jones energy error converges at second order",
+                "damped shifted force Coulomb recovers a 2D rock-salt crystal's Madelung energy",
+                "an ionic melt's energy error converges at second order under Coulomb",
             ],
             Coupling::Langevin => &[
                 "free particles equilibrate to the bath temperature",
@@ -844,6 +852,12 @@ const fn contract_for(integrator: Integrator, coupling: Coupling) -> SolverContr
              methods for molecular sampling. Appl. Math. Res. Express 2013, 34.",
             "Berendsen et al. (1984). Molecular dynamics with coupling to an external bath. \
              J. Chem. Phys. 81, 3684.",
+            "Fennell & Gezelter (2006). Is the Ewald summation still necessary? Pairwise \
+             alternatives to the accepted standard for long-range electrostatics. J. Chem. \
+             Phys. 124, 234104.",
+            "Wolf, Keblinski, Phillpot & Eggebrecht (1999). Exact method for the simulation of \
+             Coulombic systems by spherically truncated, pairwise r^-1 summation. J. Chem. \
+             Phys. 110, 8254.",
         ],
     }
 }

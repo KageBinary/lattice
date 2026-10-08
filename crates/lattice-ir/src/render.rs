@@ -33,6 +33,45 @@ pub enum RenderChannel<'a> {
         /// reader nothing; one labelled "K" tells them whether 400 is alarming.
         unit: &'a str,
     },
+    /// An angle on a grid: a quantity whose two ends are the same value, such as the
+    /// phase of a wavefunction.
+    ///
+    /// A separate variant rather than a [`RenderChannel::Scalar`] in radians, because a
+    /// scalar is drawn on a ramp with two ends, and a ramp says that `−π` and `π` are as
+    /// far apart as two values can be when they are the same angle. A phase drawn that
+    /// way shows a sharp edge wherever it wraps — a boundary the physics does not have.
+    ///
+    /// `weight` is the magnitude the angle belongs to (for a wavefunction, `|ψ|²`). The
+    /// phase of an amplitude that is nearly zero is round-off, and a viewer fades it
+    /// out by this weight rather than painting that noise at full strength.
+    Phase {
+        /// Channel name.
+        name: &'a str,
+        /// The angle per cell, radians in `(−π, π]`.
+        field: &'a ScalarField,
+        /// The magnitude per cell that the angle belongs to; non-negative.
+        weight: &'a ScalarField,
+        /// The geometry both live on.
+        grid: Grid2d,
+        /// The weight's SI unit.
+        weight_unit: &'a str,
+    },
+    /// A vector quantity on a grid: two components per cell centre.
+    ///
+    /// Spec §17.1 lists vector fields — *"arrows, streamlines, glyph sampling"* — and
+    /// P7 names fluxes among what the renderer must show.
+    Vector {
+        /// Channel name.
+        name: &'a str,
+        /// The x component per cell.
+        x: &'a ScalarField,
+        /// The y component per cell.
+        y: &'a ScalarField,
+        /// The geometry they live on.
+        grid: Grid2d,
+        /// The SI unit of each component.
+        unit: &'a str,
+    },
     /// Particle positions.
     Particles {
         /// Channel name.
@@ -137,6 +176,8 @@ impl RenderChannel<'_> {
     pub fn name(&self) -> &str {
         match self {
             RenderChannel::Scalar { name, .. }
+            | RenderChannel::Phase { name, .. }
+            | RenderChannel::Vector { name, .. }
             | RenderChannel::Particles { name, .. }
             | RenderChannel::Bodies { name, .. }
             | RenderChannel::Bonds { name, .. }
@@ -149,6 +190,12 @@ impl RenderChannel<'_> {
         match self {
             RenderChannel::Scalar { field, unit, .. } => {
                 format!("{}x{} scalar field in {unit}", field.nx(), field.ny())
+            }
+            RenderChannel::Phase { field, weight_unit, .. } => {
+                format!("{}x{} phase in rad, weighted by a magnitude in {weight_unit}", field.nx(), field.ny())
+            }
+            RenderChannel::Vector { x, unit, .. } => {
+                format!("{}x{} vector field in {unit}", x.nx(), x.ny())
             }
             RenderChannel::Particles { x, .. } => format!("{} particle positions", x.len()),
             RenderChannel::Bodies { x, is_static, .. } => {
@@ -167,6 +214,10 @@ impl RenderChannel<'_> {
     pub fn has_non_finite(&self) -> bool {
         match self {
             RenderChannel::Scalar { field, .. } => field.first_non_finite().is_some(),
+            RenderChannel::Phase { field, weight, .. } => {
+                field.first_non_finite().is_some() || weight.first_non_finite().is_some()
+            }
+            RenderChannel::Vector { x, y, .. } => x.first_non_finite().is_some() || y.first_non_finite().is_some(),
             RenderChannel::Particles { x, y, .. } | RenderChannel::Bonds { x, y, .. } => {
                 x.iter().chain(y.iter()).any(|v| !v.is_finite())
             }
@@ -279,6 +330,26 @@ mod tests {
         field.set(2, 2, f64::NAN);
         let channel = RenderChannel::Scalar { name: "t", field: &field, grid, unit: "K" };
         assert!(channel.has_non_finite());
+    }
+
+    #[test]
+    fn phase_and_vector_channels_describe_themselves_and_flag_non_finite_values() {
+        let grid = Grid2d::new(8, 4, [1.0, 1.0]);
+        let field = ScalarField::new(&grid, 0);
+        let mut weight = ScalarField::new(&grid, 0);
+        let phase = RenderChannel::Phase { name: "q.phase", field: &field, weight: &weight, grid, weight_unit: "1/m^2" };
+        assert_eq!(phase.name(), "q.phase");
+        assert_eq!(phase.describe(), "8x4 phase in rad, weighted by a magnitude in 1/m^2");
+        assert!(!phase.has_non_finite());
+
+        let vector = RenderChannel::Vector { name: "q.current", x: &field, y: &weight, grid, unit: "1/(m*s)" };
+        assert_eq!(vector.describe(), "8x4 vector field in 1/(m*s)");
+        assert!(!vector.has_non_finite());
+
+        weight.set(3, 2, f64::NAN);
+        let phase = RenderChannel::Phase { name: "q.phase", field: &field, weight: &weight, grid, weight_unit: "1" };
+        let vector = RenderChannel::Vector { name: "q.current", x: &field, y: &weight, grid, unit: "1" };
+        assert!(phase.has_non_finite() && vector.has_non_finite());
     }
 
     #[test]

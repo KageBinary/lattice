@@ -23,6 +23,10 @@
 //!   detector screen at x=4.5 nanometer;
 //! ```
 //!
+//! A detector can also count single arrivals — `detector screen at x=4.5 nanometer,
+//! clicks=4000, seed=7;` fires 4000 particles and records where each one lands, drawn
+//! from the current through the screen (see `lattice_domain_quantum2d::sampling`).
+//!
 //! The grid is centred on the origin unless an `origin:` says otherwise — §25.2 puts
 //! its wall at `x = 0` and its packet at `x = −4 nm` on a 12 nm grid, which only makes
 //! sense centred. Several wave packets superpose; their sum is normalized.
@@ -497,11 +501,41 @@ pub fn wavepacket(decl: &Decl, evaluator: &Evaluator<'_>, diagnostics: &mut Diag
     Some(PacketPlan { name: decl.name.text.clone(), center: center?, momentum: momentum?, sigma: sigma?, span: decl.name.span })
 }
 
-/// Read `detector <name> at x=…;`, returning its name and position.
-pub fn detector(decl: &Decl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnostics) -> Option<(String, f64)> {
+/// A detector as declared.
+#[derive(Clone, Debug)]
+pub struct DetectorPlan {
+    /// Its name.
+    pub name: String,
+    /// Where it was asked to be, m.
+    pub x: f64,
+    /// Particles fired and the seed their arrivals are drawn with, when it counts them.
+    pub clicks: Option<(u64, u64)>,
+    /// The declaration's name, for diagnostics.
+    pub span: Span,
+}
+
+/// Read `detector <name> at x=…[, clicks=…, seed=…];`.
+pub fn detector(decl: &Decl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnostics) -> Option<DetectorPlan> {
+    let mut clicks = None;
     let x = if decl.modifier.as_ref().is_some_and(|m| m.text == "at") {
         let call = Call { name: "at", span: decl.span, arguments: &decl.arguments };
-        call.reject_unknown(&["x"], diagnostics);
+        call.reject_unknown(&["x", "clicks", "seed"], diagnostics);
+        if let Some(fired) = call.named("clicks") {
+            let fired = evaluator.count(fired, "the detector's `clicks`", diagnostics)? as u64;
+            let seed = match call.named("seed") {
+                Some(seed) => evaluator.count(seed, "the detector's `seed`", diagnostics)? as u64,
+                None => 0,
+            };
+            clicks = Some((fired, seed));
+        } else if let Some(seed) = call.named("seed") {
+            diagnostics.push(
+                Diagnostic::error("a detector's `seed` draws its clicks, and it has none")
+                    .with_code("E0204")
+                    .at(seed.span, "nothing to seed")
+                    .help(format!("count arrivals with `detector {} at x=…, clicks=4000, seed=…;`", decl.name.text)),
+            );
+            return None;
+        }
         call.require("x", 0, diagnostics)
             .and_then(|expr| evaluator.require(expr, Dimension::LENGTH, "the detector's `x`", diagnostics))
     } else {
@@ -513,7 +547,7 @@ pub fn detector(decl: &Decl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagno
         );
         None
     };
-    Some((decl.name.text.clone(), x?))
+    Some(DetectorPlan { name: decl.name.text.clone(), x: x?, clicks, span: decl.name.span })
 }
 
 /// Everything a quantum domain is built from.
@@ -526,7 +560,7 @@ pub struct Assembly<'a> {
     /// Its wave packets.
     pub packets: &'a [PacketPlan],
     /// Its detectors.
-    pub detectors: &'a [(String, f64, Span)],
+    pub detectors: &'a [DetectorPlan],
 }
 
 impl Assembly<'_> {
@@ -566,8 +600,11 @@ impl Assembly<'_> {
                 self.energy(packet) / EV
             ));
         }
-        for (name, x, _) in self.detectors {
-            parts.push(format!("detector `{name}` at x = {x:.4e} m"));
+        for DetectorPlan { name, x, clicks, .. } in self.detectors {
+            parts.push(match clicks {
+                Some((fired, seed)) => format!("detector `{name}` at x = {x:.4e} m counting {fired} arrivals (seed {seed})"),
+                None => format!("detector `{name}` at x = {x:.4e} m"),
+            });
         }
         parts.join("; ")
     }
@@ -643,7 +680,7 @@ impl Assembly<'_> {
         }
         let first = grid.cell_center(0, 0)[0];
         let last = grid.cell_center(grid.nx() - 1, 0)[0];
-        for (name, x, span) in self.detectors {
+        for DetectorPlan { name, x, clicks, span } in self.detectors {
             if !(first..=last).contains(x) {
                 diagnostics.push(
                     Diagnostic::error(format!("detector `{name}` is off the grid"))
@@ -653,7 +690,10 @@ impl Assembly<'_> {
                 );
                 return None;
             }
-            domain = domain.with_detector(name.clone(), *x);
+            domain = match clicks {
+                Some((fired, seed)) => domain.with_clicking_detector(name.clone(), *x, *fired, *seed),
+                None => domain.with_detector(name.clone(), *x),
+            };
         }
         Some(domain)
     }

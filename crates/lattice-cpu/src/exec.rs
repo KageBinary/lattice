@@ -252,9 +252,10 @@ impl Executor {
     /// If `stride` is zero, or `rows.len()` is not a multiple of `stride`. Both mean
     /// the caller has mis-described the buffer, and a silently truncated last row is a
     /// far worse outcome than a message.
-    pub fn for_each_row_band_mut<F>(&self, rows: &mut [f64], stride: usize, grain: Grain, f: F)
+    pub fn for_each_row_band_mut<T, F>(&self, rows: &mut [T], stride: usize, grain: Grain, f: F)
     where
-        F: Fn(usize, &mut [f64]) + Sync,
+        T: Send,
+        F: Fn(usize, &mut [T]) + Sync,
     {
         assert!(stride > 0, "a row band needs a positive stride");
         assert_eq!(rows.len() % stride, 0, "the row span must hold whole rows");

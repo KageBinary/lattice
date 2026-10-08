@@ -56,6 +56,8 @@ pub struct ParticleStore {
     /// integrator divides by mass on every particle on every step.
     inv_mass: Vec<f64>,
     radius: Vec<f64>,
+    /// Electric charge, C. Zero unless a model gives one.
+    charge: Vec<f64>,
     kind: Vec<ParticleKind>,
 
     // --- Identity -------------------------------------------------------------
@@ -87,6 +89,7 @@ impl ParticleStore {
             mass: vec![0.0; capacity],
             inv_mass: vec![0.0; capacity],
             radius: vec![0.0; capacity],
+            charge: vec![0.0; capacity],
             kind: vec![ParticleKind::from_index(0); capacity],
             entries: Vec::with_capacity(capacity),
             stable_of_slot: vec![0; capacity],
@@ -114,7 +117,7 @@ impl ParticleStore {
     }
 
     /// Bytes of hot state held per particle, for the memory report (§19.3).
-    pub const BYTES_PER_PARTICLE: usize = 9 * core::mem::size_of::<f64>()
+    pub const BYTES_PER_PARTICLE: usize = 10 * core::mem::size_of::<f64>()
         + core::mem::size_of::<ParticleKind>()
         + 2 * core::mem::size_of::<u32>();
 
@@ -149,6 +152,7 @@ impl ParticleStore {
         self.mass[s] = spec.mass;
         self.inv_mass[s] = if spec.mass.is_finite() && spec.mass > 0.0 { 1.0 / spec.mass } else { 0.0 };
         self.radius[s] = spec.radius;
+        self.charge[s] = spec.charge;
         self.kind[s] = spec.kind;
         self.stable_of_slot[s] = index;
         self.len += 1;
@@ -211,6 +215,7 @@ impl ParticleStore {
             &mut self.mass,
             &mut self.inv_mass,
             &mut self.radius,
+            &mut self.charge,
         ] {
             array[dst] = array[src];
         }
@@ -244,6 +249,7 @@ impl ParticleStore {
             &mut self.mass,
             &mut self.inv_mass,
             &mut self.radius,
+            &mut self.charge,
         ] {
             for (k, &from) in new_order.iter().enumerate() {
                 scratch[k] = array[from as usize];
@@ -309,6 +315,10 @@ impl ParticleStore {
     pub fn radius(&self) -> &[f64] {
         &self.radius[..self.len]
     }
+    /// Live charges, C.
+    pub fn charge(&self) -> &[f64] {
+        &self.charge[..self.len]
+    }
     /// Live particle kinds.
     pub fn kind(&self) -> &[ParticleKind] {
         &self.kind[..self.len]
@@ -365,6 +375,7 @@ impl ParticleStore {
             force_y: &mut self.force_y[..n],
             mass: &self.mass[..n],
             radius: &self.radius[..n],
+            charge: &self.charge[..n],
             kind: &self.kind[..n],
         }
     }
@@ -397,6 +408,8 @@ pub struct ParticleSpec {
     pub mass: f64,
     /// Collision radius in metres. Zero for point particles.
     pub radius: f64,
+    /// Electric charge in coulombs. Zero for a neutral particle.
+    pub charge: f64,
     /// Selects material parameters.
     pub kind: ParticleKind,
 }
@@ -408,6 +421,7 @@ impl Default for ParticleSpec {
             velocity: [0.0, 0.0],
             mass: 1.0,
             radius: 0.0,
+            charge: 0.0,
             kind: ParticleKind::from_index(0),
         }
     }
@@ -434,6 +448,12 @@ impl ParticleSpec {
     /// Set the collision radius.
     pub fn with_radius(mut self, radius: f64) -> Self {
         self.radius = radius;
+        self
+    }
+
+    /// Set the electric charge, C.
+    pub fn with_charge(mut self, charge: f64) -> Self {
+        self.charge = charge;
         self
     }
 
@@ -496,6 +516,8 @@ pub struct ForceAccumulation<'a> {
     pub mass: &'a [f64],
     /// Collision radii, m.
     pub radius: &'a [f64],
+    /// Charges, C.
+    pub charge: &'a [f64],
     /// Particle kinds.
     pub kind: &'a [crate::ids::ParticleKind],
 }
@@ -548,6 +570,22 @@ mod tests {
         assert_eq!(s.velocity_of(id), Some([3.0, 4.0]));
         assert_eq!(s.mass()[0], 2.0);
         assert_eq!(s.inv_mass()[0], 0.5);
+    }
+
+    #[test]
+    fn a_charge_travels_with_its_particle() {
+        let mut s = ParticleStore::with_capacity(4);
+        let a = s.spawn(ParticleSpec::at([0.0, 0.0]).with_charge(1.0)).unwrap();
+        let b = s.spawn(ParticleSpec::at([1.0, 0.0]).with_charge(-2.0)).unwrap();
+        let c = s.spawn(ParticleSpec::at([2.0, 0.0]).with_charge(3.0)).unwrap();
+        assert!(s.despawn(a));
+        // `c` was swapped into slot 0.
+        assert_eq!(s.slot_of(c), Some(0));
+        assert_eq!(s.charge(), &[3.0, -2.0]);
+        s.reorder(&[1, 0]);
+        assert_eq!(s.slot_of(b), Some(0));
+        assert_eq!(s.charge(), &[-2.0, 3.0]);
+        assert_eq!(s.force_accumulation().charge, &[-2.0, 3.0]);
     }
 
     #[test]

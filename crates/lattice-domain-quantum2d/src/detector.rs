@@ -25,10 +25,14 @@
 //! leaves the cells behind it agree to the solver's tolerance. Under split-step it is a
 //! second-order approximation to the spectral current. Time integration is by the
 //! trapezoid rule over each step.
+//!
+//! A screen can also count individual arrivals — [`Detector::with_clicks`] — drawn from
+//! the same flux; see [`crate::sampling`].
 
 use lattice_ir::Grid2d;
 
 use crate::hamiltonian::Hamiltonian;
+use crate::sampling::Clicks;
 use crate::wavefunction::Wavefunction;
 
 /// A screen parallel to the y axis.
@@ -44,6 +48,8 @@ pub struct Detector {
     last: Vec<f64>,
     /// Scratch for the current flux.
     current: Vec<f64>,
+    /// Individual arrivals, when the screen counts them.
+    clicks: Option<Clicks>,
 }
 
 impl Detector {
@@ -68,7 +74,19 @@ impl Detector {
             integrated: vec![0.0; rows],
             last: vec![0.0; rows],
             current: vec![0.0; rows],
+            clicks: None,
         }
+    }
+
+    /// Also count individual arrivals: `fired` particles, drawn with `seed`.
+    pub fn with_clicks(mut self, fired: u64, seed: u64) -> Self {
+        self.clicks = Some(Clicks::new(fired, seed, self.integrated.len()));
+        self
+    }
+
+    /// The arrivals counted so far, if the screen counts them.
+    pub fn clicks(&self) -> Option<&Clicks> {
+        self.clicks.as_ref()
     }
 
     /// The detector's name.
@@ -102,11 +120,19 @@ impl Detector {
         self.flux(h, psi);
         self.last.copy_from_slice(&self.current);
         self.integrated.fill(0.0);
+        if let Some(clicks) = &mut self.clicks {
+            clicks.reset();
+        }
     }
 
     /// Accumulate one step of `dt` seconds ending at `psi`.
     pub fn record(&mut self, h: &Hamiltonian, psi: &Wavefunction, dt: f64) {
         self.flux(h, psi);
+        if let Some(clicks) = &mut self.clicks {
+            let grid = h.grid();
+            let crossed = self.last.iter().zip(&self.current).map(|(last, now)| 0.5 * (*last + *now) * dt * grid.dy());
+            clicks.record(grid, crossed);
+        }
         for ((total, last), now) in self.integrated.iter_mut().zip(&mut self.last).zip(&self.current) {
             *total += 0.5 * (*last + *now) * dt;
             *last = *now;

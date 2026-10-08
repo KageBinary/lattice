@@ -436,6 +436,91 @@ project double_slit {
         assert!(report.contains("2 slits") && report.contains("detector `screen`"), "{report}");
     }
 
+    /// A rock-salt set, with `{charge}` and `{forces}` filled in by each test.
+    fn salt(charge: &str, forces: &str) -> String {
+        format!(
+            r#"
+project salt {{
+  duration: 1 picosecond;
+  particles ions {{
+    count: 16; region: [1.12 nanometer, 1.12 nanometer]; spacing: 2.8 angstrom;
+    mass: 29 dalton; boundary: periodic; {charge}
+    {forces}
+  }}
+  solve dynamics(ions) with velocity_verlet(dt=1 femtosecond);
+}}
+"#
+        )
+    }
+
+    const CORE: &str = "force: lennard_jones(epsilon=0.5 electronvolt, sigma=2.5 angstrom, cutoff=5 angstrom);";
+
+    #[test]
+    fn charges_and_coulomb_compile_into_the_domain() {
+        let source = salt(
+            "charge: alternating(1 elementary_charge);",
+            &format!("{CORE} force: coulomb(cutoff=5.5 angstrom);"),
+        );
+        let (compiled, diagnostics, file) = build(&source);
+        assert!(diagnostics.is_empty(), "{}", diagnostics.render(&file));
+        let report = compiled.unwrap().model.report();
+        // The default damping is alpha R = 2.4.
+        assert!(report.contains("Coulomb (damped shifted force) cutoff = 5.5000e-10 m, alpha = 4.3636e9 1/m"), "{report}");
+    }
+
+    #[test]
+    fn coulomb_without_charges_or_with_a_net_charge_or_no_core_warns() {
+        for (charge, forces, code, words) in [
+            ("", format!("{CORE} force: coulomb(cutoff=5 angstrom);"), "W0311", "no charges"),
+            ("charge: 1 elementary_charge;", format!("{CORE} force: coulomb(cutoff=5 angstrom);"), "W0311", "net charge"),
+            ("charge: alternating(1 elementary_charge);", "force: coulomb(cutoff=5 angstrom);".to_string(), "W0312", "nothing keeping them apart"),
+        ] {
+            let source = salt(charge, &forces);
+            let (_, diagnostics, file) = build(&source);
+            let text = diagnostics.render(&file);
+            assert!(!diagnostics.has_errors(), "{text}");
+            assert!(diagnostics.codes().contains(&code), "{charge} / {forces}: {text}");
+            assert!(text.contains(words), "{charge} / {forces}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_coulomb_damping_must_be_an_inverse_length() {
+        let source = salt(
+            "charge: alternating(1 elementary_charge);",
+            &format!("{CORE} force: coulomb(cutoff=5 angstrom, damping=2 angstrom);"),
+        );
+        let (_, diagnostics, file) = build(&source);
+        assert!(diagnostics.has_errors(), "{}", diagnostics.render(&file));
+        assert!(diagnostics.render(&file).contains("Coulomb damping"), "{}", diagnostics.render(&file));
+    }
+
+    #[test]
+    fn a_detector_can_count_clicks_and_says_so() {
+        let source = SPEC_DOUBLE_SLIT.replace(
+            "detector screen at x=4.5 nanometer;",
+            "detector screen at x=4.5 nanometer, clicks=2500, seed=9;",
+        );
+        let file = SourceFile::new("clicks.lattice", source);
+        let (compiled, diagnostics) = compile_source(&file);
+        assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+        let report = compiled.unwrap().model.report();
+        assert!(report.contains("counting 2500 arrivals (seed 9)"), "{report}");
+
+        for (written, code, words) in [
+            ("detector screen at x=4.5 nanometer, seed=9;", "E0204", "has none"),
+            ("detector screen at x=4.5 nanometer, clicks=2.5;", "E0404", "whole number"),
+            ("detector screen at x=4.5 nanometer, click=10;", "E0204", "no argument called `click`"),
+        ] {
+            let source = SPEC_DOUBLE_SLIT.replace("detector screen at x=4.5 nanometer;", written);
+            let file = SourceFile::new("clicks.lattice", source);
+            let (_, diagnostics) = compile_source(&file);
+            let text = diagnostics.render(&file);
+            assert!(diagnostics.codes().contains(&code), "{written}: {text}");
+            assert!(text.contains(words), "{written}: {text}");
+        }
+    }
+
     #[test]
     fn quantum_declarations_without_a_domain_are_rejected() {
         let (text, codes) = err("project p { wavepacket w { center: [0, 0]; sigma: 1 nanometer; } }");

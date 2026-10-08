@@ -527,10 +527,22 @@ pub enum ForceSpec {
         /// Range, m.
         range: f64,
     },
+    /// Coulomb's law by the damped shifted force sum.
+    Coulomb {
+        /// Cutoff, m.
+        cutoff: f64,
+        /// Damping α, 1/m.
+        damping: f64,
+    },
 }
 
+/// The damping a `coulomb` force takes when none is written: `α R = 2.4`, Fennell and
+/// Gezelter's recommendation (0.2 Å⁻¹ at a 12 Å cutoff), which leaves the real-space
+/// truncation near `erfc(2.4) ≈ 7e-4` of a pair's energy.
+pub const COULOMB_DAMPING_TIMES_CUTOFF: f64 = 2.4;
+
 /// Every force name.
-const FORCES: &[&str] = &["gravity", "drag", "harmonic_well", "lennard_jones", "soft_repulsion"];
+const FORCES: &[&str] = &["gravity", "drag", "harmonic_well", "lennard_jones", "soft_repulsion", "coulomb"];
 
 impl ForceSpec {
     /// A one-line description for the model report.
@@ -552,6 +564,9 @@ impl ForceSpec {
             ForceSpec::SoftRepulsion { stiffness, range } => {
                 format!("soft repulsion k = {stiffness:.4e} N/m inside {range:.4e} m")
             }
+            ForceSpec::Coulomb { cutoff, damping } => {
+                format!("Coulomb (damped shifted force) cutoff = {cutoff:.4e} m, alpha = {damping:.4e} 1/m")
+            }
         }
     }
 
@@ -565,6 +580,7 @@ impl ForceSpec {
         match self {
             ForceSpec::LennardJones { cutoff, .. } => Some(*cutoff),
             ForceSpec::SoftRepulsion { range, .. } => Some(*range),
+            ForceSpec::Coulomb { cutoff, .. } => Some(*cutoff),
             _ => None,
         }
     }
@@ -709,6 +725,26 @@ pub fn force(
                 return None;
             }
             Some(ForceSpec::SoftRepulsion { stiffness, range })
+        }
+
+        "coulomb" => {
+            call.reject_unknown(&["cutoff", "damping"], diagnostics);
+            let cutoff = call.require("cutoff", 0, diagnostics)?;
+            let cutoff = evaluator.require(cutoff, Dimension::LENGTH, "the Coulomb cutoff", diagnostics)?;
+            let inverse_length = Dimension::from_exponents([-1, 0, 0, 0, 0, 0, 0]);
+            let damping = match call.get("damping", 1) {
+                Some(argument) => evaluator.require(argument, inverse_length, "the Coulomb damping", diagnostics)?,
+                None => COULOMB_DAMPING_TIMES_CUTOFF / cutoff,
+            };
+            if cutoff <= 0.0 || !cutoff.is_finite() || damping < 0.0 || !damping.is_finite() {
+                diagnostics.push(
+                    Diagnostic::error("Coulomb needs a positive cutoff and a damping of at least zero")
+                        .with_code("E0405")
+                        .at(call.span, format!("cutoff = {cutoff}, damping = {damping}")),
+                );
+                return None;
+            }
+            Some(ForceSpec::Coulomb { cutoff, damping })
         }
 
         other => {

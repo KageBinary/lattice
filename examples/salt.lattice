@@ -1,0 +1,55 @@
+// A hot two-dimensional salt crystal: ions of charge ±e on a rock-salt lattice, held
+// apart by a Lennard-Jones core and bound by Coulomb's law.
+//
+// 400 ions start on the 2D rock-salt checkerboard at NaCl's 2.8 Å nearest-neighbour
+// spacing. Coulomb is the damped shifted force sum (spec §12.4's "Coulomb with
+// declared cutoff/approximation"): the real-space Ewald term erfc(αr)/r, shifted to
+// zero in energy and force at the cutoff. With αR ≈ 2.5 a pair's truncated tail is
+// below a part in a thousand of its energy, and because nothing jumps at the cutoff
+// the run is microcanonical: the total energy holds to about 1e-5 of itself.
+//
+// The ions start at 1500 K and about half of that kinetic energy flows into the
+// lattice's potential energy within a few vibrations, as equipartition says it must;
+// the crystal then rattles near 750 K without melting. The radial distribution shows
+// the lattice through the noise: shells at 2.7, 3.9, 5.5 and 6.2 Å, the 1 : √2 : 2 : √5
+// of a square lattice, with opposite charges in the first and like charges in the
+// second.
+//
+// The charges are point charges in a plane interacting by the 3D law k q²/r — ions on
+// a surface — not 2D electrostatics; the solver contract says so. A set has one mass,
+// so both species take the mean of sodium's and chlorine's.
+//
+//   lattice run examples/salt.lattice
+
+project salt {
+  dimensions: 2;
+  fidelity: molecular;
+  duration: 1 picosecond;
+
+  particles ions {
+    count:   400;
+    region:  [5.6 nanometer, 5.6 nanometer];
+    spacing: 2.8 angstrom;
+    mass:    29.2 dalton;
+
+    // +e and -e on alternate lattice sites: the 2D rock-salt structure, neutral.
+    charge: alternating(1 elementary_charge);
+
+    temperature: 1500 kelvin;
+    seed:        7;
+    boundary:    periodic;
+
+    // The repulsive core that stops opposite charges collapsing onto each other.
+    force: lennard_jones(epsilon=0.5 electronvolt, sigma=2.5 angstrom,
+                         cutoff=6 angstrom, truncation=force_shift);
+    // alpha R = 1.4/nm x 1.8 nm = 2.5.
+    force: coulomb(cutoff=1.8 nanometer, damping=1.4 / nanometer);
+
+    skin:     1 angstrom;
+    analysis: rdf(bins=90, range=1.2 nanometer, every=10, after=200);
+  }
+
+  solve dynamics(ions) with velocity_verlet(dt=1 femtosecond);
+
+  observe ions every 50 femtosecond;
+}

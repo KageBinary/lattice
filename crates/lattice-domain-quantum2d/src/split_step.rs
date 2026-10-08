@@ -18,6 +18,8 @@
 //! The same factors with `Δt → −iΔτ` give imaginary-time propagation, `e^{−HΔτ/ħ}`,
 //! which damps every state relative to the ground state; see [`crate::eigen`].
 
+use lattice_ir::{Executor, Grain};
+
 use crate::complex::Complex;
 use crate::fft::Fft2;
 use crate::hamiltonian::{Hamiltonian, Kinetic};
@@ -90,31 +92,29 @@ impl SplitStep {
 
     /// Advance `psi` by `dt` seconds, returning the probability the absorber removed.
     pub fn step(&mut self, h: &Hamiltonian, psi: &mut Wavefunction, dt: f64) -> f64 {
+        self.step_with(h, psi, dt, Executor::shared_sequential())
+    }
+
+    /// [`SplitStep::step`] split across `executor`, with the same bits.
+    ///
+    /// The transforms and the phase multiplies are split; both are exact under any
+    /// partition. The absorbed total is a sum, which `docs/execution.md` keeps on the
+    /// calling thread so that its bits do not depend on the machine.
+    pub fn step_with(&mut self, h: &Hamiltonian, psi: &mut Wavefunction, dt: f64, executor: &Executor) -> f64 {
         self.prepare(h, dt, false);
         let area = h.grid().cell_area();
-        let mut absorbed = self.potential_half(psi);
-        self.fft.forward(psi.as_mut_slice());
-        for (z, f) in psi.as_mut_slice().iter_mut().zip(&self.kinetic) {
-            *z *= *f;
-        }
-        self.fft.inverse(psi.as_mut_slice());
-        absorbed += self.potential_half(psi);
+        let mut absorbed = self.potential_half(psi, executor);
+        self.fft.forward_with(psi.as_mut_slice(), executor);
+        multiply(psi.as_mut_slice(), &self.kinetic, executor);
+        self.fft.inverse_with(psi.as_mut_slice(), executor);
+        absorbed += self.potential_half(psi, executor);
         absorbed * area
     }
 
     /// One half-step of the potential, returning `Σ|ψ|²·loss` before it is applied.
-    fn potential_half(&self, psi: &mut Wavefunction) -> f64 {
-        let mut removed = 0.0;
-        if self.loss.is_empty() {
-            for (z, f) in psi.as_mut_slice().iter_mut().zip(&self.half) {
-                *z *= *f;
-            }
-        } else {
-            for ((z, f), loss) in psi.as_mut_slice().iter_mut().zip(&self.half).zip(&self.loss) {
-                removed += z.norm_sqr() * loss;
-                *z *= *f;
-            }
-        }
+    fn potential_half(&self, psi: &mut Wavefunction, executor: &Executor) -> f64 {
+        let removed = psi.as_slice().iter().zip(&self.loss).fold(0.0, |sum, (z, loss)| sum + z.norm_sqr() * loss);
+        multiply(psi.as_mut_slice(), &self.half, executor);
         removed
     }
 
@@ -134,6 +134,19 @@ impl SplitStep {
             *z *= *f;
         }
     }
+}
+
+/// How many cells of `z *= f` are worth a dispatch. A complex multiply is a particle
+/// update's order of work, and the floor is the particle integrator's.
+const PHASE_GRAIN: Grain = Grain::new(65_536, 8_192);
+
+/// `psi[k] *= factors[k]`, in chunks across `executor`.
+fn multiply(psi: &mut [Complex], factors: &[Complex], executor: &Executor) {
+    executor.for_each_chunk_mut(psi, PHASE_GRAIN, |offset, chunk| {
+        for (z, f) in chunk.iter_mut().zip(&factors[offset..]) {
+            *z *= *f;
+        }
+    });
 }
 
 #[cfg(test)]

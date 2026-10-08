@@ -9,6 +9,7 @@
 use lattice_ir::Grid2d;
 
 use crate::complex::Complex;
+use crate::hamiltonian::{Hamiltonian, Kinetic};
 
 /// A wavefunction on a grid.
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +149,50 @@ impl Wavefunction {
         total * self.grid.cell_area()
     }
 
+    /// The probability current `J = (ħ/m) Im(ψ* ∇ψ)` at every cell centre, as
+    /// row-major `[J_x, J_y]`, 1/(m·s).
+    ///
+    /// The gradient is the central difference, so at a cell the current is the mean of
+    /// the two face currents `(ħ/mΔ) Im(ψᵢ* ψᵢ₊₁)` either side of it — the current that
+    /// satisfies the five-point Hamiltonian's discrete continuity equation, which is
+    /// what the detectors integrate. The edges follow `h`: periodic for the spectral
+    /// operator, and the antisymmetric ghost `ψ = 0` walls for the finite-difference
+    /// one, which carry no current through them.
+    pub fn probability_current(&self, h: &Hamiltonian) -> [Vec<f64>; 2] {
+        let (nx, ny) = (self.grid.nx(), self.grid.ny());
+        let mut current = [vec![0.0; nx * ny], vec![0.0; nx * ny]];
+        for (axis, out) in current.iter_mut().enumerate() {
+            for (j, row) in out.chunks_exact_mut(nx).enumerate() {
+                self.current_row(h, axis, j, row);
+            }
+        }
+        current
+    }
+
+    /// One row of one component of [`Wavefunction::probability_current`].
+    pub(crate) fn current_row(&self, h: &Hamiltonian, axis: usize, j: usize, out: &mut [f64]) {
+        let (nx, ny) = (self.grid.nx(), self.grid.ny());
+        let periodic = h.kinetic() == Kinetic::Spectral;
+        let (cells, spacing) = if axis == 0 { (nx, self.grid.dx()) } else { (ny, self.grid.dy()) };
+        let scale = h.hbar() / (2.0 * h.mass() * spacing);
+        for (i, slot) in out.iter_mut().enumerate() {
+            let at = |n: usize| if axis == 0 { self.psi[j * nx + n] } else { self.psi[n * nx + i] };
+            let n = if axis == 0 { i } else { j };
+            let centre = at(n);
+            let before = match n {
+                0 if periodic => at(cells - 1),
+                0 => -centre,
+                _ => at(n - 1),
+            };
+            let after = match n + 1 {
+                m if m < cells => at(m),
+                _ if periodic => at(0),
+                _ => -centre,
+            };
+            *slot = scale * (centre.conj() * (after - before)).im;
+        }
+    }
+
     /// The first cell whose amplitude is not finite.
     pub fn first_non_finite(&self) -> Option<(usize, usize)> {
         let nx = self.grid.nx();
@@ -196,6 +241,26 @@ mod tests {
         assert!(a.inner(&b).abs() > 0.1);
         b.project_out(&a);
         assert!(a.inner(&b).abs() < 1e-14);
+    }
+
+    #[test]
+    fn a_plane_wave_carries_the_lattice_current_and_walls_carry_none() {
+        let grid = Grid2d::new(32, 8, [1.0, 0.5]);
+        let (mass, k) = (2.0, core::f64::consts::TAU * 3.0);
+        let psi = Wavefunction::from_fn(grid, |[x, _]| Complex::cis(k * x));
+        let h = Hamiltonian::new(grid, mass, HBAR, Kinetic::Spectral);
+        let [jx, jy] = psi.probability_current(&h);
+        // |ψ|² = 1, and the central difference of e^{ikx} gives (ħ/m)·sin(kΔx)/Δx.
+        let expected = HBAR / mass * (k * grid.dx()).sin() / grid.dx();
+        assert!(jx.iter().all(|j| (j - expected).abs() < 1e-12), "{} vs {expected}", jx[0]);
+        assert!(jy.iter().all(|j| j.abs() < 1e-12));
+
+        // In a box, the outermost cells see the wall's ghost and carry only half the
+        // current — none of it through the wall itself.
+        let boxed = Hamiltonian::new(grid, mass, HBAR, Kinetic::FiniteDifference);
+        let [jx, _] = psi.probability_current(&boxed);
+        let face = HBAR / (mass * grid.dx()) * (k * grid.dx()).sin();
+        assert!((jx[0] - 0.5 * face).abs() < 1e-12, "{} vs {}", jx[0], 0.5 * face);
     }
 
     #[test]

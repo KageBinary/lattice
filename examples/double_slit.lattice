@@ -12,11 +12,16 @@
 // collected — the interference pattern — at the end. Fringe spacing is about
 // λL/d = 0.51 nm · 4.5 nm / 2 nm ≈ 1.1 nm.
 //
+// The screen also fires 4000 electrons one at a time and records where each lands,
+// drawn from the current crossing it: the pattern builds up click by click, as
+// Tonomura's did, and its histogram is plotted on the same axes as the exact one.
+//
 // The absorbing layer removes what reaches the edges, and the run reports how much:
 // the norm falls on purpose, and the norm plus the absorbed probability is the
 // invariant, held to round-off.
 //
 //   lattice run examples/double_slit.lattice
+//   lattice-view examples/double_slit.lattice     (phase on a wheel, current as arrows)
 
 project double_slit {
   fidelity: engineering_2d;
@@ -42,9 +47,10 @@ project double_slit {
     sigma: [0.6 nanometer, 1.5 nanometer];
   }
 
-  detector screen at x=4.5 nanometer;
+  detector screen at x=4.5 nanometer, clicks=4000, seed=1;
 
   observe q every 0.25 femtosecond;
   visualize probability_density;
   visualize phase;
+  visualize probability_current;
 }

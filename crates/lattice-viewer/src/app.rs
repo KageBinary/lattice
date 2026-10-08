@@ -417,6 +417,15 @@ impl ViewerApp {
                         }
                     }
 
+                    // Results that are functions — a detector's arrival pattern, a radial
+                    // distribution — drawn as they stand now.
+                    let curves = loaded.simulation.curves();
+                    if !curves.is_empty() {
+                        ui.add_space(10.0);
+                        ui.colored_label(palette.text_secondary, "curves");
+                        plot_curves(ui, palette, &curves);
+                    }
+
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.show_contracts, "solver contracts");
                     if self.show_contracts {
@@ -563,29 +572,8 @@ fn draw_channel(
             unit,
         } => {
             let rendered = render::field_to_image(field, colormap, mode, palette);
-
-            let handle = match textures.get_mut(*name) {
-                Some(handle) => {
-                    handle.set(rendered.image.clone(), TEXTURE);
-                    handle.clone()
-                }
-                None => {
-                    let handle = ui
-                        .ctx()
-                        .load_texture(*name, rendered.image.clone(), TEXTURE);
-                    textures.insert((*name).to_string(), handle.clone());
-                    handle
-                }
-            };
-
-            // Preserve the domain's aspect ratio: a square chamber must not be drawn
-            // as a rectangle, or every length read off the picture is wrong.
-            let extent = grid.extent();
-            let aspect = (extent[0] / extent[1]) as f32;
-            let plot_height = (height - 60.0).max(120.0);
-            let width = (plot_height * aspect).min(ui.available_width() - 8.0);
-            let size = egui::Vec2::new(width, width / aspect);
-            ui.add(egui::Image::new(&handle).fit_to_exact_size(size));
+            let handle = upload(ui, textures, name, &rendered.image);
+            ui.add(egui::Image::new(&handle).fit_to_exact_size(image_size(ui, *grid, height)));
 
             if rendered.is_flat() {
                 ui.colored_label(
@@ -616,6 +604,74 @@ fn draw_channel(
                     render::format_value(rendered.mean),
                     render::format_value(rendered.max)
                 ),
+            );
+            if rendered.non_finite > 0 {
+                render::status_line(
+                    ui,
+                    palette,
+                    &render::Verdict {
+                        status: Status::Critical,
+                        label: "non-finite cells".to_string(),
+                        detail: format!("{} of them, drawn in red", rendered.non_finite),
+                    },
+                );
+            }
+        }
+
+        RenderChannel::Phase { name, field, weight, grid, .. } => {
+            let rendered = render::phase_to_image(field, weight, palette.plane, palette);
+            let handle = upload(ui, textures, name, &rendered.image);
+            ui.add(egui::Image::new(&handle).fit_to_exact_size(image_size(ui, *grid, height)));
+            ui.horizontal(|ui| {
+                render::phase_wheel_legend(ui, palette);
+                ui.vertical(|ui| {
+                    ui.add_space(8.0);
+                    ui.colored_label(palette.text_muted, "hue is the phase, on a wheel with no ends —");
+                    ui.colored_label(palette.text_muted, "−π and π are the same colour because they are the same angle.");
+                    ui.colored_label(
+                        palette.text_muted,
+                        "strength is |ψ|: the phase of an amplitude near zero is round-off, and fades out.",
+                    );
+                });
+            });
+            if rendered.non_finite > 0 {
+                render::status_line(
+                    ui,
+                    palette,
+                    &render::Verdict {
+                        status: Status::Critical,
+                        label: "non-finite cells".to_string(),
+                        detail: format!("{} of them, drawn in red", rendered.non_finite),
+                    },
+                );
+            }
+        }
+
+        RenderChannel::Vector { name, x, y, grid, unit } => {
+            // The magnitude as a sequential image floored at zero, so no flow looks
+            // like no flow; the arrows carry the direction.
+            let mut magnitude = lattice_ir::ScalarField::new(grid, 0);
+            for j in 0..grid.ny() {
+                for i in 0..grid.nx() {
+                    magnitude.set(i, j, x.get(i, j).hypot(y.get(i, j)));
+                }
+            }
+            let rendered = render::field_to_image_above(&magnitude, Colormap::Sequential, mode, palette, 0.0);
+            let handle = upload(ui, textures, name, &rendered.image);
+            let response = ui.add(egui::Image::new(&handle).fit_to_exact_size(image_size(ui, *grid, height)));
+            let longest = render::draw_arrows(ui.painter(), response.rect, x, y, palette);
+            render::color_scale(ui, Colormap::Sequential, mode, palette, 0.0, rendered.max, unit_label(unit));
+            ui.colored_label(
+                palette.text_muted,
+                if longest > 0.0 {
+                    format!(
+                        "shade is the magnitude; arrows the direction, the longest {} {} averaged over its block",
+                        render::format_value(longest),
+                        unit_label(unit)
+                    )
+                } else {
+                    "nothing is flowing".to_string()
+                },
             );
             if rendered.non_finite > 0 {
                 render::status_line(
@@ -721,6 +777,78 @@ fn draw_channel(
                 caption.push_str(&format!(", {outside} outside the view"));
             }
             ui.colored_label(palette.text_muted, caption);
+        }
+    }
+}
+
+/// Upload `image` as the texture named `name`, reusing the texture already there.
+fn upload(ui: &egui::Ui, textures: &mut BTreeMap<String, TextureHandle>, name: &str, image: &egui::ColorImage) -> TextureHandle {
+    match textures.get_mut(name) {
+        Some(handle) => {
+            handle.set(image.clone(), TEXTURE);
+            handle.clone()
+        }
+        None => {
+            let handle = ui.ctx().load_texture(name, image.clone(), TEXTURE);
+            textures.insert(name.to_string(), handle.clone());
+            handle
+        }
+    }
+}
+
+/// The on-screen size of a grid's image. Preserves the domain's aspect ratio: a square
+/// chamber must not be drawn as a rectangle, or every length read off the picture is
+/// wrong.
+fn image_size(ui: &egui::Ui, grid: lattice_ir::Grid2d, height: f32) -> egui::Vec2 {
+    let extent = grid.extent();
+    let aspect = (extent[0] / extent[1]) as f32;
+    let plot_height = (height - 60.0).max(120.0);
+    let width = (plot_height * aspect).min(ui.available_width() - 8.0);
+    egui::Vec2::new(width, width / aspect)
+}
+
+/// Plot curves — results that are functions rather than numbers — one plot per pair of
+/// axes. Curves that share both axes and both units share a plot: a detector's exact
+/// arrival pattern and the clicks sampled from it belong on the same axes, because the
+/// comparison between them is the point.
+fn plot_curves(ui: &mut egui::Ui, palette: &Palette, curves: &[lattice_ir::Curve]) {
+    let mut groups: Vec<(&lattice_ir::Curve, Vec<&lattice_ir::Curve>)> = Vec::new();
+    for curve in curves {
+        let axes = |c: &lattice_ir::Curve| (c.x_label, c.x_unit, c.y_label, c.y_unit);
+        match groups.iter_mut().find(|(first, _)| axes(first) == axes(curve)) {
+            Some((_, members)) => members.push(curve),
+            None => groups.push((curve, vec![curve])),
+        }
+    }
+    for (first, members) in &groups {
+        ui.add_space(6.0);
+        ui.colored_label(
+            palette.text_muted,
+            format!("{} ({}) against {} ({})", first.y_label, unit_label(first.y_unit), first.x_label, unit_label(first.x_unit)),
+        );
+        let shown = members.len().min(Palette::SERIES_SLOTS);
+        let width = (ui.available_width() - 14.0).max(120.0);
+        let id = format!("curve-{}", first.name);
+        Plot::new(id)
+            .height(150.0)
+            .width(width)
+            .allow_scroll(false)
+            .x_axis_label(format!("{} ({})", first.x_label, unit_label(first.x_unit)))
+            .show(ui, |plot_ui| {
+                for (slot, curve) in members.iter().take(shown).enumerate() {
+                    let points: PlotPoints = curve.x.iter().zip(&curve.y).map(|(x, y)| [*x, *y]).collect();
+                    plot_ui.line(Line::new(short_name(&curve.name), points).color(palette.series(slot)).width(2.0));
+                }
+            });
+        let names: Vec<&str> = members.iter().take(shown).map(|c| short_name(&c.name)).collect();
+        render::legend_row(ui, palette, &names);
+        for curve in members.iter().take(shown) {
+            for note in &curve.notes {
+                ui.colored_label(palette.text_muted, format!("{}: {note}", short_name(&curve.name)));
+            }
+            if curve.has_non_finite() {
+                ui.colored_label(palette.status(Status::Critical), format!("{} contains non-finite values", short_name(&curve.name)));
+            }
         }
     }
 }
@@ -841,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn the_double_slit_loads_and_draws_density_phase_and_potential() {
+    fn the_double_slit_loads_and_draws_density_phase_current_and_potential() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/double_slit.lattice");
         let State::Ready(mut loaded) = load(&path) else {
             panic!("double_slit should load")
@@ -851,11 +979,20 @@ mod tests {
         }
         let channels = loaded.simulation.render_channels();
         let names: Vec<&str> = channels.iter().map(|c| c.name()).collect();
-        assert_eq!(names, ["q.probability_density", "q.phase", "q.potential"]);
+        assert_eq!(names, ["q.probability_density", "q.phase", "q.probability_current", "q.potential"]);
+        assert!(matches!(channels[1], RenderChannel::Phase { .. }), "the phase is drawn on a wheel");
+        assert!(matches!(channels[2], RenderChannel::Vector { .. }), "the current is drawn with arrows");
         for channel in &channels {
-            let RenderChannel::Scalar { field, .. } = channel else { panic!("{} is not a field", channel.name()) };
-            assert!(field.first_non_finite().is_none(), "{} has a non-finite cell", channel.name());
+            assert!(!channel.has_non_finite(), "{} has a non-finite cell", channel.name());
         }
+        // The phase image is the wheel faded by |ψ|, and the current has somewhere to point.
+        let palette = Palette::for_mode(Mode::Dark);
+        let RenderChannel::Phase { field, weight, .. } = &channels[1] else { unreachable!() };
+        let image = render::phase_to_image(field, weight, palette.plane, &palette);
+        assert!(image.max_weight > 0.0 && image.non_finite == 0);
+        // The screen's arrival pattern is a curve the side panel plots.
+        let curves = loaded.simulation.curves();
+        assert!(curves.iter().any(|c| c.name == "q.screen"), "{:?}", curves.iter().map(|c| &c.name).collect::<Vec<_>>());
     }
 
     #[test]

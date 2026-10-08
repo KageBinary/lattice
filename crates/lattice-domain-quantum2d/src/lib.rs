@@ -70,6 +70,7 @@ pub mod eigen;
 pub mod fft;
 mod hamiltonian;
 mod potential;
+pub mod sampling;
 mod split_step;
 mod wavefunction;
 
@@ -80,6 +81,7 @@ pub use domain::{QuantumDomain, Scheme, SPLIT_STEP_PHASE};
 pub use eigen::{EigenSearch, Eigenstate, Spectrum};
 pub use hamiltonian::{Hamiltonian, Kinetic, Moments, Spectral};
 pub use potential::{Absorber, Potential, Shape};
+pub use sampling::Clicks;
 pub use split_step::SplitStep;
 pub use wavefunction::Wavefunction;
 

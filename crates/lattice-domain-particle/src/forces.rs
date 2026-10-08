@@ -81,7 +81,9 @@ pub trait ForceLaw: fmt::Debug + Send + Sync {
     /// Add this law's forces to the accumulators.
     ///
     /// `ctx.neighbors` is `Some` exactly when [`ForceLaw::cutoff`] returned `Some` for
-    /// some law in the domain and the domain has built a list.
+    /// some law in the domain and the domain has built a list. The list reaches the
+    /// *largest* cutoff of any law in the domain, so a pair law must skip pairs beyond
+    /// its own: two laws with different ranges share one list.
     fn accumulate(&self, view: &mut ForceAccumulation<'_>, ctx: &ForceContext<'_>);
 
     /// Potential energy of the current configuration, joules.
@@ -479,8 +481,12 @@ impl ForceLaw for LennardJones {
 
         // Two loops rather than a branch per pair: the energy-shifted form needs no
         // square root, and that is the form the benchmarks and the GPU kernel share.
+        let cutoff2 = self.cutoff * self.cutoff;
         if force_shift == 0.0 {
             list.for_each_pair(pos_x, pos_y, |i, j, dx, dy, r2| {
+                if r2 >= cutoff2 {
+                    return;
+                }
                 let inv_r2 = 1.0 / r2;
                 let s6 = (sigma2 * inv_r2).powi(3);
                 let s12 = s6 * s6;
@@ -496,6 +502,9 @@ impl ForceLaw for LennardJones {
             });
         } else {
             list.for_each_pair(pos_x, pos_y, |i, j, dx, dy, r2| {
+                if r2 >= cutoff2 {
+                    return;
+                }
                 let inv_r2 = 1.0 / r2;
                 let s6 = (sigma2 * inv_r2).powi(3);
                 let s12 = s6 * s6;
@@ -513,14 +522,21 @@ impl ForceLaw for LennardJones {
     fn potential_energy(&self, store: &ParticleStore, ctx: &ForceContext<'_>) -> f64 {
         let Some(list) = ctx.neighbors else { return 0.0 };
         let sigma2 = self.sigma * self.sigma;
+        let cutoff2 = self.cutoff * self.cutoff;
         let mut total = 0.0;
         if self.force_shift == 0.0 {
             list.for_each_pair(store.pos_x(), store.pos_y(), |_, _, _, _, r2| {
+                if r2 >= cutoff2 {
+                    return;
+                }
                 let s6 = (sigma2 / r2).powi(3);
                 total += 4.0 * self.epsilon * (s6 * s6 - s6) - self.energy_shift;
             });
         } else {
             list.for_each_pair(store.pos_x(), store.pos_y(), |_, _, _, _, r2| {
+                if r2 >= cutoff2 {
+                    return;
+                }
                 let s6 = (sigma2 / r2).powi(3);
                 total += 4.0 * self.epsilon * (s6 * s6 - s6) - self.energy_shift
                     + (r2.sqrt() - self.cutoff) * self.force_shift;
@@ -534,9 +550,13 @@ impl ForceLaw for LennardJones {
         let sigma2 = self.sigma * self.sigma;
         let twenty_four_eps = 24.0 * self.epsilon;
         let force_shift = self.force_shift;
+        let cutoff2 = self.cutoff * self.cutoff;
         let mut total = 0.0;
         // (xᵢ − xⱼ)·Fᵢⱼ = coefficient · r², since Fᵢ = coefficient·(xᵢ − xⱼ).
         list.for_each_pair(store.pos_x(), store.pos_y(), |_, _, _, _, r2| {
+            if r2 >= cutoff2 {
+                return;
+            }
             let inv_r2 = 1.0 / r2;
             let s6 = (sigma2 * inv_r2).powi(3);
             let coefficient = twenty_four_eps * inv_r2 * (2.0 * s6 * s6 - s6) - force_shift * inv_r2.sqrt();
@@ -610,7 +630,12 @@ impl ForceLaw for SoftRepulsion {
         let (k, d) = (self.stiffness, self.range);
         let (pos_x, pos_y) = (view.pos_x, view.pos_y);
         let (force_x, force_y) = (&mut *view.force_x, &mut *view.force_y);
+        let range2 = d * d;
         list.for_each_pair(pos_x, pos_y, |i, j, dx, dy, r2| {
+            // Beyond the range k(d − r) would turn attractive.
+            if r2 >= range2 {
+                return;
+            }
             let r = r2.sqrt();
             // F = k(d − r) along r̂, pushing i away from j.
             let coefficient = k * (d - r) / r;
@@ -636,6 +661,9 @@ impl ForceLaw for SoftRepulsion {
         let (k, d) = (self.stiffness, self.range);
         let mut total = 0.0;
         list.for_each_pair(store.pos_x(), store.pos_y(), |_, _, _, _, r2| {
+            if r2 >= d * d {
+                return;
+            }
             let r = r2.sqrt();
             total += k * (d - r) * r;
         });
@@ -822,6 +850,34 @@ mod tests {
             (numeric - analytic).abs() < 1e-4 * analytic.abs(),
             "numeric {numeric} vs analytic {analytic}"
         );
+    }
+
+    /// The neighbour list reaches the largest cutoff in the domain, so every pair law
+    /// must stop at its own. A pair 1.5 apart is inside Lennard-Jones's 2.5 and outside
+    /// soft repulsion's 1.0: it feels Lennard-Jones and nothing else — before this was
+    /// enforced, soft repulsion's k(d − r) pulled it together.
+    #[test]
+    fn a_pair_law_ignores_listed_pairs_beyond_its_own_cutoff() {
+        let positions = [[0.0, 0.0], [1.5, 0.0]];
+        let mut list = open_list(10.0, 2.5, 2);
+        let mut store = store_of(&positions, 1.0);
+        list.update(&store);
+        let ctx = ForceContext { neighbors: Some(&list), image: MinimumImage::open() };
+
+        let soft = SoftRepulsion::new(10.0, 1.0);
+        let mut view = store.force_accumulation();
+        soft.accumulate(&mut view, &ctx);
+        assert_eq!((view.force_x[0], view.force_x[1]), (0.0, 0.0));
+        assert_eq!(soft.virial(&store, &ctx), 0.0);
+        assert_eq!(soft.potential_energy(&store, &ctx), 0.0);
+
+        // A force-shifted LJ with a short cutoff, read through a longer list.
+        let short = LennardJones::with_truncation(1.0, 1.0, 1.2, Truncation::ForceShift);
+        let mut view = store.force_accumulation();
+        short.accumulate(&mut view, &ctx);
+        assert_eq!(view.force_x[0], 0.0);
+        assert_eq!(short.potential_energy(&store, &ctx), 0.0);
+        assert_eq!(short.virial(&store, &ctx), 0.0);
     }
 
     /// Newton's third law is what makes pairwise forces conserve momentum exactly.

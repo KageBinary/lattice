@@ -193,6 +193,7 @@ momentum is exactly zero — which is what makes the momentum diagnostic meaning
 | `harmonic_well(center=, stiffness=)` | stiffness in N/m |
 | `lennard_jones(epsilon=, sigma=, cutoff=, truncation=)` | cutoff defaults to 2.5σ; `truncation` is `energy_shift` (default) or `force_shift` |
 | `soft_repulsion(stiffness=, range=)` | `U = ½k(d − r)²` inside `range`; stiffness in N/m |
+| `coulomb(cutoff=, damping=)` | `k qᵢqⱼ/r` by the damped shifted force sum; needs `charge:`. `damping` is an inverse length and defaults to `2.4 / cutoff` |
 
 `boundary:` is `periodic`, `reflective` or `open` (the default). A `region` is required
 for a periodic or reflective boundary, and for any force with a cutoff.
@@ -229,11 +230,32 @@ particles chain {
 | `thermostat:` | `langevin(temperature=, friction=)` — BAOAB, samples the canonical ensemble, needs `velocity_verlet` — or `velocity_rescale(temperature=, relaxation=)` (alias `berendsen`), which does not |
 | `skin:` | cache pairs in a Verlet list out to cutoff + skin, rebuilt when any particle has moved half the skin. Results agree with rebuilding every step to round-off |
 | `analysis:` | `rdf(bins=, range=, every=, after=)` — a radial distribution sampled every `every` steps once `after` steps have passed. `range` may not exceed half a periodic box |
+| `charge:` | a charge on every particle, or `alternating(q)` — `+q` and `−q` on alternate lattice sites, the 2D rock-salt checkerboard. Only `coulomb` reads it |
 
 A thermostatted run publishes total energy as a metric, not an invariant: energy flows
 through the bath on purpose, and reporting its drift as a conservation failure would be
 wrong. The radial distribution is published as a *curve* — `g(r)` against `r` — in the
 run artifact and at the end of `lattice run`.
+
+### Coulomb
+
+A plain cutoff ruins `1/r`: the neglected tail is not small, and a truncated sum over a
+neutral crystal oscillates with whichever shell of charges the cutoff cuts through.
+`coulomb` is Fennell and Gezelter's damped shifted force sum instead — the real-space
+half of an Ewald sum, `erfc(αr)/r`, shifted so that its energy and force both vanish at
+the cutoff. Nothing jumps when a pair crosses it, so a run without a thermostat conserves
+energy to the integrator's error alone. What it leaves out is Ewald's reciprocal-space
+half, which assumes the system is neutral on the scale of the cutoff; the default
+`αR = 2.4` puts the real-space truncation near `erfc(2.4) ≈ 7e-4` of a pair's energy.
+
+The charges are point charges in the plane interacting by the three-dimensional law —
+ions on a surface — not two-dimensional electrostatics, where line charges interact by
+`−ln r`. A complete model is [`examples/salt.lattice`](../examples/salt.lattice).
+
+Three combinations compile and run and give a result nobody asked for, so they warn:
+a `coulomb` force with no charges (`W0311`), a set that is not neutral — a uniform charge,
+or an odd count on the checkerboard (`W0311`) — and alternating charges with no
+`lennard_jones` or `soft_repulsion` core to keep opposite charges apart (`W0312`).
 
 ## Rigid bodies
 
@@ -528,6 +550,30 @@ is normalized. A `detector` is a screen parallel to y that integrates the probab
 current through it; `lattice run` plots what it collected — the interference pattern —
 and the run artifact stores it as a curve.
 
+A detector can also count single arrivals, which is how §13.1's *measurement-inspired
+sampling* reaches the language:
+
+```
+detector screen at x=4.5 nanometer, clicks=4000, seed=1;
+```
+
+fires 4000 particles and records where each one lands, drawn from the forward current
+through the screen; `seed` (default 0) makes the draw reproducible, and is an error
+without `clicks`. The histogram is a second curve, `<domain>.<detector>.clicks`, on the
+same axes as the exact pattern, and the count detected so far is an observation. The
+screen samples the flux without collapsing the state: the arrivals have the right
+statistics, and the wavefunction evolves as one undisturbed particle.
+
+| Render channel | What `lattice-view` draws |
+|---|---|
+| `probability_density` | the density on a sequential ramp |
+| `phase` | `arg ψ` on a phase wheel — fixed lightness and chroma, the hue turning once around — faded toward the background by the amplitude, so a phase where there is no wavefunction recedes; the wheel is its legend |
+| `probability_current` | the current's magnitude, with arrows for its direction |
+| `potential` | `V` |
+
+The terminal viewer draws the current's magnitude and says what it cannot draw: a
+character ramp has two ends, and a phase does not.
+
 With an absorbing boundary the norm falls on purpose. The domain publishes
 `probability_norm` and `probability_absorbed` as metrics and their sum,
 `probability_accounted`, as the invariant.
@@ -588,7 +634,7 @@ visualize probability_density;         // the domain picks an encoding
 | `E021x` | geometry and chemistry: unknown builtin (`E0210`), invalid shape or formula (`E0211`), unbalanced reaction (`E0212`) |
 | `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range |
 | `E09xx` | not implemented yet — the message names the milestone |
-| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, and the quantum module's physics checks (`W0308`–`W0310`) |
+| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), and charges that do not suit a Coulomb law (`W0311`–`W0312`) |
 
 Every rejection carries a source position and either a suggested fix or the rule it
 enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the

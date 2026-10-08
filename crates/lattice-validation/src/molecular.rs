@@ -15,8 +15,8 @@
 use std::sync::OnceLock;
 
 use lattice_domain_particle::{
-    analysis, Angle, Bond, BoundaryBox, HarmonicAngle, HarmonicBond, Integrator, LennardJones,
-    ParticleDomain, ParticleSpec, Thermostat, Truncation, BOLTZMANN,
+    analysis, erfc, Angle, Bond, BoundaryBox, Coulomb, HarmonicAngle, HarmonicBond, Integrator,
+    LennardJones, ParticleDomain, ParticleSpec, Thermostat, Truncation, BOLTZMANN,
 };
 use lattice_ir::{Arena, Domain, Pcg32, StepContext};
 
@@ -98,7 +98,125 @@ pub(crate) static CASES: &[Case] = &[
         claim: "velocity rescaling moves an ideal gas toward its target as T_n = T0 + (Ti - T0)(1 - dt/tau)^n exactly",
         run: berendsen_relaxation,
     },
+    Case {
+        name: "coulomb_recovers_the_madelung_energy",
+        domain: "molecular2d",
+        level: Level::Analytic,
+        claim: "the damped shifted force sum gives a 2D rock-salt crystal's Madelung energy -M k q^2 / 2a, M = 1.6155426, within its erfc(alpha R) truncation and exp(-k^2/4 alpha^2) reciprocal terms",
+        run: madelung,
+    },
+    Case {
+        name: "ionic_melt_energy_error_is_second_order",
+        domain: "molecular2d",
+        level: Level::Manufactured,
+        claim: "under damped shifted force Coulomb, which vanishes in energy and force at its cutoff, an ionic melt's energy error is velocity Verlet's alone and falls as dt^2",
+        run: ionic_melt_order,
+    },
 ];
+
+/// The Madelung constant of the 2D square lattice of alternating charges with `1/r`
+/// interactions: the potential at an ion is `−M k q / a`.
+const MADELUNG_SQUARE: f64 = 1.615_542_626_712_824_7;
+
+/// A `side × side` checkerboard of `±1` charges at unit spacing in a periodic box, in
+/// reduced units: `k = q = a = m = 1`.
+fn rock_salt(side: usize, law: Coulomb) -> ParticleDomain {
+    let count = side * side;
+    let size = side as f64;
+    let mut domain = ParticleDomain::new("salt", count)
+        .with_integrator(Integrator::VelocityVerlet)
+        .with_bounds(BoundaryBox::periodic([0.0, 0.0], [size, size]))
+        .with_force(law);
+    for index in 0..count {
+        let (i, j) = (index % side, index / side);
+        let charge = if (i + j) % 2 == 0 { 1.0 } else { -1.0 };
+        domain.spawn(ParticleSpec::at([i as f64 + 0.5, j as f64 + 0.5]).with_charge(charge)).unwrap();
+    }
+    domain
+}
+
+fn madelung() -> Outcome {
+    let alpha = 0.4;
+    // The omitted reciprocal sum: the checkerboard's charge pattern has its smallest
+    // wavevector at |k| = π√2 / a.
+    let reciprocal = (-core::f64::consts::PI.powi(2) / (2.0 * alpha * alpha)).exp();
+    let exact = -0.5 * MADELUNG_SQUARE;
+    let mut worst_ratio = 0.0f64;
+    let mut notes = Vec::new();
+    for cutoff in [6.5, 8.5] {
+        let mut domain = rock_salt(20, Coulomb::with_constant(cutoff, alpha, 1.0));
+        domain.initialize();
+        let per_ion = domain.potential_energy() / domain.store().len() as f64;
+        let error = ((per_ion - exact) / exact).abs();
+        // The neglected real-space shells sum to a few times their leading term.
+        let bound = 4.0 * erfc(alpha * cutoff) + reciprocal;
+        worst_ratio = worst_ratio.max(error / bound);
+        let store = domain.store();
+        let largest_force = (0..store.len()).map(|i| store.force_x()[i].hypot(store.force_y()[i])).fold(0.0, f64::max);
+        notes.push(format!(
+            "R = {cutoff} a: {per_ion:.10} k q^2/a per ion, relative error {error:.3e} against a bound of {bound:.3e}; \
+             largest net force on an ion {largest_force:.1e}, by symmetry zero"
+        ));
+    }
+    let mut outcome = Outcome::at_most("worst relative error / derived bound", "1", worst_ratio, 1.0)
+        .note(format!("exact -M/2 = {exact:.10} k q^2/a per ion; alpha = {alpha}/a, 400 ions"))
+        .note(format!(
+            "bound = 4 erfc(alpha R) + exp(-pi^2 / 2 alpha^2 a^2); the reciprocal term is {reciprocal:.1e}"
+        ));
+    for note in notes {
+        outcome = outcome.note(note);
+    }
+    outcome
+}
+
+/// RMS energy error per ion over `time` reduced units of an ionic melt at step `dt`,
+/// and the RMS distance the ions end from their starting sites.
+fn ionic_energy_error(dt: f64, time: f64) -> (f64, f64) {
+    // Opposite charges attract without limit at short range; a force-shifted
+    // Lennard-Jones core keeps them apart. Started on the crystal and thermalized hot,
+    // so that pairs cross both cutoffs throughout the run — the displacement returned
+    // is how far the ions actually wander.
+    let side = 14;
+    let mut domain = rock_salt(side, Coulomb::with_constant(6.5, 0.4, 1.0))
+        .with_force(LennardJones::with_truncation(1.0, 0.8, 2.0, Truncation::ForceShift));
+    let mut rng = Pcg32::seed_from_u64(5);
+    // k_B T = 0.5 k q^2 / a, in a store whose BOLTZMANN is the SI one.
+    assert!(analysis::thermalize(domain.store_mut(), 0.5 / BOLTZMANN, &mut rng));
+    domain.initialize();
+    let e0 = domain.total_energy();
+    let start: Vec<[f64; 2]> =
+        domain.store().pos_x().iter().zip(domain.store().pos_y()).map(|(x, y)| [*x, *y]).collect();
+    let steps = (time / dt).round() as usize;
+    let mut arena = Arena::with_capacity(0);
+    let mut ctx = StepContext::new(&mut arena);
+    let mut sum = 0.0;
+    for _ in 0..steps {
+        domain.advance(dt, &mut ctx);
+        sum += (domain.total_energy() - e0).powi(2);
+    }
+    let count = domain.store().len() as f64;
+    // Minimum image, so a wrap at the box edge is not counted as a crossing of the box.
+    let size = side as f64;
+    let wrap = |d: f64| d - size * (d / size).round();
+    let store = domain.store();
+    let displaced = (0..store.len())
+        .map(|i| wrap(store.pos_x()[i] - start[i][0]).powi(2) + wrap(store.pos_y()[i] - start[i][1]).powi(2))
+        .sum::<f64>();
+    ((sum / steps as f64).sqrt() / count, (displaced / count).sqrt())
+}
+
+fn ionic_melt_order() -> Outcome {
+    let (dt, time) = (0.004, 1.5);
+    let (coarse, _) = ionic_energy_error(dt, time);
+    let (fine, wandered) = ionic_energy_error(dt / 2.0, time);
+    let order = (coarse / fine).log2();
+    Outcome::near("observed order of the RMS energy error", "1", order, 2.0, 0.3)
+        .note(format!("RMS |E - E0| per ion: {coarse:.3e} -> {fine:.3e} k q^2/a on halving dt"))
+        .note(format!(
+            "the ions end an RMS {wandered:.2} a from their lattice sites, against Lindemann's ~0.15 a for melting"
+        ))
+        .note("196 ions of charge +-1 from a rock-salt lattice at k_B T = 0.5 k q^2/a, Coulomb cutoff 6.5 a with alpha = 0.4/a, a force-shifted LJ core (eps 1, sigma 0.8 a)")
+}
 
 fn run(domain: &mut ParticleDomain, dt: f64, steps: usize) {
     let mut arena = Arena::with_capacity(0);

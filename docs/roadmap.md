@@ -493,7 +493,7 @@ GPU rigid bodies, and GPU chemistry remain outside the released backend scope.
 
 **Spec exit condition:** *"energy/norm tests and visual examples."* Two halves: the
 molecular module of §12.4, whose tests are energy tests, and `quantum2d` of §13.1, whose
-tests are norm tests. Both are done; what each leaves out is listed under it.
+tests are norm tests. Both are done, and M5.3 built the four things they left out.
 
 ### M5.1 — Classical molecular dynamics ✅
 
@@ -505,7 +505,7 @@ tests are norm tests. Both are done; what each leaves out is listed under it.
 | Neighbour search | cell list + optional skin | `NeighborList`: a cell list, optionally cached behind a Verlet skin with bonded exclusions |
 | Boundary | periodic/reflective/open | all three, with minimum-image geometry that bonds and angles respect across a periodic seam |
 | Thermostat | Langevin and simple velocity-rescaling | both, each with its own contract — a thermostatted run does not claim energy conservation |
-| Potentials | LJ, harmonic bond, soft repulsion, Coulomb cutoff | LJ (energy- or force-shifted), harmonic bonds and angles, soft repulsion. **Coulomb is not built** |
+| Potentials | LJ, harmonic bond, soft repulsion, Coulomb cutoff | LJ (energy- or force-shifted), harmonic bonds and angles, soft repulsion. Coulomb came later, in M5.3 |
 | Analysis | energy, RDF, MSD, temperature, pressure | all five; the RDF is published as a curve |
 
 In the language: `temperature:`, `layout: serpentine`, `bonds:`, `angles:`,
@@ -595,7 +595,62 @@ is the same scene with numbers that work.
   a 512² grid that took as long as the two FFTs. The channels are now computed when
   drawn rather than when stepped.
 
-### What M5 leaves out
+### M5.3 — What M5 left out ✅
+
+The four items M5 closed without, each now built and validated:
+
+| Gap | Built | Validated by |
+|---|---|---|
+| Coulomb with a declared cutoff (§12.4) | `coulomb(cutoff=, damping=)` — Fennell and Gezelter's damped shifted force sum: Ewald's real-space `erfc(αr)/r`, shifted to zero in energy and force at the cutoff. Point charges in the plane under the 3D law; `charge:` is uniform or `alternating(q)` | a 2D rock-salt crystal's Madelung energy within a derived bound — 3.1e-4 against 9.4e-4 at `R = 6.5a`, 2.9e-6 against 6.1e-6 at `8.5a`; an ionic melt's energy error falling at order 2.00, Verlet's alone |
+| Measurement-inspired sampling (§13.1) | `Wavefunction::sample_positions` (the Born rule, Rust API only) and a detector's `clicks=` — single arrivals drawn from the forward current through the screen, binomially thinned so the total over a run is right | 40 000 Born samples against the density, χ²/dof 0.92; 200 000 fired particles' clicks against the forward current, χ²/dof 1.26, 21 046 detected against 21 053 expected |
+| The probability current as a picture (§17.1) | a `probability_current` render channel: magnitude, with arrows averaged over blocks so a downsampled view cannot miss a strong cell | the drawn current integrates to the lattice's `⟨p⟩/m` — its central difference, 5.8% below the continuum value on that grid, against `(k₀Δx)²/6 = 5.9%` predicted |
+| A phase wheel and curves in the window (§17.1) | phase on a wheel of fixed OKLab lightness and chroma, faded by the amplitude, with the wheel as its legend; `lattice-view` plots curves, and a detector's exact pattern shares axes with its clicks | — |
+| Speed (§15.6) | both FFT passes and both transposes split into row bands across the worker pool; `lattice bench quantum-split-step` times the §15.6 grid against a norm check | bit-identical wavefunctions on 1, 2, 3 and 8 threads (`quantum_split_step_matches_across_thread_counts`), on a Bluestein grid in both directions |
+
+In the language: `charge:`, `force: coulomb(…)`, `clicks=` and `seed=` on a detector, and
+`visualize probability_current`, with two new warnings for charges that do not suit a
+Coulomb law (`W0311`, `W0312`); all in [language.md](language.md).
+[`examples/salt.lattice`](../examples/salt.lattice) is a hot 2D salt crystal, and
+[`examples/double_slit.lattice`](../examples/double_slit.lattice) now fires 4000
+electrons at its screen. Six validation cases; 69 in all, and 1198 tests.
+
+### What M5.3 taught us
+
+- **A truncated `1/r` is not an approximation that improves.** Summed over a neutral
+  crystal, a plain cutoff does not converge as it grows: it oscillates with whichever
+  shell of charges it cuts through. Damping first and cutting second is what makes the
+  cutoff a declared, bounded error — and the Madelung case prints the bound beside the
+  error rather than a tolerance.
+- **The current to check is the grid's, not the continuum's.** The drawn current
+  integrates to 5.8% below `⟨p⟩/m`, which would read as a bug against the continuum;
+  against the central difference the lattice actually takes it agrees to a part in 1e10.
+  The case asserts the latter and reports the continuum gap as a note.
+- **A parallel FFT promises bit-identity for free.** There is no reduction anywhere in
+  an FFT: each row is the same arithmetic whichever thread runs it. What did need
+  measuring was the floor — split across the pool with no floor, a 32² transform ran a
+  quarter slower, while 64² ran 1.5× faster and 128² 1.6×. `FFT_GRAIN` holds small grids
+  on one thread.
+- **Colour is not free per pixel.** Interpolating in OKLab costs three `powf` a pixel —
+  45 ms for one 256×128 field, which held the viewer to a few frames a second. Lookup
+  tables make it an index, but a 1024-step table came out two 8-bit levels off where the
+  diverging map turns steeply near its pole; 4096 steps keep every entry within one.
+- **A phase is faded by its amplitude, not its density.** Fading by `|ψ|²` hides every
+  fringe but the packet's core; `|ψ|` keeps the tail's phase visible. Either way, an
+  angle where there is no wavefunction is round-off, and is drawn as nothing.
+
+### What M5 still leaves out
+
+- **Ewald's reciprocal-space half.** The damped shifted force sum assumes the system is
+  neutral on the scale of its cutoff. A crystal satisfies that; a one-component plasma
+  does not, and the compiler warns (`W0311`) rather than pretending.
+- **Collapse.** A screen samples the flux and lets the wavefunction carry on, so the
+  arrivals' statistics are right and whatever happens afterwards is one undisturbed
+  particle's. Born sampling is reachable from Rust, not from the language.
+- **A GPU quantum path**, and a fresh 512² timing. The old single-thread figure was
+  12 ms a step; the parallel figure belongs in [execution.md](execution.md)'s table once
+  it is measured on an idle machine.
+
+### Where M5.3 started (historical)
 
 - **Coulomb with a declared cutoff** — the one §12.4 potential not built. A plain cutoff
   on `1/r` is a poor approximation the contract would have to say a great deal about;

@@ -14,7 +14,7 @@
 use lattice_domain_quantum2d::{
     eigen, Absorber, EigenSearch, Hamiltonian, Kinetic, Potential, QuantumDomain, Shape, Wavefunction, HBAR,
 };
-use lattice_ir::{Arena, Domain, Grid2d, StepContext};
+use lattice_ir::{Arena, Domain, Grid2d, Pcg32, StepContext};
 
 use crate::{Case, Level, Outcome};
 
@@ -88,6 +88,27 @@ pub(crate) static CASES: &[Case] = &[
         level: Level::Property,
         claim: "Crank-Nicolson in a box holds the norm and <H> to its solver tolerance",
         run: crank_nicolson_conservation,
+    },
+    Case {
+        name: "probability_current_carries_the_momentum",
+        domain: "quantum2d",
+        level: Level::Analytic,
+        claim: "the drawn probability current integrates to (hbar/m dx) <sin(k dx)>, the central difference of <p>/m, for a Gaussian packet",
+        run: current_integral,
+    },
+    Case {
+        name: "born_samples_follow_the_density",
+        domain: "quantum2d",
+        level: Level::Property,
+        claim: "positions sampled from a diffracted state pass a chi-squared test against |psi|^2",
+        run: born_sampling,
+    },
+    Case {
+        name: "screen_clicks_sample_the_arrival_pattern",
+        domain: "quantum2d",
+        level: Level::Property,
+        claim: "a double slit's single-particle clicks pass a chi-squared test against fired times the forward current through the screen",
+        run: screen_clicks,
     },
 ];
 
@@ -319,6 +340,132 @@ fn tunneling() -> Outcome {
 }
 
 /// Spec §25.2's scene at a resolution a validation run can afford.
+/// Pearson's statistic for observed against expected counts, with categories expected
+/// to hold fewer than five pooled into one so the chi-squared approximation holds.
+/// Returns the statistic and its degrees of freedom.
+fn chi_squared(observed: &[f64], expected: &[f64]) -> (f64, usize) {
+    let (mut statistic, mut categories) = (0.0, 0usize);
+    let (mut pooled_o, mut pooled_e) = (0.0, 0.0);
+    for (o, e) in observed.iter().zip(expected) {
+        if *e < 5.0 {
+            pooled_o += o;
+            pooled_e += e;
+        } else {
+            statistic += (o - e).powi(2) / e;
+            categories += 1;
+        }
+    }
+    if pooled_e > 0.0 {
+        statistic += (pooled_o - pooled_e).powi(2) / pooled_e;
+        categories += 1;
+    }
+    (statistic, categories.saturating_sub(1))
+}
+
+/// Four standard deviations above the chi-squared distribution's mean: a sampler
+/// that is right fails this about once in ten thousand seeds, and one with a misplaced
+/// row or a wrong weight fails it by a mile.
+fn chi_squared_limit(dof: usize) -> f64 {
+    dof as f64 + 4.0 * (2.0 * dof as f64).sqrt()
+}
+
+fn current_integral() -> Outcome {
+    // A free packet on a periodic grid, sampled finely enough that its spectrum is the
+    // continuum Gaussian's to round-off.
+    let grid = Grid2d::with_origin(256, 64, [16.0 * NM, 4.0 * NM], [-8.0 * NM, -2.0 * NM]);
+    let (sigma, momentum) = (0.8 * NM, 1.0e-24);
+    let h = Hamiltonian::new(grid, MASS, HBAR, Kinetic::Spectral);
+    let psi = Wavefunction::gaussian(grid, [0.0, 0.0], [sigma, sigma], [momentum, 0.0], HBAR);
+    let [jx, jy] = psi.probability_current(&h);
+    let area = grid.cell_area();
+    let total_x = jx.iter().sum::<f64>() * area;
+    let total_y = jy.iter().sum::<f64>() * area;
+
+    // Σ ψ*(ψᵢ₊₁ − ψᵢ₋₁) is Σ_k |φ_k|² 2i sin(kΔx), so the integral is (ħ/mΔx)⟨sin kΔx⟩,
+    // and for momenta spread as N(k₀, 1/2σ) that is sin(k₀Δx)·exp(−Δx²/8σ²).
+    let (k0, dx) = (momentum / HBAR, grid.dx());
+    let predicted = HBAR / (MASS * dx) * (k0 * dx).sin() * (-(dx * dx) / (8.0 * sigma * sigma)).exp();
+    let group = momentum / MASS;
+    Outcome::near("integral of J_x over the grid", "m/s", total_x, predicted, 1e-10 * predicted)
+        .note(format!(
+            "<p>/m is {group:.6e} m/s; the central difference sits {:.3e} below it, against (k0 dx)^2/6 = {:.3e} at lowest order",
+            1.0 - total_x / group,
+            (k0 * dx).powi(2) / 6.0
+        ))
+        .note(format!("integral of J_y {total_y:.3e} m/s, for a packet with no y momentum"))
+}
+
+fn born_sampling() -> Outcome {
+    // A state with structure: the double slit, a few femtoseconds after the wall.
+    let (mut domain, _) = double_slit_domain();
+    run(&mut domain, 0.01e-15, 450);
+    let psi = domain.state();
+    let grid = psi.grid();
+    let count = 40_000;
+    let samples = psi.sample_positions(&mut Pcg32::seed_from_u64(2026), count);
+
+    // Bin into 8×8-cell blocks, which the samples' uniform placement within a cell
+    // cannot cross wrongly.
+    let block = 8;
+    let (bx, by) = (grid.nx() / block, grid.ny() / block);
+    let mut observed = vec![0.0; bx * by];
+    let [x0, y0] = grid.origin();
+    for [x, y] in &samples {
+        let i = (((x - x0) / grid.dx()) as usize).min(grid.nx() - 1) / block;
+        let j = (((y - y0) / grid.dy()) as usize).min(grid.ny() - 1) / block;
+        observed[j * bx + i] += 1.0;
+    }
+    let norm = psi.norm();
+    let mut expected = vec![0.0; bx * by];
+    for j in 0..grid.ny() {
+        for i in 0..grid.nx() {
+            expected[(j / block) * bx + i / block] += psi.get(i, j).norm_sqr() * grid.cell_area() / norm * count as f64;
+        }
+    }
+    let (statistic, dof) = chi_squared(&observed, &expected);
+    Outcome::at_most("chi-squared of samples against |psi|^2, 8x8-cell blocks", "1", statistic, chi_squared_limit(dof))
+        .note(format!("{count} samples, {dof} degrees of freedom: chi^2/dof = {:.3}", statistic / dof as f64))
+        .note("the limit is the mean plus four standard deviations of the chi-squared distribution")
+}
+
+fn screen_clicks() -> Outcome {
+    let (domain, speed) = double_slit_domain();
+    // Enough that most rows expect hundreds of clicks: with a few dozen, Pearson's
+    // statistic has a heavier tail than the chi-squared it is compared with.
+    let fired = 200_000;
+    let mut domain = domain.with_clicking_detector("counter", 4.5 * NM, fired, 77);
+    let dt = 0.01e-15;
+    let steps = ((12.0 * NM / speed) / dt).round() as usize;
+    run(&mut domain, dt, steps);
+
+    let grid = domain.grid();
+    let clicks = domain.detectors()[1].clicks().expect("the counter counts");
+    let counts = clicks.counts(grid);
+    let forward: f64 = clicks.expected().iter().sum();
+    let detected = clicks.positions().len() as f64;
+
+    // A multinomial over the screen's rows plus "never detected": each of `fired`
+    // particles lands in row j with probability ∫J⁺dt Δy there, or nowhere.
+    let mut observed: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+    let mut expected: Vec<f64> = clicks.expected().iter().map(|p| p * fired as f64).collect();
+    observed.push(fired as f64 - detected);
+    expected.push(fired as f64 * (1.0 - forward));
+    let (statistic, dof) = chi_squared(&observed, &expected);
+
+    // Fringes, not a blur: the clicks' own histogram has the pattern's minima.
+    let pattern = domain.detectors()[1].pattern(grid).1;
+    let peak = pattern.iter().copied().fold(0.0, f64::max);
+    let centre = grid.ny() / 2;
+    let dip = (centre.saturating_sub(10)..(centre + 10).min(grid.ny())).map(|j| pattern[j]).fold(f64::MAX, f64::min);
+    Outcome::at_most("chi-squared of clicks against fired x forward current per row", "1", statistic, chi_squared_limit(dof))
+        .note(format!(
+            "{detected} of {fired} detected, against {:.1} expected from the forward current; {dof} degrees of freedom, chi^2/dof = {:.3}",
+            fired as f64 * forward,
+            statistic / dof as f64
+        ))
+        .note(format!("the pattern's deepest minimum near the axis is {:.3} of its peak", dip / peak))
+}
+
 fn double_slit_domain() -> (QuantumDomain, f64) {
     let grid = Grid2d::with_origin(128, 64, [12.0 * NM, 6.0 * NM], [-6.0 * NM, -3.0 * NM]);
     let mut potential = Potential::zero(grid);
@@ -455,3 +602,4 @@ fn crank_nicolson_conservation() -> Outcome {
             iterations as f64 / steps as f64
         ))
 }
+

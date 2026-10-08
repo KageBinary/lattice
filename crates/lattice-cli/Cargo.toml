@@ -31,6 +31,7 @@ lattice-observe.workspace = true
 lattice-validation.workspace = true
 lattice-domain-particle.workspace = true
 lattice-domain-grid2d.workspace = true
+lattice-domain-quantum2d.workspace = true
 
 # Not inherited from the workspace: `unreachable_pub` fires on every item in a
 # binary crate, since nothing in a binary is reachable from outside it.

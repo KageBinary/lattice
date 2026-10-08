@@ -17,10 +17,20 @@
 //! a meaningful zero, where the question is *which side*. The midpoint must read as
 //! "nothing", which is why it is grey and not a third hue.
 //!
+//! **An angle gets a wheel.** A phase has no ends — `−π` and `π` are one value — so
+//! neither ramp above can draw it: both have two ends, and would paint a hard edge
+//! wherever the phase wraps. [`phase_wheel`] holds lightness and chroma fixed and turns
+//! the hue once around, so the colour has no ends either, and equal angles look equally
+//! far apart wherever on the circle they are. Hue is the one channel a cyclic quantity
+//! can honestly use, and the rule against rainbows does not apply to it for the same
+//! reason it applies to magnitudes: the data's own shape is what the colour must have.
+//!
 //! **Interpolation happens in OKLab.** Blending two colours in sRGB passes through a
 //! muddy, darkened middle — the classic blue-to-yellow-via-grey artifact. OKLab is
 //! perceptually uniform, so equal steps in the data produce equal steps in perceived
 //! colour, which is the entire point of a scientific colourmap.
+
+use std::sync::OnceLock;
 
 use eframe::egui::Color32;
 
@@ -202,6 +212,44 @@ pub fn sample(map: Colormap, mode: Mode, t: f64) -> Color32 {
     }
 }
 
+/// Steps in a ramp's lookup table, per unit of `t`.
+///
+/// Fine enough that a tabulated colour is within one 8-bit level of the exact one
+/// everywhere. 1024 was not: the diverging map's warm arm turns steeply near its pole,
+/// and there a tabulated colour came out two levels off.
+const LUT_STEPS: usize = 4096;
+
+/// [`sample`], from a table computed once per map and mode.
+///
+/// Per pixel, [`sample`] interpolates in OKLab and converts back to sRGB, three `powf`
+/// calls a pixel — measured at 45 ms for one 256×128 field, which held the viewer to a
+/// few frames a second on a model with several channels. The table makes it an index.
+/// `t = 0` and the ends land exactly on table entries computed by [`sample`], so the
+/// neutral midpoint of a diverging map is the same colour either way.
+pub fn sample_fast(map: Colormap, mode: Mode, t: f64) -> Color32 {
+    static TABLES: [OnceLock<Vec<Color32>>; 4] = [const { OnceLock::new() }; 4];
+    let slot = match (map, mode) {
+        (Colormap::Sequential, Mode::Light) => 0,
+        (Colormap::Sequential, Mode::Dark) => 1,
+        (Colormap::Diverging, Mode::Light) => 2,
+        (Colormap::Diverging, Mode::Dark) => 3,
+    };
+    let table = TABLES[slot].get_or_init(|| match map {
+        Colormap::Sequential => (0..=LUT_STEPS).map(|k| sample(map, mode, k as f64 / LUT_STEPS as f64)).collect(),
+        Colormap::Diverging => {
+            (0..=2 * LUT_STEPS).map(|k| sample(map, mode, k as f64 / LUT_STEPS as f64 - 1.0)).collect()
+        }
+    });
+    if t.is_nan() {
+        return table[0];
+    }
+    let index = match map {
+        Colormap::Sequential => (t.clamp(0.0, 1.0) * LUT_STEPS as f64).round() as usize,
+        Colormap::Diverging => ((t.clamp(-1.0, 1.0) + 1.0) * LUT_STEPS as f64).round() as usize,
+    };
+    table[index]
+}
+
 /// One hue, light → dark. In dark mode the anchor flips so that the end meaning
 /// "near zero" is the one that recedes into the surface.
 fn sequential(mode: Mode, t: f64) -> Color32 {
@@ -236,6 +284,79 @@ fn diverging(mode: Mode, t: f64) -> Color32 {
     };
 
     from_oklab(lerp_oklab(midpoint, arm, magnitude))
+}
+
+/// Lightness and chroma of the phase wheel: the largest chroma at this lightness that
+/// every hue reaches inside sRGB, so no part of the wheel is clipped into a different
+/// colour from its neighbours.
+const WHEEL_LIGHTNESS: f64 = 0.70;
+const WHEEL_CHROMA: f64 = 0.10;
+
+/// The phase wheel at angle `theta`, radians: fixed OKLab lightness and chroma, hue
+/// equal to the angle. `0` sits on red, and increasing angle runs through yellow,
+/// green and blue.
+pub fn phase_wheel(theta: f64) -> Color32 {
+    from_oklab(wheel(theta))
+}
+
+fn wheel(theta: f64) -> Oklab {
+    // OKLab's a axis points at red-magenta; offsetting by its hue puts 0 on red.
+    let hue = theta + 0.5;
+    Oklab { l: WHEEL_LIGHTNESS, a: WHEEL_CHROMA * hue.cos(), b: WHEEL_CHROMA * hue.sin() }
+}
+
+/// The phase wheel at `theta`, faded toward `background` as `strength` falls from 1 to
+/// 0. Mixed in OKLab, so a half-strength colour is perceptually half way.
+///
+/// For drawing an angle that belongs to a magnitude: where the magnitude vanishes the
+/// angle is round-off, and it should recede into the surface rather than be painted at
+/// full strength beside the angles that mean something.
+pub fn phase_wheel_over(theta: f64, strength: f64, background: Color32) -> Color32 {
+    from_oklab(lerp_oklab(to_oklab(background), wheel(theta), strength.clamp(0.0, 1.0)))
+}
+
+/// Hues and strengths in [`PhaseTable`].
+const WHEEL_HUES: usize = 256;
+const WHEEL_STRENGTHS: usize = 128;
+
+/// [`phase_wheel_over`] for one background, tabulated: 256 hues by 128 strengths.
+///
+/// Adjacent hues are 1.4° apart and adjacent strengths 1/127 of the way to full, both
+/// under one 8-bit level of the output, so the picture is the same and a frame costs
+/// an index per pixel instead of an OKLab round trip.
+#[derive(Debug)]
+pub struct PhaseTable {
+    background: Color32,
+    colors: Vec<Color32>,
+}
+
+impl PhaseTable {
+    /// The table for `background`.
+    pub fn new(background: Color32) -> Self {
+        let colors = (0..WHEEL_STRENGTHS)
+            .flat_map(|s| {
+                let strength = s as f64 / (WHEEL_STRENGTHS - 1) as f64;
+                (0..WHEEL_HUES).map(move |h| {
+                    let theta = core::f64::consts::TAU * h as f64 / WHEEL_HUES as f64 - core::f64::consts::PI;
+                    phase_wheel_over(theta, strength, background)
+                })
+            })
+            .collect();
+        Self { background, colors }
+    }
+
+    /// The background the table fades toward.
+    pub fn background(&self) -> Color32 {
+        self.background
+    }
+
+    /// The colour of angle `theta` at `strength` ∈ [0, 1].
+    pub fn get(&self, theta: f64, strength: f64) -> Color32 {
+        let turn = (theta + core::f64::consts::PI) / core::f64::consts::TAU;
+        let hue = ((turn * WHEEL_HUES as f64).round() as i64).rem_euclid(WHEEL_HUES as i64) as usize;
+        let level = (strength.clamp(0.0, 1.0) * (WHEEL_STRENGTHS - 1) as f64).round() as usize;
+        self.colors[level * WHEEL_HUES + hue]
+    }
 }
 
 /// Sample a ramp of hex steps at `t` ∈ [0,1], interpolating in OKLab.
@@ -440,6 +561,75 @@ mod tests {
                     lightness(diverging(Mode::Light, signed)) < middle,
                     "t = {signed} should be darker than the neutral midpoint"
                 );
+            }
+        }
+    }
+
+    /// The wheel has no ends: −π and π are the same colour, and stepping across the
+    /// wrap is no bigger a change than any other step of the same size.
+    #[test]
+    fn the_phase_wheel_is_continuous_across_the_wrap() {
+        use core::f64::consts::PI;
+        assert_eq!(phase_wheel(-PI), phase_wheel(PI));
+        let distance = |a: Color32, b: Color32| {
+            let (a, b) = (to_oklab(a), to_oklab(b));
+            ((a.l - b.l).powi(2) + (a.a - b.a).powi(2) + (a.b - b.b).powi(2)).sqrt()
+        };
+        let step = 2.0 * PI / 64.0;
+        let steps: Vec<f64> =
+            (0..64).map(|k| distance(phase_wheel(-PI + k as f64 * step), phase_wheel(-PI + (k + 1) as f64 * step))).collect();
+        let (low, high) = steps.iter().fold((f64::MAX, 0.0f64), |(lo, hi), d| (lo.min(*d), hi.max(*d)));
+        // Equal angles, equal colour differences, to the 8-bit rounding of the output.
+        assert!(high - low < 0.006, "steps range {low} to {high}");
+    }
+
+    /// Fixed lightness, so no angle reads as "more" than another, and every hue inside
+    /// sRGB, so none is clipped into a neighbour's colour.
+    #[test]
+    fn the_phase_wheel_holds_its_lightness_and_stays_in_gamut() {
+        for k in 0..360 {
+            let theta = f64::from(k).to_radians();
+            let drawn = to_oklab(phase_wheel(theta));
+            assert!((drawn.l - WHEEL_LIGHTNESS).abs() < 0.01, "{k}°: lightness {}", drawn.l);
+            // An out-of-gamut colour is clamped channel by channel, which moves its
+            // chroma; one that survives the round trip with its chroma was in gamut.
+            assert!((drawn.chroma() - WHEEL_CHROMA).abs() < 0.01, "{k}°: chroma {}", drawn.chroma());
+        }
+    }
+
+    #[test]
+    fn a_faded_phase_recedes_into_the_background() {
+        let surface = Palette::for_mode(Mode::Dark).plane;
+        assert_eq!(phase_wheel_over(1.0, 0.0, surface), from_oklab(to_oklab(surface)));
+        assert_eq!(phase_wheel_over(1.0, 1.0, surface), phase_wheel(1.0));
+    }
+
+    /// The tables stand in for the exact maps: within one 8-bit level everywhere, and
+    /// exact at the points a test or a reader would check — the ends and the midpoint.
+    #[test]
+    fn the_lookup_tables_match_the_exact_maps() {
+        for mode in [Mode::Light, Mode::Dark] {
+            for (map, low) in [(Colormap::Sequential, 0.0), (Colormap::Diverging, -1.0)] {
+                for k in 0..=1000 {
+                    let t = low + (1.0 - low) * f64::from(k) / 1000.0;
+                    let (fast, exact) = (sample_fast(map, mode, t), sample(map, mode, t));
+                    for (a, b) in [(fast.r(), exact.r()), (fast.g(), exact.g()), (fast.b(), exact.b())] {
+                        assert!(a.abs_diff(b) <= 1, "{map:?} {mode:?} at {t}: {fast:?} vs {exact:?}");
+                    }
+                }
+                assert_eq!(sample_fast(map, mode, 1.0), sample(map, mode, 1.0));
+                assert_eq!(sample_fast(map, mode, low), sample(map, mode, low));
+            }
+            assert_eq!(sample_fast(Colormap::Diverging, mode, 0.0), sample(Colormap::Diverging, mode, 0.0));
+        }
+        let table = PhaseTable::new(Palette::for_mode(Mode::Dark).plane);
+        for k in 0..=720 {
+            let theta = -core::f64::consts::PI + f64::from(k) * core::f64::consts::TAU / 720.0;
+            for strength in [0.0, 0.3, 1.0] {
+                let (fast, exact) = (table.get(theta, strength), phase_wheel_over(theta, strength, table.background()));
+                for (a, b) in [(fast.r(), exact.r()), (fast.g(), exact.g()), (fast.b(), exact.b())] {
+                    assert!(a.abs_diff(b) <= 2, "{theta} at {strength}: {fast:?} vs {exact:?}");
+                }
             }
         }
     }

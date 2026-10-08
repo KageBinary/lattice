@@ -62,8 +62,8 @@
 //! # Molecular dynamics
 //!
 //! Spec §12.4's module is the same domain with more attached: [`HarmonicBond`] and
-//! [`HarmonicAngle`] act on declared topology, [`SoftRepulsion`] and a force-shifted
-//! [`LennardJones`] join the pair laws, a [`Thermostat`] couples the system to a
+//! [`HarmonicAngle`] act on declared topology, [`SoftRepulsion`], a force-shifted
+//! [`LennardJones`] and a damped shifted force [`Coulomb`] join the pair laws, a [`Thermostat`] couples the system to a
 //! temperature, and [`analysis`] measures temperature, pressure, the radial
 //! distribution function and mean squared displacement. Every configuration publishes
 //! its own contract, so a thermostatted run says what it gave up to hold its
@@ -71,6 +71,7 @@
 
 pub mod analysis;
 mod bonded;
+mod coulomb;
 mod domain;
 mod forces;
 mod image;
@@ -80,6 +81,7 @@ mod thermostat;
 mod verlet;
 
 pub use bonded::{Angle, Bond, HarmonicAngle, HarmonicBond};
+pub use coulomb::{erfc, Coulomb};
 pub use domain::{BoundaryBox, ParticleBoundary, ParticleDomain, RdfRequest};
 pub use forces::{
     ForceContext, ForceLaw, HarmonicWell, LennardJones, LinearDrag, SoftRepulsion, Truncation,

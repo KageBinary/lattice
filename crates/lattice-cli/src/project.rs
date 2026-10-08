@@ -297,6 +297,32 @@ fn render_channel(channel: &RenderChannel<'_>) -> String {
         RenderChannel::Scalar { field, .. } => {
             out.push_str(&render::heatmap(field, 72, 20));
         }
+        RenderChannel::Phase { .. } => {
+            // A character ramp has two ends, and an angle does not: drawn on one, a phase
+            // shows a hard edge at every wrap, and box-averaging cells across a wrap gives
+            // an angle that is in neither. `lattice-view` draws it on a cyclic wheel.
+            out.push_str("  an angle — drawn by `lattice-view` on a phase wheel, not on a two-ended ramp\n");
+        }
+        RenderChannel::Vector { x, y, grid, unit, .. } => {
+            // The terminal shows the magnitude; the arrows are `lattice-view`'s.
+            let mut magnitude = lattice_ir::ScalarField::new(grid, 0);
+            let mut net = [0.0, 0.0];
+            for j in 0..grid.ny() {
+                for i in 0..grid.nx() {
+                    let (vx, vy) = (x.get(i, j), y.get(i, j));
+                    magnitude.set(i, j, vx.hypot(vy));
+                    net[0] += vx * grid.cell_area();
+                    net[1] += vy * grid.cell_area();
+                }
+            }
+            out.push_str(&render::heatmap(&magnitude, 72, 20));
+            out.push_str(&format!(
+                "  magnitude shown; largest {:.3e} {unit}, integral over the grid ({:.3e}, {:.3e}) {unit}·m^2\n",
+                magnitude.max_interior(),
+                net[0],
+                net[1]
+            ));
+        }
         RenderChannel::Particles { x, y, origin, extent, .. } => {
             out.push_str(&render::scatter(x, y, *origin, *extent, 72, 20, "particles"));
         }
