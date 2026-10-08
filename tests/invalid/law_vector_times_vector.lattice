@@ -1,0 +1,11 @@
+// expect: E0410
+// Two vectors have no single product: the dot product is a scalar and the cross
+// product, in the plane, a scalar of a different meaning. A law says which.
+
+project law_vector_times_vector {
+  dimensions: 2;
+
+  force f(a: particle) -> vec2<newton> {
+    return a.position * a.velocity * 1 kilogram / second^2;
+  }
+}

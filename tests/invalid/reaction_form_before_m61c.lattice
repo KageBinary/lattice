@@ -1,0 +1,23 @@
+// expect: E0900
+// Spec 8.3 writes a reaction with `stoichiometry:` and a rate law that reads
+// concentrations. That form is milestone M6.1c; until then the reaction says so,
+// rather than calling `stoichiometry` an unknown setting or `c(...)` an unknown call.
+
+project reaction_form_before_m61c {
+  dimensions: 2;
+  duration: 1 second;
+  let k = 1.4e11 meter^2 / (mole second);
+
+  grid cell { size: [4, 4]; extent: [1 meter, 1 meter]; }
+  species H_plus on cell = 1 mole / meter^2 { diffusivity: 0 meter^2 / second; }
+  species OH_minus on cell = 1 mole / meter^2 { diffusivity: 0 meter^2 / second; }
+  species H2O on cell = 0 mole / meter^2 { diffusivity: 0 meter^2 / second; }
+  domain chemistry water { grid: cell; }
+
+  reaction neutralization {
+    stoichiometry: H_plus + OH_minus -> H2O;
+    rate: k * c(H_plus) * c(OH_minus);
+  }
+
+  solve reactions(water) with strang(dt=0.01 second);
+}

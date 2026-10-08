@@ -61,6 +61,7 @@ pub mod builtins;
 pub mod chemistry;
 pub mod compile;
 pub mod eval;
+pub mod laws;
 pub mod molecular;
 pub mod quantum;
 pub mod rigid;
@@ -660,5 +661,74 @@ project orbit {
         let mut observations = lattice_ir::Observations::new();
         compiled.domains[0].observe(&mut observations);
         assert!(observations.first_non_finite().is_none());
+    }
+
+    // --- `let` constants and law names, end to end -------------------------------
+
+    /// A constant is usable in any setting, wherever the setting is written, and only
+    /// the constants above it in another `let`.
+    #[test]
+    fn constants_reach_every_setting() {
+        // Both settings come before the constants they read.
+        let compiled = ok(&SLAB.replace(
+            "duration: 20 second;",
+            "duration: run_for; timestep: step; let run_for = 20 second; let step = run_for / 400;",
+        ));
+        assert_eq!(compiled.model.duration, Some(20.0));
+        assert_eq!(compiled.model.timestep, Some(0.05));
+    }
+
+    #[test]
+    fn a_constant_uses_only_the_ones_above_it() {
+        let (_, codes) = err("project p { let a = b; let b = 1 meter; }");
+        assert_eq!(codes, ["E0200"], "`b` is not defined yet where `a` reads it");
+    }
+
+    #[test]
+    fn constants_are_declared_once_and_a_unit_shadow_is_warned_about() {
+        let (_, codes) = err("project p { let k = 1; let k = 2; }");
+        assert_eq!(codes, ["E0201"]);
+        let (_, diagnostics, _) = build("project p { let m = 2 kilogram; }");
+        assert_eq!(diagnostics.codes(), ["W0313"]);
+    }
+
+    #[test]
+    fn a_law_cannot_take_a_built_in_force_name() {
+        let (_, codes) = err("project p { force drag(a: particle) -> vec2<newton> { return vec2(0 newton, 0 newton); } }");
+        assert!(codes.contains(&"E0201".to_string()), "{codes:?}");
+    }
+
+    /// The use site names the law and its milestone, rather than calling it an unknown
+    /// force: the fixture cannot tell this E0900 from the declaration's, so this does.
+    #[test]
+    fn a_law_used_by_name_says_when_it_can_run() {
+        let (text, _) = err("project p {
+            force push(a: particle) -> vec2<newton> { return vec2(1 newton, 0 newton); }
+            particles s { count: 1; mass: 1 kilogram; force: push(); }
+        }");
+        assert!(text.contains("`push` is a user-defined law, and using one is not implemented yet"), "{text}");
+        assert!(!text.contains("E0210"), "not reported as an unknown force:\n{text}");
+    }
+
+    /// A rate that reads `temperature` is the state — unless `temperature` is a constant.
+    #[test]
+    fn a_constant_named_temperature_is_not_the_state() {
+        let mixture = |extra: &str, rate: &str| {
+            format!(
+                "project p {{
+                   {extra}
+                   grid g {{ size: [4, 4]; extent: [1 meter, 1 meter]; }}
+                   species A on g = 1 mole / meter^2 {{ diffusivity: 0 meter^2 / second; }}
+                   species B on g = 0 mole / meter^2 {{ diffusivity: 0 meter^2 / second; }}
+                   domain chemistry mix {{ grid: g; }}
+                   reaction r {{ reactants: A; products: B; rate: {rate}; }}
+                   solve reactions(mix) with strang(dt=0.1 second);
+                   duration: 1 second;
+                 }}"
+            )
+        };
+        let (_, codes) = err(&mixture("", "temperature / (300 kelvin second)"));
+        assert!(codes.contains(&"E0900".to_string()), "{codes:?}");
+        ok(&mixture("let temperature = 300 kelvin;", "temperature / (300 kelvin second)"));
     }
 }

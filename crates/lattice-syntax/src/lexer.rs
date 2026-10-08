@@ -63,6 +63,14 @@ pub enum Keyword {
     True,
     /// `false`
     False,
+    /// `let`, which names a value: a model constant, or a step inside a law.
+    Let,
+    /// `return`, which ends a law with its value.
+    Return,
+    /// `if`, which chooses between two values.
+    If,
+    /// `else`
+    Else,
 }
 
 impl Keyword {
@@ -84,6 +92,10 @@ impl Keyword {
         Keyword::Conserve,
         Keyword::True,
         Keyword::False,
+        Keyword::Let,
+        Keyword::Return,
+        Keyword::If,
+        Keyword::Else,
     ];
 
     /// The spelling.
@@ -105,6 +117,10 @@ impl Keyword {
             Keyword::Conserve => "conserve",
             Keyword::True => "true",
             Keyword::False => "false",
+            Keyword::Let => "let",
+            Keyword::Return => "return",
+            Keyword::If => "if",
+            Keyword::Else => "else",
         }
     }
 
@@ -162,6 +178,24 @@ pub enum TokenKind {
     Slash,
     /// `^`
     Caret,
+    /// `<`, also the opening bracket of `vec2<newton>`.
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`, also the closing bracket of `vec2<newton>`.
+    Gt,
+    /// `>=`
+    Ge,
+    /// `==`
+    EqEq,
+    /// `!=`
+    NotEq,
+    /// `&&`
+    AndAnd,
+    /// `||`
+    OrOr,
+    /// `!`
+    Bang,
     /// End of input.
     Eof,
 }
@@ -199,6 +233,15 @@ impl TokenKind {
             TokenKind::Star => "*",
             TokenKind::Slash => "/",
             TokenKind::Caret => "^",
+            TokenKind::Lt => "<",
+            TokenKind::Le => "<=",
+            TokenKind::Gt => ">",
+            TokenKind::Ge => ">=",
+            TokenKind::EqEq => "==",
+            TokenKind::NotEq => "!=",
+            TokenKind::AndAnd => "&&",
+            TokenKind::OrOr => "||",
+            TokenKind::Bang => "!",
             _ => "",
         }
     }
@@ -243,7 +286,6 @@ fn is_ident_continue(c: char) -> bool {
 /// lexical error instead of one per compile.
 pub fn tokenize(file: &SourceFile) -> (Vec<Token>, Diagnostics) {
     let text = file.text();
-    let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut diagnostics = Diagnostics::new();
     let mut i = 0usize;
@@ -361,9 +403,17 @@ pub fn tokenize(file: &SourceFile) -> (Vec<Token>, Diagnostics) {
         }
 
         // Punctuation.
-        let two = if bytes.len() >= i + 2 { &text[i..i + 2] } else { "" };
+        // `get`, not indexing: two bytes past a multi-byte character such as `⋅` or
+        // `≤` land inside it, and slicing there would panic instead of lexing.
+        let two = text.get(i..i + 2).unwrap_or("");
         let (kind, width) = match two {
             "->" => (TokenKind::Arrow, 2),
+            "<=" => (TokenKind::Le, 2),
+            ">=" => (TokenKind::Ge, 2),
+            "==" => (TokenKind::EqEq, 2),
+            "!=" => (TokenKind::NotEq, 2),
+            "&&" => (TokenKind::AndAnd, 2),
+            "||" => (TokenKind::OrOr, 2),
             _ => {
                 let single = match c {
                     '{' => TokenKind::LBrace,
@@ -384,6 +434,9 @@ pub fn tokenize(file: &SourceFile) -> (Vec<Token>, Diagnostics) {
                     '*' | '\u{b7}' | '\u{22c5}' => TokenKind::Star,
                     '/' => TokenKind::Slash,
                     '^' => TokenKind::Caret,
+                    '<' => TokenKind::Lt,
+                    '>' => TokenKind::Gt,
+                    '!' => TokenKind::Bang,
                     other => {
                         diagnostics.push(
                             Diagnostic::error(format!("unexpected character `{other}`"))
@@ -511,6 +564,35 @@ mod tests {
         assert_eq!(k, expected);
     }
 
+    #[test]
+    fn comparison_and_logic_operators_lex() {
+        let k = kinds("< <= > >= == != && || !");
+        let expected = [
+            TokenKind::Lt,
+            TokenKind::Le,
+            TokenKind::Gt,
+            TokenKind::Ge,
+            TokenKind::EqEq,
+            TokenKind::NotEq,
+            TokenKind::AndAnd,
+            TokenKind::OrOr,
+            TokenKind::Bang,
+            TokenKind::Eof,
+        ];
+        assert_eq!(k, expected);
+        // Two-character operators win over their one-character prefixes, and `=` alone
+        // is still the argument binder.
+        assert_eq!(kinds("a<=b")[1], TokenKind::Le);
+        assert_eq!(kinds("dt=1")[1], TokenKind::Equals);
+    }
+
+    /// `vec2<newton>` is three tokens; the parser, not the lexer, decides that the
+    /// angle brackets enclose a unit rather than compare anything.
+    #[test]
+    fn a_vector_type_lexes_as_brackets() {
+        assert_eq!(kinds("vec2<newton>"), [TokenKind::Ident, TokenKind::Lt, TokenKind::Ident, TokenKind::Gt, TokenKind::Eof]);
+    }
+
     /// `->` must not lex as `-` followed by `>`, or every coupling statement breaks.
     #[test]
     fn the_arrow_beats_a_bare_minus() {
@@ -569,6 +651,17 @@ mod tests {
             let k = kinds(source);
             assert_eq!(k[0], TokenKind::Ident, "{source} should be an identifier");
             assert_eq!(k[1], TokenKind::Eof, "{source} should be one token");
+        }
+    }
+
+    /// A multi-byte character is lexed or reported, never a panic: `⋅` is three bytes,
+    /// and looking two bytes ahead from it once sliced through the middle of it.
+    #[test]
+    fn multi_byte_characters_never_panic() {
+        assert_eq!(kinds("2\u{22c5}3")[1], TokenKind::Star);
+        for source in ["a \u{2264} b", "a \u{2212} b", "a \u{2192} b", "\u{2264}"] {
+            let (_, diagnostics) = lex(source);
+            assert_eq!(diagnostics.codes(), ["E0001"], "{source}");
         }
     }
 

@@ -605,7 +605,7 @@ The four items M5 closed without, each now built and validated:
 | Measurement-inspired sampling (§13.1) | `Wavefunction::sample_positions` (the Born rule, Rust API only) and a detector's `clicks=` — single arrivals drawn from the forward current through the screen, binomially thinned so the total over a run is right | 40 000 Born samples against the density, χ²/dof 0.92; 200 000 fired particles' clicks against the forward current, χ²/dof 1.26, 21 046 detected against 21 053 expected |
 | The probability current as a picture (§17.1) | a `probability_current` render channel: magnitude, with arrows averaged over blocks so a downsampled view cannot miss a strong cell | the drawn current integrates to the lattice's `⟨p⟩/m` — its central difference, 5.8% below the continuum value on that grid, against `(k₀Δx)²/6 = 5.9%` predicted |
 | A phase wheel and curves in the window (§17.1) | phase on a wheel of fixed OKLab lightness and chroma, faded by the amplitude, with the wheel as its legend; `lattice-view` plots curves, and a detector's exact pattern shares axes with its clicks | — |
-| Speed (§15.6) | both FFT passes and both transposes split into row bands across the worker pool; `lattice bench quantum-split-step` times the §15.6 grid against a norm check | bit-identical wavefunctions on 1, 2, 3 and 8 threads (`quantum_split_step_matches_across_thread_counts`), on a Bluestein grid in both directions |
+| Speed (§15.6) | both FFT passes and both transposes split into row bands across the worker pool; `lattice bench quantum-split-step` times the §15.6 grid against a norm check | bit-identical wavefunctions on 1, 2, 3 and 8 threads (`quantum_split_step_matches_across_thread_counts`), on a Bluestein grid in both directions; 5.6× at 512² on 20 threads, 1.67 ms a step |
 
 In the language: `charge:`, `force: coulomb(…)`, `clicks=` and `seed=` on a detector, and
 `visualize probability_current`, with two new warnings for charges that do not suit a
@@ -646,9 +646,11 @@ electrons at its screen. Six validation cases; 69 in all, and 1198 tests.
 - **Collapse.** A screen samples the flux and lets the wavefunction carry on, so the
   arrivals' statistics are right and whatever happens afterwards is one undisturbed
   particle's. Born sampling is reachable from Rust, not from the language.
-- **A GPU quantum path**, and a fresh 512² timing. The old single-thread figure was
-  12 ms a step; the parallel figure belongs in [execution.md](execution.md)'s table once
-  it is measured on an idle machine.
+- **A GPU quantum path.** On the worker pool a 512² step is 1.67 ms, about 600 a second,
+  against 9.28 ms on one thread (median of three, idle machine; the earlier 12 ms figure
+  predates M5.3's FFT changes and was not taken under the same conditions). That
+  clears §15.6's "interactive/near-interactive" on the CPU; the device would matter for
+  grids past 1024². The figures are in [execution.md](execution.md)'s table.
 
 ### Where M5.3 started (historical)
 
@@ -676,6 +678,88 @@ electrons at its screen. Six validation cases; 69 in all, and 1198 tests.
 - **Coulomb with a declared cutoff** is the one §12.4 potential not built. A plain cutoff
   on `1/r` is a poor approximation the contract would have to say a great deal about;
   doing it properly is Ewald-shaped work.
+
+## M6 — Extensibility (in progress)
+
+**Spec exit condition:** *"external user can author custom law and observer."* Four
+parts: the expression compiler of §8.3, batch sweeps, a Python API, and a plugin SDK
+(§16.3). The expression compiler comes first because it *is* the custom law, and the
+rest build on its parameter surface.
+
+| Stage | Result | State |
+|---|---|---|
+| M6.1a | the law grammar, `let` constants, and a type and unit checker | ✅ |
+| M6.1b | a std-only `lattice-expr` crate: a scalar interpreter, user `force`/`potential` in the particle domain, derived forces and per-law contracts | next |
+| M6.1c | §8.3's reaction form: `stoichiometry`, `heat_release`, rate laws reading concentrations and temperature | |
+| M6.1d | a batched interpreter bit-identical to the scalar one, non-finite tracing to source, `lattice inspect expr` | |
+| M6.2 | `observer` laws and the Rust observer SDK — the exit condition's "and observer" | |
+| M6.3 | WGSL lowering, with a budget derived per expression as M4.2 did per kernel | |
+| M6.4 | batch sweeps over `let` constants and `param` bindings, re-bound without recompiling | |
+| M6.5 | the Python API (pyo3), whose `Sweep` is §25.3's | |
+
+### M6.1a — Laws, typed ✅
+
+Spec §8.3's two examples parse character for character. A project can now hold:
+
+- **Laws:** `force` and `potential` declarations, with a header of particles, a
+  declared return type (`vec2<newton>`, `joule`), and a body of `let`, `param` and
+  `return`. There is no assignment and no loop, and `if` is an expression with both
+  arms, so a law is one value computed on every path.
+- **Constants:** `let` at the top level. Constants are evaluated first, so any setting
+  may use any of them; among themselves, each sees only those above it.
+
+The checker in `crates/lattice-compiler/src/laws.rs`:
+- gives every sub-expression a type (a scalar or `vec2` of a dimension, a truth value,
+  or a particle);
+- folds every unit into an SI constant;
+- reports at the sub-expression that went wrong, with ten new codes. The nine errors
+  (`E0111`–`E0113`, `E0410`–`E0415`) have a fixture each. The warning `W0313` cannot be
+  a fixture, which must be rejected, so it has unit tests instead.
+
+The kinds differ in what they may read, and that is the point. A pair `potential` sees
+its particles only through `distance(a, b)`, so the force it implies is central:
+momentum and angular momentum are conserved by construction. Energy is conserved only
+where the potential is continuous, because `if`, `abs`, `min` and `max` can make it
+jump, and M6.1b's contracts will say so. A `force` may read velocities and is promised
+nothing about energy.
+
+A law that checks still ends in `E0900` naming M6.1b, and so does a use site such as
+`force: spring(…)`. §8.3's reaction form names M6.1c, an `observer` law M6.2, and a
+law named like a built-in force is refused. Each has a fixture.
+
+1,235 tests, 45 invalid fixtures, 69 validation cases unchanged.
+
+### What M6.1a taught us
+
+- **A "not implemented" table is a claim, and it was false.** language.md said §8.3's
+  constructs produced `E09xx`. They produced `E0001`, an "unexpected character `<`".
+  The lexer had never seen `vec2<newton>`. No fixture covered it, so nothing noticed.
+  Each planned construct now has a fixture that asserts the milestone error: the law,
+  its use site, the reaction form, and `observer`.
+- **Reviewers who did not write the code found what the author could not.** Two
+  independent reviews of this change saw only the diff. They found:
+  - **A pre-existing crash:** the lexer sliced two bytes past a three-byte `⋅`
+    (documented as multiplication) and panicked. Law syntax invites `≤` and `−`.
+  - **An overclaim:** "energy conserved by construction" for potentials that are
+    allowed to jump.
+  - **Two silent paths:** a law whose `param` failed was still reported as checking,
+    and a law named `drag` silently took `force: drag(…)` from the built-in.
+  - **Doc claims ahead of the code,** including this section's first draft, which
+    counted "nine codes, one fixture each" when there were ten, and one had no fixture.
+
+  All of these are fixed and tested.
+- **The observation disagreed with the contract.** A particle scene with drag
+  published its total energy as an *invariant*, so the panel showed a conservation
+  failure every step, while the contract correctly said energy was not conserved. A
+  user force will often be dissipative, so this had to be fixed before one could run.
+  Total energy is now an invariant only without a thermostat or a non-conservative
+  force. An open boundary deletes nothing and keeps the invariant. That is narrower
+  than `is_energy_conserving`, which also gives up on open boundaries, and a test pins
+  the difference.
+- **Adjacency meets call syntax.** `4 epsilon (s − 1)` multiplies by adjacency up to
+  `epsilon` and then reads `epsilon(…)` as a call. The grammar already worked this way
+  for `f(x)`, and changing it would break call syntax. The checker now names the case
+  and gives the fix: "`epsilon` is a value, not a function; write `epsilon * (…)`".
 
 ## Outside the milestones: the playground
 
@@ -708,7 +792,7 @@ Three engine bugs came out of building it, which is the argument for having buil
 
 | Milestone | Result | Blocked on |
 |---|---|---|
-| M6 — Extensibility | expression compiler (§8.3), Python API, plugin SDK | M1, done |
+| M6 — Extensibility | expression compiler (§8.3), Python API, plugin SDK — in progress, above | M1, done |
 | M7 — Productization | packages, report export, reproducibility artifacts | M3, done |
 | M8 — External solvers | quantum/FMI adapters with provenance | M7 |
 

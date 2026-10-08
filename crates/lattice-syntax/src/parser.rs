@@ -4,27 +4,44 @@
 //!
 //! ```text
 //! project  := 'project' IDENT '{' item* '}'
-//! item     := setting | grid | field | species | block | domain
+//! item     := setting | grid | field | species | block | domain | law | let
 //!           | solve | couple | observe | visualize
-//! setting  := IDENT ':' expr ';'
+//! setting  := IDENT ':' expr ('->' expr)? ';'           -- `->` for stoichiometry
 //! grid     := 'grid' IDENT '{' setting* '}'
 //! field    := ('field' | 'species') IDENT ('on' IDENT)? ('=' expr)? (';' | '{' setting* '}')
 //! block    := ('reaction' | 'material' | 'potential' | 'particles') IDENT '{' setting* '}'
 //! domain   := 'domain' IDENT IDENT '{' setting* '}'
+//! law      := IDENT IDENT '(' (IDENT ':' type),* ')' ('->' type)? '{' stmt* '}'
+//! stmt     := 'let' IDENT '=' expr ';' | 'param' IDENT ':' type ('=' expr)? ';'
+//!           | 'return' expr ';'
+//! type     := 'vec2' '<' add '>' | add
+//! let      := 'let' IDENT '=' expr ';'
 //! solve    := 'solve' IDENT '(' args ')' 'with' IDENT '(' args ')' ';'
 //! couple   := 'couple' path '->' path ('conserve' IDENT)? ';'
 //! observe  := 'observe' expr ('every' expr)? ';'
 //! visualize:= 'visualize' expr 'as' IDENT ';'
 //!
-//! expr     := add
+//! expr     := or
+//! or       := and ('||' and)*
+//! and      := cmp ('&&' cmp)*
+//! cmp      := add (('<' | '<=' | '>' | '>=' | '==' | '!=') add)?   -- never chained
 //! add      := mul (('+' | '-') mul)*
 //! mul      := unary (('*' | '/') unary | IDENT)*        -- adjacency is multiplication
-//! unary    := ('-' | '+')* power
+//! unary    := ('-' | '+' | '!')* power
 //! power    := postfix ('^' SIGNED_INT)?
 //! postfix  := primary ('.' IDENT | '(' args ')')*
-//! primary  := NUMBER | STRING | 'true' | 'false' | IDENT
+//! primary  := NUMBER | STRING | 'true' | 'false' | IDENT | if
 //!           | '(' expr (',' expr)* ')' | '[' (expr (',' expr)*)? ']'
+//! if       := 'if' expr '{' expr '}' 'else' (if | '{' expr '}')
 //! ```
+//!
+//! # Laws are values, not programs
+//!
+//! A law body is a sequence of `let` bindings ending in a `return` — spec §8.3's
+//! *"restricted, typed, side-effect-free language"*. There is no assignment, no loop,
+//! and `if` is an expression with both arms required, so every law computes exactly one
+//! value on every path. The parser accepts any statement order; the compiler checks
+//! that the body ends in its `return`.
 //!
 //! # Adjacency is multiplication
 //!
@@ -259,6 +276,14 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Couple) => Ok(Item::Couple(self.parse_couple()?)),
             TokenKind::Keyword(Keyword::Observe) => Ok(Item::Observe(self.parse_observe()?)),
             TokenKind::Keyword(Keyword::Visualize) => Ok(Item::Visualize(self.parse_visualize()?)),
+            TokenKind::Keyword(Keyword::Let) => Ok(Item::Let(self.parse_let_item()?)),
+            // `<kind> <name>(…) -> type { … }` — a user-defined law. The `(` after the
+            // name is what tells it from a block declaration.
+            TokenKind::Ident
+                if self.peek_at(1).kind == TokenKind::Ident && self.peek_at(2).kind == TokenKind::LParen =>
+            {
+                Ok(Item::Law(self.parse_law()?))
+            }
             // `<kind> <name> …` — grid, reaction, potential, detector, and anything
             // a future solver family introduces. Which kinds are meaningful is the
             // compiler's question, not the grammar's.
@@ -275,8 +300,9 @@ impl<'a> Parser<'a> {
                 self.diagnostics.push(Diagnostic::new(
                     crate::diagnostic::Severity::Note,
                     "a project contains `name: value;` settings, `<kind> <name> { … }` \
-                     declarations, and the statements `field`, `species`, `domain`, \
-                     `solve`, `couple`, `observe`, `visualize`",
+                     declarations, `<kind> <name>(…) { … }` laws, `let` constants, and the \
+                     statements `field`, `species`, `domain`, `solve`, `couple`, `observe`, \
+                     `visualize`",
                 ));
                 Err(())
             }
@@ -305,7 +331,14 @@ impl<'a> Parser<'a> {
     fn parse_setting(&mut self) -> Result<Setting, ()> {
         let key = self.parse_setting_key()?;
         self.expect(TokenKind::Colon, "after a setting name")?;
-        let value = self.parse_expr()?;
+        let mut value = self.parse_expr()?;
+        // `reactants -> products`, at the lowest precedence and only as a whole value,
+        // so `->` keeps exactly one meaning wherever else it appears.
+        if self.eat(TokenKind::Arrow).is_some() {
+            let products = self.parse_expr()?;
+            let span = value.span.merge(products.span);
+            value = Expr::new(ExprKind::Yields(Box::new(value), Box::new(products)), span);
+        }
         let end = self.expect(TokenKind::Semicolon, "after a setting value")?;
         let span = key.span.merge(end.span);
         Ok(Setting { key, value, span })
@@ -357,6 +390,160 @@ impl<'a> Parser<'a> {
         };
         let end = self.expect(TokenKind::Semicolon, "to end the declaration")?;
         Ok(Decl { kind, name, modifier, arguments, settings: Vec::new(), span: start.merge(end.span) })
+    }
+
+    /// `let name = value;` at the top level of a project.
+    fn parse_let_item(&mut self) -> Result<LetDecl, ()> {
+        let start = self.advance().span;
+        let name = self.expect_ident("a name after `let`")?;
+        self.expect(TokenKind::Equals, "after the name in a `let`")?;
+        let value = self.parse_expr()?;
+        let end = self.expect(TokenKind::Semicolon, "to end the `let`")?;
+        Ok(LetDecl { name, value, span: start.merge(end.span) })
+    }
+
+    /// `<kind> <name>(<params>) -> <type> { <stmts> }`
+    fn parse_law(&mut self) -> Result<LawDecl, ()> {
+        let kind = self.expect_ident("a law kind")?;
+        let name = self.expect_ident("a law name")?;
+        self.expect(TokenKind::LParen, "to open the law's parameters")?;
+        let mut params = Vec::new();
+        while !self.check(TokenKind::RParen) {
+            let param_name = self.expect_ident("a parameter name")?;
+            self.expect(TokenKind::Colon, "after a parameter name")?;
+            let ty = self.parse_type()?;
+            let span = param_name.span.merge(ty.span);
+            params.push(LawParam { name: param_name, ty, span });
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "to close the law's parameters")?;
+        let returns = if self.eat(TokenKind::Arrow).is_some() { Some(self.parse_type()?) } else { None };
+
+        self.expect(TokenKind::LBrace, "to open the law's body")?;
+        // Where the body ends, found before parsing it: a statement that fails inside
+        // an `if` arm leaves the parser between braces, and only the matching brace
+        // says which `}` closes the law rather than the arm.
+        let close_at = self.matching_brace(self.pos - 1);
+        let mut body = Vec::new();
+        let mut recovered = false;
+        loop {
+            let at_close = close_at.map_or_else(|| self.check(TokenKind::RBrace), |end| self.pos >= end);
+            if at_close || self.at_end() {
+                break;
+            }
+            let start = self.pos;
+            match self.parse_stmt() {
+                Ok(stmt) => body.push(stmt),
+                Err(()) => {
+                    recovered = true;
+                    self.pos = start;
+                    self.skip_statement(close_at);
+                }
+            }
+        }
+        let close = self.expect(TokenKind::RBrace, "to close the law's body")?;
+        Ok(LawDecl { span: kind.span.merge(close.span), kind, name, params, returns, body, recovered })
+    }
+
+    /// The index of the `}` matching the `{` at `open`, if the braces balance.
+    fn matching_brace(&self, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (index, token) in self.tokens.iter().enumerate().skip(open) {
+            match token.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                TokenKind::Eof => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// From the start of a statement, skip past its `;`, counting braces from the
+    /// statement's own start so a `;` inside an `if` arm does not end it, and never
+    /// past the law's closing brace.
+    fn skip_statement(&mut self, close_at: Option<usize>) {
+        let mut depth = 0usize;
+        loop {
+            if close_at.is_some_and(|end| self.pos >= end) || self.at_end() {
+                return;
+            }
+            match self.peek().kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace if depth == 0 => return,
+                TokenKind::RBrace => depth -= 1,
+                TokenKind::Semicolon if depth == 0 => {
+                    self.advance();
+                    return;
+                }
+                _ => {}
+            }
+            self.advance();
+        }
+    }
+
+    fn parse_stmt(&mut self) -> Result<Stmt, ()> {
+        let token = self.peek();
+        let kind = match token.kind {
+            TokenKind::Keyword(Keyword::Let) => {
+                self.advance();
+                let name = self.expect_ident("a name after `let`")?;
+                self.expect(TokenKind::Equals, "after the name in a `let`")?;
+                StmtKind::Let { name, value: self.parse_expr()? }
+            }
+            TokenKind::Keyword(Keyword::Return) => {
+                self.advance();
+                StmtKind::Return(self.parse_expr()?)
+            }
+            // `param` is not reserved: it opens a statement only here, where nothing
+            // else could stand.
+            TokenKind::Ident if self.text(token.span) == "param" && self.peek_at(1).kind == TokenKind::Ident => {
+                self.advance();
+                let name = self.expect_ident("a parameter name")?;
+                self.expect(TokenKind::Colon, "after the parameter name; a `param` declares its unit")?;
+                let ty = self.parse_type()?;
+                let default = if self.eat(TokenKind::Equals).is_some() { Some(self.parse_expr()?) } else { None };
+                StmtKind::Param { name, ty, default }
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("expected `let`, `param` or `return`, found {}", token.kind.describe()))
+                        .with_code("E0112")
+                        .at(token.span, "not a statement")
+                        .note(
+                            "a law's body names values with `let`, declares what its use site binds \
+                             with `param`, and ends with `return`; there is no assignment and no loop",
+                        ),
+                );
+                return Err(());
+            }
+        };
+        let end = self.expect(TokenKind::Semicolon, "to end the statement")?;
+        Ok(Stmt { kind, span: token.span.merge(end.span) })
+    }
+
+    /// `vec2<unit>`, or a plain name or unit expression.
+    ///
+    /// The unit inside the brackets is parsed above the comparison level, so the `>`
+    /// that closes it is never read as a comparison.
+    fn parse_type(&mut self) -> Result<TypeExpr, ()> {
+        let token = self.peek();
+        if token.kind == TokenKind::Ident && self.text(token.span) == "vec2" && self.peek_at(1).kind == TokenKind::Lt {
+            self.advance();
+            self.advance();
+            let unit = self.parse_additive()?;
+            let close = self.expect(TokenKind::Gt, "to close `vec2<…>`")?;
+            return Ok(TypeExpr { kind: TypeKind::Vec2(unit), span: token.span.merge(close.span) });
+        }
+        let ty = self.parse_additive()?;
+        Ok(TypeExpr { span: ty.span, kind: TypeKind::Plain(ty) })
     }
 
     fn parse_field_decl(&mut self) -> Result<FieldDecl, ()> {
@@ -529,7 +716,93 @@ impl<'a> Parser<'a> {
 
     /// The entry point for expressions.
     pub(crate) fn parse_expr(&mut self) -> Result<Expr, ()> {
-        self.parse_additive()
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, ()> {
+        let mut left = self.parse_and()?;
+        while self.eat(TokenKind::OrOr).is_some() {
+            let right = self.parse_and()?;
+            let span = left.span.merge(right.span);
+            left = Expr::new(ExprKind::Binary(BinaryOp::Or, Box::new(left), Box::new(right)), span);
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, ()> {
+        let mut left = self.parse_comparison()?;
+        while self.eat(TokenKind::AndAnd).is_some() {
+            let right = self.parse_comparison()?;
+            let span = left.span.merge(right.span);
+            left = Expr::new(ExprKind::Binary(BinaryOp::And, Box::new(left), Box::new(right)), span);
+        }
+        Ok(left)
+    }
+
+    fn comparison_op(kind: TokenKind) -> Option<BinaryOp> {
+        Some(match kind {
+            TokenKind::Lt => BinaryOp::Lt,
+            TokenKind::Le => BinaryOp::Le,
+            TokenKind::Gt => BinaryOp::Gt,
+            TokenKind::Ge => BinaryOp::Ge,
+            TokenKind::EqEq => BinaryOp::Eq,
+            TokenKind::NotEq => BinaryOp::Ne,
+            _ => return None,
+        })
+    }
+
+    /// One comparison at most. `a < b < c` reads as a range in mathematics and as
+    /// `(a < b) < c` — a truth value compared with a quantity — in every grammar that
+    /// allows it, so it is refused rather than given either meaning.
+    fn parse_comparison(&mut self) -> Result<Expr, ()> {
+        let left = self.parse_additive()?;
+        let Some(op) = Self::comparison_op(self.peek().kind) else { return Ok(left) };
+        self.advance();
+        let right = self.parse_additive()?;
+        let span = left.span.merge(right.span);
+        if let Some(second) = Self::comparison_op(self.peek().kind) {
+            let token = self.peek();
+            self.diagnostics.push(
+                Diagnostic::error(format!("comparisons do not chain: `{}` follows `{}`", second.symbol(), op.symbol()))
+                    .with_code("E0111")
+                    .at(token.span, "second comparison")
+                    .help("write a range as two comparisons joined by `&&`, as in `a < b && b < c`"),
+            );
+            return Err(());
+        }
+        Ok(Expr::new(ExprKind::Binary(op, Box::new(left), Box::new(right)), span))
+    }
+
+    /// `if condition { value } else { value }`, with `else if` chaining.
+    fn parse_if(&mut self) -> Result<Expr, ()> {
+        let start = self.advance().span;
+        let condition = self.parse_expr()?;
+        let then = self.parse_braced_expr("the `if` value")?;
+        if !self.peek().is_keyword(Keyword::Else) {
+            let found = self.peek();
+            self.diagnostics.push(
+                Diagnostic::error(format!("an `if` needs an `else`, found {}", found.kind.describe()))
+                    .with_code("E0113")
+                    .at(found.span, "expected `else`")
+                    .note("`if` chooses between two values, so a law computes one on every path"),
+            );
+            return Err(());
+        }
+        self.advance();
+        let otherwise = if self.peek().is_keyword(Keyword::If) {
+            self.parse_if()?
+        } else {
+            self.parse_braced_expr("the `else` value")?
+        };
+        let span = start.merge(otherwise.span);
+        Ok(Expr::new(ExprKind::If(Box::new(condition), Box::new(then), Box::new(otherwise)), span))
+    }
+
+    fn parse_braced_expr(&mut self, what: &str) -> Result<Expr, ()> {
+        let open = self.expect(TokenKind::LBrace, &format!("to open {what}"))?;
+        let value = self.parse_expr()?;
+        let close = self.expect(TokenKind::RBrace, &format!("to close {what}"))?;
+        Ok(Expr::new(value.kind, open.span.merge(close.span)))
     }
 
     fn parse_additive(&mut self) -> Result<Expr, ()> {
@@ -591,6 +864,7 @@ impl<'a> Parser<'a> {
         let op = match token.kind {
             TokenKind::Minus => UnaryOp::Neg,
             TokenKind::Plus => UnaryOp::Pos,
+            TokenKind::Bang => UnaryOp::Not,
             _ => return self.parse_power(),
         };
         self.advance();
@@ -704,6 +978,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Expr::new(ExprKind::Name(self.text(token.span).to_string()), token.span))
             }
+            TokenKind::Keyword(Keyword::If) => self.parse_if(),
             TokenKind::LParen => {
                 self.advance();
                 let first = self.parse_expr()?;
@@ -1414,5 +1689,141 @@ project chem {
              }",
         );
         assert_eq!(project.settings().count(), 1);
+    }
+
+    // --- laws (spec §8.3) ---------------------------------------------------
+
+    /// Spec §8.3's two examples, character for character, inside a project.
+    #[test]
+    fn the_spec_expression_examples_parse_verbatim() {
+        let project = parse_ok(
+            r#"project p {
+force spring(a: particle, b: particle) -> vec2<newton> {
+    let dx = minimum_image(b.position - a.position);
+    let extension = length(dx) - rest_length;
+    return stiffness * extension * normalize(dx)
+         - damping * dot(b.velocity - a.velocity, normalize(dx)) * normalize(dx);
+}
+
+reaction neutralization {
+    stoichiometry: H_plus + OH_minus -> H2O;
+    rate: k * c(H_plus) * c(OH_minus);
+    heat_release: 57.3 kilojoule / mole;
+}
+}"#,
+        );
+        let law = project.laws().next().expect("the force parses as a law");
+        assert_eq!((law.kind.text.as_str(), law.name.text.as_str()), ("force", "spring"));
+        assert_eq!(law.params.len(), 2);
+        assert_eq!(law.params[1].name.text, "b");
+        assert!(matches!(law.returns.as_ref().unwrap().kind, TypeKind::Vec2(_)));
+        assert_eq!(law.body.len(), 3);
+        assert!(matches!(law.body[2].kind, StmtKind::Return(_)));
+
+        let reaction = project.reactions().next().unwrap();
+        let stoichiometry = &reaction.setting("stoichiometry").unwrap().value;
+        assert!(matches!(stoichiometry.kind, ExprKind::Yields(_, _)), "{stoichiometry:?}");
+    }
+
+    #[test]
+    fn a_law_takes_params_defaults_and_a_scalar_return_type() {
+        let project = parse_ok(
+            "project p {
+               potential lj(a: particle, b: particle) -> joule {
+                 param epsilon: joule;
+                 param sigma: meter = 1 angstrom;
+                 let s6 = (sigma / distance(a, b))^6;
+                 return 4 * epsilon * (s6^2 - s6);
+               }
+             }",
+        );
+        let law = project.laws().next().unwrap();
+        let StmtKind::Param { name, default, .. } = &law.body[1].kind else { panic!() };
+        assert_eq!(name.text, "sigma");
+        assert!(default.is_some());
+        assert!(matches!(law.returns.as_ref().unwrap().kind, TypeKind::Plain(_)));
+    }
+
+    #[test]
+    fn a_law_without_a_return_type_or_parameters_parses() {
+        let project = parse_ok("project p { force nothing() { return 0; } }");
+        let law = project.laws().next().unwrap();
+        assert!(law.params.is_empty() && law.returns.is_none());
+    }
+
+    /// A declaration and a law share `<kind> <name>`; the `(` is what tells them apart,
+    /// so the quantum module's `potential barrier { … }` is untouched.
+    #[test]
+    fn a_block_declaration_is_not_mistaken_for_a_law() {
+        let project = parse_ok("project p { potential barrier { height: 1 electronvolt; } }");
+        assert_eq!(project.declarations().count(), 1);
+        assert_eq!(project.laws().count(), 0);
+    }
+
+    #[test]
+    fn top_level_let_parses() {
+        let project = parse_ok("project p { let k = 1.4e11 meter^2 / (mole second); rate: k; }");
+        let constant = project.lets().next().unwrap();
+        assert_eq!(constant.name.text, "k");
+    }
+
+    #[test]
+    fn comparison_and_logic_bind_below_arithmetic() {
+        // `a + b < c && d` is `((a + b) < c) && d`.
+        let ExprKind::Binary(BinaryOp::And, left, _) = expr_of("a + b < c && d").kind else { panic!() };
+        let ExprKind::Binary(BinaryOp::Lt, sum, _) = &left.kind else { panic!("{left:?}") };
+        assert!(matches!(sum.kind, ExprKind::Binary(BinaryOp::Add, _, _)));
+        // `||` binds below `&&`.
+        assert!(matches!(expr_of("a || b && c").kind, ExprKind::Binary(BinaryOp::Or, _, _)));
+        assert!(matches!(expr_of("!a").kind, ExprKind::Unary(UnaryOp::Not, _)));
+    }
+
+    #[test]
+    fn if_is_an_expression_with_else_if_chaining() {
+        let ExprKind::If(_, _, otherwise) = expr_of("if r < 1 meter { 1 } else if r < 2 meter { 2 } else { 3 }").kind
+        else {
+            panic!()
+        };
+        assert!(matches!(otherwise.kind, ExprKind::If(_, _, _)));
+    }
+
+    #[test]
+    fn law_syntax_errors_have_their_own_codes() {
+        let (_, _, codes) = parse_err("project p { x: a < b < c; }");
+        assert!(codes.contains(&"E0111".to_string()), "{codes:?}");
+        let (_, _, codes) = parse_err("project p { x: if a { 1 }; }");
+        assert!(codes.contains(&"E0113".to_string()), "{codes:?}");
+        let (_, _, codes) = parse_err("project p { force f() { x = 1; return 1; } }");
+        assert!(codes.contains(&"E0112".to_string()), "{codes:?}");
+    }
+
+    /// A bad statement does not take the rest of the law, or the project, with it.
+    #[test]
+    fn a_bad_statement_recovers_inside_the_law() {
+        let (project, _, codes) =
+            parse_err("project p { force f(a: particle) -> newton { x = 1; return 1 newton; } dimensions: 2; }");
+        assert_eq!(codes, ["E0112"]);
+        let project = project.unwrap();
+        assert_eq!(project.laws().next().unwrap().body.len(), 1, "the `return` survives");
+        assert!(project.setting("dimensions").is_some(), "the item after the law survives");
+    }
+
+    /// A statement that fails inside an `if` arm stops the parser between braces. The
+    /// law must still close at its own `}`, not the arm's, or the rest of the arm is
+    /// read as project items and reported as errors that are not there.
+    #[test]
+    fn a_failure_inside_an_if_arm_does_not_close_the_law() {
+        let (project, _, codes) = parse_err(
+            "project p {
+               potential u(a: particle) -> joule {
+                 return if a.mass > 1 kilogram { 1 joule + ; } else { 2 joule };
+               }
+               dimensions: 2;
+             }",
+        );
+        assert_eq!(codes, ["E0110"], "one error, not cascades");
+        let project = project.unwrap();
+        assert!(project.laws().next().unwrap().recovered);
+        assert!(project.setting("dimensions").is_some());
     }
 }

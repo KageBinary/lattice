@@ -73,7 +73,7 @@ honesty over feature count**:
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
 | **Execution** | A worker pool and an explicit partitioning executor; parallel diffusion stencils and per-particle integration; `--threads` and a `--compare` mode that measures its own speedup | Parallel and scalar agree *bit for bit* — every cell, every particle, the CG iteration count, and the reproducibility hash. 4.8× at 512², 1.9× on 262k particles, and nothing slower than it was |
 | **Backends** | A dependency-free backend boundary — devices, buffers, §10.5 precision modes, a kernel cache keyed the way §15.5 asks — with the scalar CPU path and a portable `wgpu` compute backend behind it; explicit diffusion and Crank–Nicolson both device-resident, the latter with a conjugate gradient whose reduction has a *stated* association order; `--backend gpu` on the benchmark harness | The GPU differs from the CPU reference by 4.3 `f32` ulps over 200 explicit steps, using 0.3% of a budget *derived* from `f32` rounding rather than fitted — and agrees to the bit where nothing rounds. 130× the scalar CPU on a 1024² stencil, and 4.1× *slower* end-to-end at 256²; both are published, because neither is honest alone. The implicit path refuses a residual tolerance below `ε·(1 + ‖A‖₂)` instead of failing to reach it, and its budget is dominated by the two solves' stopping criteria rather than by precision |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1198 tests including doctests across 19 crates with all features |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1235 tests including doctests across 19 crates with all features |
 | **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, curves, conservation drift and the solver's contract; phase on a cyclic wheel, vector fields as magnitude and arrows | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
@@ -82,6 +82,10 @@ Fluids, waves, electromagnetism, and the Python SDK — M6–M8, or outside the
 milestones. Coulomb is the real-space half of an Ewald sum, with no reciprocal-space
 part, and the quantum module has no GPU path. See
 [the roadmap](docs/roadmap.md#what-m5-still-leaves-out).
+
+User-defined laws (spec §8.3) are in progress: a `force` or `potential` parses and is
+type- and unit-checked, but cannot run until M6.1b, and says so with `E0900`. See
+[the roadmap's M6 section](docs/roadmap.md#m6--extensibility-in-progress).
 
 GPU execution is deliberately limited to the released kernels and boundary modes.
 General GPU execution of arbitrary coupled `.lattice` projects is not implemented;

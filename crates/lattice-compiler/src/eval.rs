@@ -200,6 +200,37 @@ impl<'a> Evaluator<'a> {
             ExprKind::Unary(UnaryOp::Neg, inner) => Some(-self.eval(inner, diagnostics)?),
             ExprKind::Unary(UnaryOp::Pos, inner) => self.eval(inner, diagnostics),
 
+            // Conditions are values inside a law, where they choose between two
+            // quantities. A setting is one quantity, decided once.
+            ExprKind::Unary(UnaryOp::Not, _) | ExprKind::If(..) => {
+                diagnostics.push(
+                    Diagnostic::error("a condition cannot be a setting's value")
+                        .with_code("E0414")
+                        .span(expr.span)
+                        .note("`if`, `!` and comparisons choose between values inside a law")
+                        .help("a value that depends on the state belongs in a `force` or `potential`"),
+                );
+                None
+            }
+            ExprKind::Binary(op, _, _) if op.is_comparison() || op.is_logical() => {
+                diagnostics.push(
+                    Diagnostic::error(format!("`{}` gives a truth value, where a quantity is required", op.symbol()))
+                        .with_code("E0414")
+                        .span(expr.span)
+                        .note("comparisons choose between values inside a law"),
+                );
+                None
+            }
+            ExprKind::Yields(..) => {
+                diagnostics.push(
+                    Diagnostic::error("a reaction equation cannot be a quantity")
+                        .with_code("E0401")
+                        .span(expr.span)
+                        .note("`reactants -> products` is the value of a reaction's `stoichiometry:`"),
+                );
+                None
+            }
+
             ExprKind::Binary(op, left, right) => {
                 // Both sides are evaluated even when the first fails, so a model with
                 // two bad units reports both instead of one per compile.
@@ -209,6 +240,15 @@ impl<'a> Evaluator<'a> {
                 match op {
                     BinaryOp::Mul => Some(a * b),
                     BinaryOp::Div => Some(a / b),
+                    // Reported by the arm above, before either side was evaluated.
+                    BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::And
+                    | BinaryOp::Or => None,
                     BinaryOp::Add | BinaryOp::Sub => {
                         let result = if *op == BinaryOp::Add { a.try_add(b) } else { a.try_sub(b) };
                         match result {
@@ -269,8 +309,8 @@ impl<'a> Evaluator<'a> {
                              methods",
                         )
                         .help(
-                            "user-defined expressions arrive with the expression compiler \
-                             in milestone M6",
+                            "a law that computes a value from the state is declared with \
+                             `force` or `potential` and used by name; see docs/language.md",
                         ),
                 );
                 None
@@ -300,9 +340,9 @@ impl<'a> Evaluator<'a> {
                         .with_code("E0210")
                         .at(expr.span, "member access")
                         .help(
-                            "field and species members such as `.concentration` are runtime \
-                             values, available to rate laws once the chemistry module lands \
-                             in milestone M3",
+                            "members such as `a.position` are runtime values, read inside a \
+                             `force` or `potential`; rate laws that read concentrations arrive \
+                             in milestone M6.1c",
                         ),
                 );
                 None
@@ -604,14 +644,22 @@ mod tests {
         let (text, codes) = err("gaussian(1, 2)");
         assert!(codes.contains(&"E0210".to_string()));
         assert!(text.contains("field initializers"), "{text}");
-        assert!(text.contains("M6"), "the message should say when this arrives:\n{text}");
+        assert!(text.contains("`force` or `potential`"), "the message should say where a computed value goes:\n{text}");
     }
 
     #[test]
-    fn member_access_points_at_the_chemistry_milestone() {
+    fn member_access_points_at_laws_and_the_rate_law_milestone() {
         let (text, codes) = err("A.concentration");
         assert!(codes.contains(&"E0210".to_string()));
-        assert!(text.contains("M3"), "{text}");
+        assert!(text.contains("inside a") && text.contains("M6.1c"), "{text}");
+    }
+
+    #[test]
+    fn a_condition_is_not_a_setting_value() {
+        for source in ["1 meter < 2 meter", "if true { 1 } else { 2 }", "!true"] {
+            let (_, codes) = err(source);
+            assert_eq!(codes, ["E0414"], "{source}");
+        }
     }
 
     #[test]

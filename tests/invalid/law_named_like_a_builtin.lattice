@@ -1,0 +1,11 @@
+// expect: E0201
+// A law called `drag` would silently take `force: drag(...)` from the built-in. The
+// built-in names are not free.
+
+project law_named_like_a_builtin {
+  dimensions: 2;
+
+  force drag(a: particle) -> vec2<newton> {
+    return -1 kilogram / second * a.velocity;
+  }
+}

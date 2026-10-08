@@ -1,0 +1,13 @@
+// expect: E0413
+// `4 epsilon (s - 1)` reads as a call of `epsilon`: a name followed by `(` is a call,
+// space or no space. The diagnostic says to write `epsilon * (...)`.
+
+project law_value_called {
+  dimensions: 2;
+
+  potential u(a: particle, b: particle) -> joule {
+    param epsilon: joule;
+    let s = distance(a, b) / (1 meter);
+    return 4 epsilon (s - 1);
+  }
+}

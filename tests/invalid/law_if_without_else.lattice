@@ -1,0 +1,11 @@
+// expect: E0113
+// `if` chooses between two values. Without an `else` the law would have no value
+// on one path.
+
+project law_if_without_else {
+  dimensions: 2;
+
+  potential u(a: particle, b: particle) -> joule {
+    return if distance(a, b) < 2 meter { 1 joule };
+  }
+}

@@ -220,6 +220,20 @@ are reproduced here as a rough expectation, not a promise.
 | `heat-crank-nicolson` | 256² | 1.6x |
 | `particles-gravity` | 262k | 1.9x |
 | `particles-lj` | 1k | 1.0x |
+| `quantum2d` domain advance | 512² | 5.6x |
+| `quantum2d` domain advance | 768×512 | 5.7x |
+
+The two `quantum2d` rows are not from `lattice bench` and are not best of three: they
+are the `advance` column of
+`cargo run --release -p lattice-domain-quantum2d --example step_profile`, median of three
+runs on 2026-10-08 with no game running. That is 9.28 ms on one thread against 1.67 ms on
+the pool at 512² (about 600 steps a second), and 46.9 ms against 8.17 ms at §25.2's
+768×512, whose rows need Bluestein's transform. Every run reported the pool's
+wavefunction bit-identical to the single thread's. The transforms, transposes and phase
+multiplies all run on the pool; what stays on the calling thread is the absorbed
+probability, a sum over the grid folded twice a step in a fixed order so its bits do not
+depend on the machine, and the domain's bookkeeping around the step. Which of those
+bounds the 5.6x has not been measured.
 
 Three things in that table are worth reading rather than skimming.
 

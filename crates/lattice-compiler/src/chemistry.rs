@@ -59,7 +59,36 @@ pub const REACTION_SETTINGS: &[&str] = &[
     "reverse_rate",
     "activation_energy",
     "enthalpy",
+    // Spec §8.3's form, recognized so it is reported as planned (M6.1c), not unknown.
+    "stoichiometry",
+    "heat_release",
 ];
+
+/// The first part of a reaction written in spec §8.3's form, which M6.1c implements:
+/// `stoichiometry:`, `heat_release:`, or a `rate:` that reads the state — a call such as
+/// `c(H_plus)` or `arrhenius(…)`, a member such as `A.concentration`, or `temperature`.
+/// Returns where it is and what it is. `is_constant` names the model's `let`
+/// constants, so a constant called `temperature` is not mistaken for the state.
+pub fn planned_rate_law(decl: &Decl, is_constant: &dyn Fn(&str) -> bool) -> Option<(Span, &'static str)> {
+    if let Some(setting) = decl.setting("stoichiometry") {
+        return Some((setting.key.span, "`stoichiometry:`"));
+    }
+    if let Some(setting) = decl.setting("heat_release") {
+        return Some((setting.key.span, "`heat_release:`"));
+    }
+    let rate = decl.setting("rate")?;
+    reads_state(&rate.value, is_constant).then_some((rate.value.span, "a rate law that reads the state"))
+}
+
+fn reads_state(expr: &Expr, is_constant: &dyn Fn(&str) -> bool) -> bool {
+    match &expr.kind {
+        ExprKind::Call(..) | ExprKind::Member(..) => true,
+        ExprKind::Name(name) => name == "temperature" && !is_constant(name),
+        ExprKind::Unary(_, inner) | ExprKind::Power(inner, _) => reads_state(inner, is_constant),
+        ExprKind::Binary(_, a, b) => reads_state(a, is_constant) || reads_state(b, is_constant),
+        _ => false,
+    }
+}
 
 /// Chemistry settings a `species` declaration accepts, on top of the field ones.
 pub const SPECIES_SETTINGS: &[&str] = &["formula", "charge", "molar_mass"];

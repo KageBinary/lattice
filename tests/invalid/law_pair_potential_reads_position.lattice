@@ -1,0 +1,12 @@
+// expect: E0412
+// A pair potential sees its particles only through `distance(a, b)`. That is what
+// makes the force it implies central and conservative by construction; reading the
+// positions themselves would promise neither.
+
+project law_pair_potential_reads_position {
+  dimensions: 2;
+
+  potential u(a: particle, b: particle) -> joule {
+    return 1 joule * a.position.x / meter;
+  }
+}

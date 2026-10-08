@@ -542,7 +542,7 @@ pub enum ForceSpec {
 pub const COULOMB_DAMPING_TIMES_CUTOFF: f64 = 2.4;
 
 /// Every force name.
-const FORCES: &[&str] = &["gravity", "drag", "harmonic_well", "lennard_jones", "soft_repulsion", "coulomb"];
+pub(crate) const FORCES: &[&str] = &["gravity", "drag", "harmonic_well", "lennard_jones", "soft_repulsion", "coulomb"];
 
 impl ForceSpec {
     /// A one-line description for the model report.

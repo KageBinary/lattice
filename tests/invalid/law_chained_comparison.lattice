@@ -1,0 +1,12 @@
+// expect: E0111
+// `0 < r < cutoff` reads as a range to a mathematician and as `(0 < r) < cutoff` --
+// a truth value compared with a length -- to a parser. Lattice gives it neither
+// meaning: comparisons do not chain.
+
+project law_chained_comparison {
+  dimensions: 2;
+
+  potential u(a: particle, b: particle) -> joule {
+    return if 0 meter < distance(a, b) < 2 meter { 1 joule } else { 0 joule };
+  }
+}

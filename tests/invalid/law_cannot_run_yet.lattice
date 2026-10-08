@@ -1,0 +1,11 @@
+// expect: E0900
+// A law that type-checks still cannot run until milestone M6.1b, and says so: a model
+// whose force was silently dropped would run and give confident, wrong numbers.
+
+project law_cannot_run_yet {
+  dimensions: 2;
+
+  force gravity_down(a: particle) -> vec2<newton> {
+    return a.mass * vec2(0 meter / second^2, -9.81 meter / second^2);
+  }
+}

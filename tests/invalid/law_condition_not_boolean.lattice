@@ -1,0 +1,11 @@
+// expect: E0414
+// A condition must be a comparison or a combination of them; a mass is not true or
+// false.
+
+project law_condition_not_boolean {
+  dimensions: 2;
+
+  potential u(a: particle) -> joule {
+    return if a.mass { 1 joule } else { 0 joule };
+  }
+}

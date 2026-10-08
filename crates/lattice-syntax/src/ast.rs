@@ -93,6 +93,8 @@ pub enum UnaryOp {
     Neg,
     /// `+x`
     Pos,
+    /// `!x`
+    Not,
 }
 
 /// Binary operators.
@@ -106,6 +108,22 @@ pub enum BinaryOp {
     Mul,
     /// `a / b`
     Div,
+    /// `a < b`
+    Lt,
+    /// `a <= b`
+    Le,
+    /// `a > b`
+    Gt,
+    /// `a >= b`
+    Ge,
+    /// `a == b`
+    Eq,
+    /// `a != b`
+    Ne,
+    /// `a && b`
+    And,
+    /// `a || b`
+    Or,
 }
 
 impl BinaryOp {
@@ -116,7 +134,25 @@ impl BinaryOp {
             BinaryOp::Sub => "-",
             BinaryOp::Mul => "*",
             BinaryOp::Div => "/",
+            BinaryOp::Lt => "<",
+            BinaryOp::Le => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::Ge => ">=",
+            BinaryOp::Eq => "==",
+            BinaryOp::Ne => "!=",
+            BinaryOp::And => "&&",
+            BinaryOp::Or => "||",
         }
+    }
+
+    /// True for `<`, `<=`, `>`, `>=`, `==` and `!=`: quantities in, a truth value out.
+    pub const fn is_comparison(self) -> bool {
+        matches!(self, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Eq | BinaryOp::Ne)
+    }
+
+    /// True for `&&` and `||`.
+    pub const fn is_logical(self) -> bool {
+        matches!(self, BinaryOp::And | BinaryOp::Or)
     }
 }
 
@@ -186,6 +222,113 @@ pub enum ExprKind {
     List(Vec<Expr>),
     /// `(a, b)`
     Tuple(Vec<Expr>),
+    /// `if condition { then } else { otherwise }` — a choice between two values, not a
+    /// branch of control: both arms are expressions of the same type.
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `reactants -> products`, written only as a whole setting value, as in
+    /// spec §8.3's `stoichiometry: H_plus + OH_minus -> H2O;`.
+    Yields(Box<Expr>, Box<Expr>),
+}
+
+/// A type written in a law: `particle`, `joule`, `newton/meter`, `vec2<newton>`.
+///
+/// Unresolved, like the rest of the tree: `particle` and `joule` are both plain names
+/// here, and the compiler decides which is an entity and which is a unit.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TypeExpr {
+    /// What kind of type.
+    pub kind: TypeKind,
+    /// Where it is.
+    pub span: Span,
+}
+
+/// The shapes a written type takes.
+#[derive(Clone, PartialEq, Debug)]
+pub enum TypeKind {
+    /// A name or unit expression: `particle`, `bool`, `joule`, `newton / meter`, `1`.
+    Plain(Expr),
+    /// `vec2<unit>`: a two-component vector whose components carry the unit.
+    Vec2(Expr),
+}
+
+/// One parameter in a law's header, `a: particle`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct LawParam {
+    /// The name the body refers to it by.
+    pub name: Ident,
+    /// Its type.
+    pub ty: TypeExpr,
+    /// The whole parameter.
+    pub span: Span,
+}
+
+/// A statement in a law's body.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Stmt {
+    /// What kind of statement.
+    pub kind: StmtKind,
+    /// The whole statement including its `;`.
+    pub span: Span,
+}
+
+/// The statements a law body may contain. There are no loops, no assignment after
+/// definition, and nothing with a side effect: a law is a value computed from its
+/// inputs, which is what lets it run on any backend and in any order.
+#[derive(Clone, PartialEq, Debug)]
+pub enum StmtKind {
+    /// `let name = value;`
+    Let {
+        /// The name.
+        name: Ident,
+        /// Its value.
+        value: Expr,
+    },
+    /// `param name: type;` or `param name: type = default;` — a value bound where the
+    /// law is used, as in `force: spring(stiffness=40 newton/meter)`.
+    Param {
+        /// The name.
+        name: Ident,
+        /// Its declared type, whose unit a use site's value must match.
+        ty: TypeExpr,
+        /// The value used when a use site gives none.
+        default: Option<Expr>,
+    },
+    /// `return value;`
+    Return(Expr),
+}
+
+/// A user-defined law: `force spring(a: particle, b: particle) -> vec2<newton> { … }`.
+///
+/// The kind (`force`, `potential`, …) is an ordinary identifier, as declaration kinds
+/// are: the compiler decides which kinds it knows.
+#[derive(Clone, PartialEq, Debug)]
+pub struct LawDecl {
+    /// What sort of law: `force`, `potential`, …
+    pub kind: Ident,
+    /// The law's name, by which a `force:` setting uses it.
+    pub name: Ident,
+    /// The header's parameters.
+    pub params: Vec<LawParam>,
+    /// The declared result type, after `->`.
+    pub returns: Option<TypeExpr>,
+    /// The statements between the braces.
+    pub body: Vec<Stmt>,
+    /// True when a statement failed to parse and was skipped, so the body is
+    /// incomplete: a missing `return` may be the statement that failed.
+    pub recovered: bool,
+    /// The whole declaration.
+    pub span: Span,
+}
+
+/// `let k = 1.4e11 meter^2 / (mole second);` — a named model constant.
+#[derive(Clone, PartialEq, Debug)]
+pub struct LetDecl {
+    /// The name.
+    pub name: Ident,
+    /// Its value.
+    pub value: Expr,
+    /// The whole declaration.
+    pub span: Span,
 }
 
 /// A declaration of the general form `<kind> <name> { … }` or `<kind> <name> … ;`.
@@ -344,6 +487,10 @@ pub enum Item {
     Observe(ObserveStmt),
     /// `visualize … as …;`
     Visualize(VisualizeStmt),
+    /// `force spring(a: particle, b: particle) -> vec2<newton> { … }`
+    Law(LawDecl),
+    /// `let k = …;`
+    Let(LetDecl),
 }
 
 impl Item {
@@ -354,6 +501,8 @@ impl Item {
             Item::Decl(d) => Some(&d.name),
             Item::Field(d) | Item::Species(d) => Some(&d.name),
             Item::Domain(d) => Some(&d.name),
+            Item::Law(d) => Some(&d.name),
+            Item::Let(d) => Some(&d.name),
             Item::Solve(_) | Item::Couple(_) | Item::Observe(_) | Item::Visualize(_) => None,
         }
     }
@@ -370,6 +519,8 @@ impl Item {
             Item::Couple(_) => "couple",
             Item::Observe(_) => "observe",
             Item::Visualize(_) => "visualize",
+            Item::Law(d) => &d.kind.text,
+            Item::Let(_) => "let",
         }
     }
 
@@ -384,6 +535,8 @@ impl Item {
             Item::Couple(s) => s.span,
             Item::Observe(s) => s.span,
             Item::Visualize(s) => s.span,
+            Item::Law(d) => d.span,
+            Item::Let(d) => d.span,
         }
     }
 }
@@ -493,6 +646,22 @@ impl Project {
     pub fn domains(&self) -> impl Iterator<Item = &DomainDecl> {
         self.items.iter().filter_map(|item| match item {
             Item::Domain(decl) => Some(decl),
+            _ => None,
+        })
+    }
+
+    /// All user-defined laws, of every kind.
+    pub fn laws(&self) -> impl Iterator<Item = &LawDecl> {
+        self.items.iter().filter_map(|item| match item {
+            Item::Law(decl) => Some(decl),
+            _ => None,
+        })
+    }
+
+    /// All `let` constants, in declaration order.
+    pub fn lets(&self) -> impl Iterator<Item = &LetDecl> {
+        self.items.iter().filter_map(|item| match item {
+            Item::Let(decl) => Some(decl),
             _ => None,
         })
     }

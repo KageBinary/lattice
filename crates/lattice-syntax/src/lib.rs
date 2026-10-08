@@ -18,7 +18,8 @@ pub mod source;
 
 pub use ast::{
     Argument, BinaryOp, CoupleStmt, Decl, DomainDecl, Expr, ExprKind, FieldDecl, Ident, Item,
-    ObserveStmt, Path, Project, Setting, SolveStmt, UnaryOp, VisualizeStmt,
+    LawDecl, LawParam, LetDecl, ObserveStmt, Path, Project, Setting, SolveStmt, Stmt, StmtKind,
+    TypeExpr, TypeKind, UnaryOp, VisualizeStmt,
 };
 pub use diagnostic::{Diagnostic, Diagnostics, Label, Severity};
 pub use lexer::{tokenize, Keyword, Token, TokenKind};

@@ -1,0 +1,10 @@
+// expect: E0415
+// A law computes one value, and `return` is what gives it.
+
+project law_without_return {
+  dimensions: 2;
+
+  force f(a: particle) -> vec2<newton> {
+    let g = 9.81 meter / second^2;
+  }
+}

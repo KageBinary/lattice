@@ -1,0 +1,10 @@
+// expect: E0900
+// An `observer` law is the exit condition's other half, and arrives in M6.2.
+
+project observer_law_before_m62 {
+  dimensions: 2;
+
+  observer kinetic(a: particle) -> joule {
+    return 0.5 * a.mass * dot(a.velocity, a.velocity);
+  }
+}

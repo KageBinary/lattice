@@ -1,0 +1,21 @@
+// expect: E0900
+// A particle set that uses a law by name cannot run it until M6.1b, and the use site
+// says so, rather than calling `spring` an unknown force.
+
+project law_used_before_m61b {
+  dimensions: 2;
+
+  force spring(a: particle, b: particle) -> vec2<newton> {
+    param stiffness: newton / meter;
+    let dx = minimum_image(b.position - a.position);
+    return stiffness * dx;
+  }
+
+  particles beads {
+    count: 4;
+    region: [4 meter, 4 meter];
+    spacing: 1 meter;
+    mass: 1 kilogram;
+    force: spring(stiffness=40 newton / meter);
+  }
+}

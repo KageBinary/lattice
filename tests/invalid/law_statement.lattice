@@ -1,0 +1,14 @@
+// expect: E0112
+// A law's body has `let`, `param` and `return`, and nothing else. There is no
+// assignment: each name is defined once, which is what makes a law a value rather
+// than a program.
+
+project law_statement {
+  dimensions: 2;
+
+  force f(a: particle) -> vec2<newton> {
+    let g = 9.81 meter / second^2;
+    g = 10 meter / second^2;
+    return a.mass * vec2(0 meter / second^2, -g);
+  }
+}

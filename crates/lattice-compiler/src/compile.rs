@@ -44,10 +44,11 @@ use lattice_syntax::{
     Decl, Diagnostic, Diagnostics, Expr, ExprKind, FieldDecl, Ident, Project, SolveStmt, SourceFile,
     Span,
 };
-use lattice_units::{Dimension, UnitRegistry};
+use lattice_units::{Dimension, Quantity, UnitRegistry};
 
 use crate::builtins::{self, ForceSpec, Initializer};
 use crate::eval::Evaluator;
+use crate::laws::{self, TypedLaw};
 use crate::molecular::{AngleSpec, BondSpec};
 
 /// How a particle set is laid out at the start.
@@ -236,6 +237,12 @@ struct Compiler<'a> {
     /// The areal heat capacity a field declared, J/(m²·K), for deriving a coupling
     /// factor.
     heat_capacity: BTreeMap<String, f64>,
+    /// The model's `let` constants, in declaration order, visible to every expression.
+    constants: Vec<(String, Quantity)>,
+    /// The user-defined laws that type-checked (spec §8.3).
+    laws: Vec<TypedLaw>,
+    /// Every declared law's name, checked or not, so a use site can say what it names.
+    law_names: Vec<String>,
     notes: Vec<String>,
 }
 
@@ -286,14 +293,89 @@ impl<'a> Compiler<'a> {
             reaction_names: Vec::new(),
             domain_index: BTreeMap::new(),
             heat_capacity: BTreeMap::new(),
+            constants: Vec::new(),
+            laws: Vec::new(),
+            law_names: Vec::new(),
             notes: Vec::new(),
         }
     }
 
     /// An evaluator borrowing the source and registry — deliberately *not* `self`,
     /// so it can coexist with `&mut self.diagnostics`.
+    ///
+    /// It knows the model's `let` constants, so a constant can stand wherever a
+    /// quantity can.
     fn evaluator(&self) -> Evaluator<'a> {
-        Evaluator::new(self.file, self.units)
+        let mut evaluator = Evaluator::new(self.file, self.units);
+        for (name, value) in &self.constants {
+            evaluator.define(name.clone(), *value);
+        }
+        evaluator
+    }
+
+    /// Evaluate the `let` constants, in order: each may use the ones before it.
+    fn declare_constants(&mut self, project: &Project) {
+        let mut seen: BTreeMap<String, Span> = BTreeMap::new();
+        for constant in project.lets() {
+            if let Some(previous) = seen.get(&constant.name.text) {
+                let previous = *previous;
+                self.error(
+                    Diagnostic::error(format!("`{}` is declared twice", constant.name.text))
+                        .with_code("E0201")
+                        .at(constant.name.span, "declared again here")
+                        .also(previous, "first declared here"),
+                );
+                continue;
+            }
+            seen.insert(constant.name.text.clone(), constant.name.span);
+            if self.units.resolve(&constant.name.text).is_ok() {
+                self.diagnostics.push(laws::shadow_warning(&constant.name));
+            }
+            let evaluator = self.evaluator();
+            if let Some(value) = evaluator.quantity(&constant.value, &mut self.diagnostics) {
+                self.constants.push((constant.name.text.clone(), value));
+            }
+        }
+    }
+
+    /// Type-check every user-defined law (spec §8.3).
+    ///
+    /// Until M6.1b a law that checks still cannot run, and says so: a model whose
+    /// force was silently dropped would run and give confident, wrong numbers.
+    fn declare_laws(&mut self, project: &Project) {
+        // A law named like a built-in force would silently take `force: drag(…)` from
+        // it; the built-in names are not free.
+        for law in project.laws() {
+            if builtins::FORCES.contains(&law.name.text.as_str()) {
+                self.error(
+                    Diagnostic::error(format!("`{}` is the name of a built-in force", law.name.text))
+                        .with_code("E0201")
+                        .at(law.name.span, "taken by the built-in")
+                        .note("`force:` would be ambiguous between the two")
+                        .help("give the law a name of its own"),
+                );
+            }
+        }
+        let evaluator = self.evaluator();
+        self.law_names = project
+            .laws()
+            .map(|law| law.name.text.clone())
+            .filter(|name| !builtins::FORCES.contains(&name.as_str()))
+            .collect();
+        self.laws = laws::check_laws(project, &evaluator, &mut self.diagnostics);
+        // A law refused for its name above is not also told that it checks.
+        self.laws.retain(|law| !builtins::FORCES.contains(&law.name.as_str()));
+        for law in &self.laws {
+            self.diagnostics.push(
+                Diagnostic::error(format!("`{}` checks, but user-defined laws cannot run yet", law.name))
+                    .with_code("E0900")
+                    .at(law.span, "type- and unit-checked")
+                    .note(
+                        "this is milestone M6.1a: laws are parsed, typed and unit-checked; \
+                         running them arrives in M6.1b",
+                    ),
+            );
+        }
     }
 
     fn error(&mut self, diagnostic: Diagnostic) {
@@ -301,7 +383,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn run(&mut self, project: &Project) -> Compiled {
+        // Constants first: any setting below may use them.
+        self.declare_constants(project);
         let settings = self.project_settings(project);
+        self.declare_laws(project);
 
         // Grids first: fields refer to them by name.
         for decl in project.declarations_of("grid") {
@@ -893,6 +978,19 @@ impl<'a> Compiler<'a> {
         // with drag.
         let mut forces = Vec::new();
         for setting in decl.settings.iter().filter(|s| s.key.text == "force") {
+            let callee = match &setting.value.kind {
+                ExprKind::Call(callee, _) => callee.as_name(),
+                _ => setting.value.as_name(),
+            };
+            if let Some(name) = callee.filter(|name| self.law_names.iter().any(|law| law == name)) {
+                self.error(
+                    Diagnostic::error(format!("`{name}` is a user-defined law, and using one is not implemented yet"))
+                        .with_code("E0900")
+                        .at(setting.value.span, "arrives in M6.1b")
+                        .note("this is milestone M6.1a: the law is checked where it is declared"),
+                );
+                continue;
+            }
             if let Some(force) = builtins::force(&setting.value, &evaluator, &mut self.diagnostics) {
                 forces.push(force);
             }
@@ -1313,6 +1411,21 @@ impl<'a> Compiler<'a> {
         let declarations = core::mem::take(&mut self.reaction_decls);
         for decl in &declarations {
             self.check_settings(decl, chemistry::REACTION_SETTINGS);
+            let is_constant = |name: &str| self.constants.iter().any(|(constant, _)| constant == name);
+            if let Some((span, what)) = chemistry::planned_rate_law(decl, &is_constant) {
+                self.error(
+                    Diagnostic::error(format!("{what} is not implemented yet"))
+                        .with_code("E0900")
+                        .at(span, "arrives in M6.1c")
+                        .note(
+                            "spec §8.3's reaction form (`stoichiometry:`, `heat_release:`, and a \
+                             `rate:` that reads concentrations or the temperature) is milestone \
+                             M6.1c; until then write `reactants:`, `products:`, a rate constant \
+                             and `enthalpy:`",
+                        ),
+                );
+                continue;
+            }
             if let Some(reaction) =
                 chemistry::reaction(decl, &index_of, &evaluator, &mut self.diagnostics)
             {

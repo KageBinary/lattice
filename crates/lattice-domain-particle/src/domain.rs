@@ -970,10 +970,14 @@ impl Domain for ParticleDomain {
         let unit = Invariant::Energy.si_unit();
         out.record_metric(format!("{prefix}.kinetic_energy"), kinetic, unit);
         out.record_metric(format!("{prefix}.potential_energy"), potential, unit);
-        // Under a thermostat the total is not an invariant and must not be reported as
-        // one: the whole point of the bath is that energy flows through it. The
-        // contract says so; the observation must agree with the contract.
-        if self.thermostat.is_none() {
+        // Under a thermostat, or with a force that does not derive from a potential
+        // (drag), the total is not an invariant and must not be reported as one:
+        // energy flows out on purpose, and a panel showing it as a conservation failure
+        // every step teaches its reader to ignore the panel. An open boundary deletes
+        // nothing, so it leaves the total an invariant and is not part of this test.
+        let exchanges_energy =
+            self.thermostat.is_some() || self.forces.iter().any(|f| !f.is_conservative());
+        if !exchanges_energy {
             out.record_invariant(format!("{prefix}.total_energy"), Invariant::Energy, kinetic + potential);
         } else {
             out.record_metric(format!("{prefix}.total_energy"), kinetic + potential, unit);
@@ -1498,6 +1502,42 @@ mod tests {
         let mut obs = Observations::new();
         single.observe(&mut obs);
         assert!(obs.value("one.temperature").is_none(), "a lone particle has no temperature");
+    }
+
+    /// The observation must agree with the contract: a scene whose energy flows out on
+    /// purpose publishes its total as a metric, never as an invariant that fails every
+    /// step. An open boundary deletes nothing, so it keeps the invariant.
+    #[test]
+    fn total_energy_is_an_invariant_only_where_energy_is_conserved() {
+        let kind_of = |d: &ParticleDomain, name: &str| {
+            let mut obs = Observations::new();
+            d.observe(&mut obs);
+            obs.get(&format!("{name}.total_energy")).map(|o| o.kind)
+        };
+        let scene = |name: &str| {
+            let mut d = ParticleDomain::new(name, 2).with_force(HarmonicWell::new([0.0, 0.0], 1.0));
+            d.spawn(ParticleSpec::at([1.0, 0.0]).with_mass(1.0)).unwrap();
+            d.spawn(ParticleSpec::at([0.0, 1.0]).with_mass(1.0)).unwrap();
+            d
+        };
+
+        let mut drag = scene("drag").with_force(LinearDrag::new(0.1));
+        drag.initialize();
+        assert!(matches!(kind_of(&drag, "drag"), Some(lattice_ir::ObservationKind::Metric)), "drag removes energy on purpose");
+
+        let mut bath = scene("bath").with_thermostat(Thermostat::VelocityRescale { temperature: 1.0, relaxation: 1.0 });
+        bath.initialize();
+        assert!(matches!(kind_of(&bath, "bath"), Some(lattice_ir::ObservationKind::Metric)), "a bath exchanges energy");
+
+        let mut open = scene("open").with_bounds(BoundaryBox::new([-5.0, -5.0], [5.0, 5.0], ParticleBoundary::Open));
+        open.initialize();
+        assert!(
+            matches!(kind_of(&open, "open"), Some(lattice_ir::ObservationKind::Invariant(Invariant::Energy))),
+            "an open boundary deletes nothing, so the total is still conserved"
+        );
+        // The difference from `is_energy_conserving`, pinned: that test also gives up
+        // on an open boundary, and the observation deliberately does not.
+        assert!(!open.is_energy_conserving());
     }
 
     #[test]

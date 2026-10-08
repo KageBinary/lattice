@@ -84,25 +84,59 @@ bare zero temperature is still a dimension error.
 
 ```text
 project  := 'project' IDENT '{' item* '}'
-item     := setting | decl | field | domain | solve | couple | observe | visualize
-setting  := IDENT ':' expr ';'
+item     := setting | decl | law | let | field | domain | solve | couple | observe | visualize
+setting  := IDENT ':' expr ('->' expr)? ';'
 decl     := IDENT IDENT ( '{' setting* '}' | IDENT args? ';' )
+law      := IDENT IDENT '(' (IDENT ':' type),* ')' ('->' type)? '{' stmt* '}'
+stmt     := 'let' IDENT '=' expr ';' | 'param' IDENT ':' type ('=' expr)? ';' | 'return' expr ';'
+type     := 'vec2' '<' unit '>' | unit | 'particle' | 'bool'
+let      := 'let' IDENT '=' expr ';'
 field    := ('field' | 'species') IDENT ('on' IDENT)? ('=' expr)? (';' | '{' setting* '}')
 solve    := 'solve' IDENT '(' args ')' 'with' IDENT '(' args ')' ';'
 couple   := 'couple' path '->' path ('conserve' IDENT)? ';'
 observe  := 'observe' expr ('every' expr)? ';'
 visualize:= 'visualize' expr ('as' IDENT)? ';'
+
+expr     := expr '||' expr | expr '&&' expr | sum (cmp sum)?     -- comparisons never chain
+cmp      := '<' | '<=' | '>' | '>=' | '==' | '!='
+sum      := product (('+' | '-') product)*
+product  := unary (('*' | '/') unary | IDENT)*                  -- adjacency is multiplication
+unary    := ('-' | '+' | '!')* power
+power    := postfix ('^' ('-' | '+')? INTEGER)?
+postfix  := primary ('.' IDENT | '(' args ')')*
+primary  := NUMBER | STRING | 'true' | 'false' | IDENT | '(' expr ')' | '[' list ']'
+          | 'if' expr '{' expr '}' 'else' ('{' expr '}' | primary-if)
 ```
 
 Declaration *kinds* are not reserved words. `grid`, `reaction`, `potential` and
 `wavepacket` all take the `IDENT IDENT { … }` path, and the compiler decides which it
 knows. Two things fall out: a new solver family needs no grammar change, and `grid:`
-works as a setting key (spec §25.2 uses it as both).
+works as a setting key (spec §25.2 uses it as both). A law has the same leading
+`IDENT IDENT`; the `(` after its name is what tells it from a block, so the quantum
+module's `potential barrier { … }` and a `potential lj(a: particle, b: particle)` live
+side by side.
 
 Reserved words are only: `project`, `field`, `species`, `domain`, `solve`, `couple`,
 `observe`, `visualize`, `import`, `on`, `with`, `as`, `every`, `conserve`, `true`,
-`false` — and even those are accepted as setting keys, where they cannot be anything
-else.
+`false`, `let`, `return`, `if`, `else` — and even those are accepted as setting keys,
+where they cannot be anything else. `param` is not reserved: it opens a statement only
+inside a law, where nothing else could stand.
+
+### Constants
+
+`let` at the top level of a project names a quantity, and a declared name beats a
+unit of the same spelling:
+
+```
+let k = 1.4e11 meter^2 / (mole second);
+let sigma = 3.4 angstrom;
+```
+
+Constants are evaluated before anything else, so every setting in the project may use
+any of them, wherever it is written. Among themselves they are ordered: each `let` may
+use only the ones above it. A name that is also a unit (`let m = …` hides the metre) is
+legal and warned about (`W0313`), because every `3 m` in the model then means three
+times the constant.
 
 ---
 
@@ -589,6 +623,96 @@ rather than refuse. Spec §25.2's own example triggers two of them.
 | `W0309` | a packet's wavenumbers reach the grid's Nyquist limit `π/Δ` | those momenta alias onto the opposite direction |
 | `W0310` | split-step's `dt` puts more than 2 radians of kinetic phase per step on the grid's top mode, with a wall or rectangle present | sharp edges reach the top modes, where the splitting error lives; a validated tunnelling case was 1.9% wrong at 7.5 radians |
 
+## User-defined laws
+
+Spec §8.3's *"restricted, typed, side-effect-free language"* for force laws. A law is
+declared once and used by name where a built-in force would be.
+
+> **Status (M6.1a):** laws parse, and are type- and unit-checked with every diagnostic
+> below, but a law that checks still ends in `E0900`: running one arrives in M6.1b.
+> A use site such as `force: spring(…)` names M6.1b too.
+
+```
+force spring(a: particle, b: particle) -> vec2<newton> {
+    param rest_length: meter;
+    param stiffness: newton / meter;
+    param damping: kilogram / second;
+    let dx = minimum_image(b.position - a.position);
+    let extension = length(dx) - rest_length;
+    return stiffness * extension * normalize(dx)
+         - damping * dot(b.velocity - a.velocity, normalize(dx)) * normalize(dx);
+}
+
+potential lj(a: particle, b: particle) -> joule {
+    param epsilon: joule;
+    param sigma: meter = 3.4 angstrom;
+    let s6 = (sigma / distance(a, b))^6;
+    return 4 * epsilon * (s6^2 - s6);
+}
+```
+
+That is §8.3's spring as the spec writes it, with one addition: the spec leaves
+`rest_length`, `stiffness` and `damping` unbound, and here each is a `param` with its
+unit. A `param`'s value is given where the law is used
+(`force: spring(rest_length=1 meter, stiffness=40 newton/meter, damping=0.2 kilogram/second)`),
+or falls back to its `= default`.
+
+### Kinds, and what each promises
+
+What each kind may read is enforced now; what it conserves is what the solver
+contract will state once laws run (M6.1b), and the read restrictions are what make
+those statements true.
+
+| Kind | Header | Returns | May read | Conserves |
+|---|---|---|---|---|
+| `potential` | `(a: particle, b: particle)` | `joule` | `distance(a, b)`, masses, charges | momentum and angular momentum by construction (the force is `−U′(r) r̂`); energy where `U` is continuous |
+| `potential` | `(a: particle)` | `joule` | `a.position`, mass, charge | energy where `U` is continuous (an external field) |
+| `force` | `(a: particle, b: particle)` | `vec2<newton>` | everything | momentum: the engine applies the opposite force to `b` |
+| `force` | `(a: particle)` | `vec2<newton>` | everything | nothing |
+
+The restrictions are type errors, not conventions. A pair `potential` that reads
+`a.position`, or any `potential` that reads a velocity, is refused (`E0412`): an energy
+that depends on more than the separation does not give a central, conservative force.
+What the restrictions cannot rule out is a potential that jumps or kinks: `if`, `abs`,
+`min` and `max` are all allowed, and at a jump the derived force is silent, so the
+integrator crosses it with a step change in energy. The contract says "where `U` is
+continuous" for that reason. A `force` may read anything, and is never credited with
+conserving energy.
+
+### Values and operations
+
+Every value is a scalar or a `vec2` of some dimension, or a truth value; units fold to
+SI constants at compile time, so `4 * epsilon` costs one multiplication at run time.
+
+| | |
+|---|---|
+| Particle members | `.position` (m), `.velocity` (m/s), `.mass` (kg), `.charge` (C) |
+| Vector components | `.x`, `.y` |
+| Arithmetic | `+ -` on matching shapes and dimensions; `*` and `/` of scalars and of a vector by a scalar; `^` with a whole-number exponent, on scalars |
+| Comparisons | `< <= > >= == !=` on scalars of one dimension, never chained (`E0111`) |
+| Logic | `&& || !` on truth values |
+| Choice | `if c { a } else { b }`, both arms one type; `else if` chains |
+| Functions | `sqrt abs min max clamp`; `exp ln sin cos tan erfc pow` of plain numbers; `atan2(y, x)`; `vec2 length dot cross normalize`; `minimum_image(dx)` and `distance(a, b)` in a pair law |
+
+Two vectors have no `*` (`E0410`): `dot` and `cross` say which product is meant. A
+bare `0` takes the dimension of what it meets, as it does in a setting, so
+`max(x, 0)` and `if r < 0 { … }` mean what they say. A name followed by `(` is a call
+even with a space between, so `4 epsilon (s - 1)` is refused with the fix
+(`epsilon * (s - 1)`) in the message.
+
+| Code | When |
+|---|---|
+| `E0111` | comparisons chained, `a < b < c` |
+| `E0112` | a statement other than `let`, `param`, `return` — there is no assignment |
+| `E0113` | an `if` without an `else` |
+| `E0410` | shapes that do not combine: a vector times a vector, a vector where a scalar is required |
+| `E0411` | the declared signature: not particles in the header, the wrong return type, or the body returning something else |
+| `E0412` | a name this law may not read here: a position in a pair potential, a velocity in any potential, `minimum_image` outside a pair |
+| `E0413` | a call: unknown function, wrong number of arguments, or a value called as a function |
+| `E0414` | a condition that is not a truth value |
+| `E0415` | a body with no `return`, or statements after it |
+| `W0313` | a `let` or `param` whose name is also a unit |
+
 ## Solving
 
 ```
@@ -628,17 +752,17 @@ visualize probability_density;         // the domain picks an encoding
 | Range | Meaning |
 |---|---|
 | `E00xx` | lexical: bad character, unterminated comment or string |
-| `E01xx` | syntax: unexpected token, reserved word as a name, bad exponent |
+| `E01xx` | syntax: unexpected token, reserved word as a name, bad exponent; in laws, chained comparisons (`E0111`), a bad statement (`E0112`), an `if` without `else` (`E0113`) |
 | `E02xx` | resolution: unknown name, duplicate declaration, unknown setting |
 | `E02xx` | also: unknown keyword value (`E0208`) |
 | `E021x` | geometry and chemistry: unknown builtin (`E0210`), invalid shape or formula (`E0211`), unbalanced reaction (`E0212`) |
-| `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range |
+| `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range; in laws, `E0410`–`E0415` (see [User-defined laws](#user-defined-laws)) |
 | `E09xx` | not implemented yet — the message names the milestone |
-| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), and charges that do not suit a Coulomb law (`W0311`–`W0312`) |
+| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), charges that do not suit a Coulomb law (`W0311`–`W0312`), and a name that hides a unit (`W0313`) |
 
 Every rejection carries a source position and either a suggested fix or the rule it
 enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the
-twenty-six models in `tests/invalid/`.
+45 models in `tests/invalid/`.
 
 ---
 
@@ -652,7 +776,9 @@ numbers.
 | Construct | Milestone |
 |---|---|
 | `domain fluid2d` | M4 |
-| user-defined expressions and force laws (spec §8.3) | M6 |
+| running a `force` or `potential` law, and using one in `force:` (spec §8.3) | M6.1b |
+| a reaction's `stoichiometry:`, `heat_release:`, or a `rate:` that reads `c(…)`, a member or `temperature` (spec §8.3) | M6.1c |
+| `observer` laws | M6.2 |
 
 Stochastic kinetics (Gillespie) is not implemented either, but it has no syntax of its
 own — a `solve reactions(…) with gillespie(…)` would be the way in, and it reports an

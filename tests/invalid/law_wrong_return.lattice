@@ -1,0 +1,11 @@
+// expect: E0411
+// Momentum is not a force. The return type is checked against the dimension the
+// body's units actually produce.
+
+project law_wrong_return {
+  dimensions: 2;
+
+  force f(a: particle) -> vec2<newton> {
+    return a.mass * a.velocity;
+  }
+}
