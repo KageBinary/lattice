@@ -1,0 +1,20 @@
+// expect: E0412
+// `minimum_image` is the separation of the law's two particles through the nearest
+// periodic image. The image of an arbitrary vector would need the box, which a law
+// is not given.
+
+project law_minimum_image_of_a_sum {
+  dimensions: 2;
+
+  force push(a: particle, b: particle) -> vec2<newton> {
+    return 1 newton / meter * minimum_image(a.position + b.position);
+  }
+
+  particles beads {
+    count: 4;
+    region: [4 meter, 4 meter];
+    spacing: 1 meter;
+    mass: 1 kilogram;
+    force: push(cutoff=1.5 meter);
+  }
+}

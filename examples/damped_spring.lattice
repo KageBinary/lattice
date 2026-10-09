@@ -1,0 +1,47 @@
+// Spec §8.3's user-defined force: two beads on a damped spring.
+//
+// The law is written in the language, checked for units, compiled to a program, and
+// run in the particle loop. A pair `force` returns the force on `a`, with
+// `minimum_image(b.position - a.position)` pointing from a to b; the engine applies the
+// opposite force to `b`, so momentum is conserved by construction.
+//
+// One sign differs from the spec. §8.3 writes the damping term as
+// `- damping * dot(...)`, which in this convention (and in the other one, where the
+// spring term would be wrong instead) does positive work on the pair: it feeds energy
+// in, and the beads fly apart. Damping on `a` is `+c (v_rel . d) d`. The compiler
+// checks for exactly this — the spec's line draws warning W0317.
+//
+// The beads start 0.2 m stretched. The oscillation decays at c / 2mu = 0.2 per second
+// (mu = 0.5 kg is the reduced mass) and rings at sqrt(k/mu - (c/2mu)^2) = 8.94 rad/s.
+//
+//   lattice run examples/damped_spring.lattice
+
+project damped_spring {
+  dimensions: 2;
+  duration: 20 second;
+
+  force spring(a: particle, b: particle) -> vec2<newton> {
+      param rest_length: meter;
+      param stiffness: newton / meter;
+      param damping: kilogram / second;
+      let dx = minimum_image(b.position - a.position);
+      let extension = length(dx) - rest_length;
+      return stiffness * extension * normalize(dx)
+           + damping * dot(b.velocity - a.velocity, normalize(dx)) * normalize(dx);
+  }
+
+  particles beads {
+    count: 2;
+    region: [4 meter, 4 meter];
+    spacing: 1.2 meter;
+    mass: 1 kilogram;
+    force: spring(rest_length=1 meter, stiffness=40 newton/meter,
+                  damping=0.2 kilogram/second, cutoff=1.9 meter);
+  }
+
+  // A force's stiffness cannot be read off its formula, so the step is ours to choose
+  // (W0314 says so): the fastest motion is the 8.94 rad/s ring, a 0.7 s period, and a
+  // millisecond resolves it seven hundred times over.
+  solve dynamics(beads) with velocity_verlet(dt=0.001 second);
+  observe beads every 0.5 second;
+}

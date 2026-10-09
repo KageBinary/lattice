@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-Rust 1.85 or newer (edition 2024). No other tools are needed. Sixteen of the nineteen
+Rust 1.85 or newer (edition 2024). No other tools are needed. Seventeen of the twenty
 crates have no external dependencies at all: the two that open a window, and the portable
 GPU backend, are the exceptions.
 
@@ -34,7 +34,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test --workspace --all-features # 1178 tests including doctests across 19 crates
+$ cargo test --workspace --all-features # 1258 tests including doctests across 20 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window

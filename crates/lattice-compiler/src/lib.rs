@@ -62,6 +62,8 @@ pub mod chemistry;
 pub mod compile;
 pub mod eval;
 pub mod laws;
+pub mod lower_law;
+pub mod user_force;
 pub mod molecular;
 pub mod quantum;
 pub mod rigid;
@@ -698,16 +700,21 @@ project orbit {
         assert!(codes.contains(&"E0201".to_string()), "{codes:?}");
     }
 
-    /// The use site names the law and its milestone, rather than calling it an unknown
-    /// force: the fixture cannot tell this E0900 from the declaration's, so this does.
+    /// A law used by name compiles into the particle set, and the report carries its
+    /// bindings and its contract.
     #[test]
-    fn a_law_used_by_name_says_when_it_can_run() {
-        let (text, _) = err("project p {
-            force push(a: particle) -> vec2<newton> { return vec2(1 newton, 0 newton); }
-            particles s { count: 1; mass: 1 kilogram; force: push(); }
+    fn a_law_used_by_name_is_bound_and_described() {
+        let compiled = ok("project p {
+            force push(a: particle) -> vec2<newton> {
+                param strength: newton;
+                return vec2(strength, 0 newton);
+            }
+            particles s { count: 1; mass: 1 kilogram; force: push(strength=2 newton); }
+            solve dynamics(s) with velocity_verlet(dt=0.01 second);
         }");
-        assert!(text.contains("`push` is a user-defined law, and using one is not implemented yet"), "{text}");
-        assert!(!text.contains("E0210"), "not reported as an unknown force:\n{text}");
+        let summary = &compiled.model.domains[0].summary;
+        assert!(summary.contains("user force `push`") && summary.contains("strength = 2.0000e0"), "{summary}");
+        assert!(summary.contains("conserves nothing by construction"), "{summary}");
     }
 
     /// A rate that reads `temperature` is the state — unless `temperature` is a constant.
@@ -730,5 +737,128 @@ project orbit {
         let (_, codes) = err(&mixture("", "temperature / (300 kelvin second)"));
         assert!(codes.contains(&"E0900".to_string()), "{codes:?}");
         ok(&mixture("let temperature = 300 kelvin;", "temperature / (300 kelvin second)"));
+    }
+
+    // --- user laws at their use site (M6.1b) -------------------------------------
+
+    /// Two particles one metre apart in a set using `law` through `force_line`.
+    fn pair_model(law: &str, force_line: &str, charge: &str) -> String {
+        format!(
+            "project p {{
+               duration: 1 second;
+               {law}
+               particles s {{
+                 count: 2; region: [4 meter, 4 meter]; spacing: 1 meter; mass: 1 kilogram;
+                 {charge}
+                 force: {force_line};
+               }}
+               solve dynamics(s) with velocity_verlet(dt=0.001 second);
+             }}"
+        )
+    }
+
+    fn warnings(source: &str) -> Vec<String> {
+        let (_, diagnostics, file) = build(source);
+        assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+        diagnostics.codes().into_iter().map(String::from).collect()
+    }
+
+    const SPEC_SPRING: &str = "force spring(a: particle, b: particle) -> vec2<newton> {
+        param rest_length: meter;
+        param stiffness: newton / meter;
+        param damping: kilogram / second;
+        let dx = minimum_image(b.position - a.position);
+        let extension = length(dx) - rest_length;
+        return stiffness * extension * normalize(dx)
+             - damping * dot(b.velocity - a.velocity, normalize(dx)) * normalize(dx);
+    }";
+
+    const SPRING_USE: &str =
+        "spring(rest_length=1 meter, stiffness=40 newton/meter, damping=0.2 kilogram/second, cutoff=1.9 meter)";
+
+    /// Spec §8.3's spring as written feeds energy in, and is told so; with the sign that
+    /// makes it a damper it is not. Either way a force does not limit the step.
+    #[test]
+    fn the_spec_spring_draws_the_sign_warning_and_the_corrected_one_does_not() {
+        let spec = warnings(&pair_model(SPEC_SPRING, SPRING_USE, ""));
+        assert!(spec.contains(&"W0317".to_string()) && spec.contains(&"W0314".to_string()), "{spec:?}");
+        let corrected = warnings(&pair_model(&SPEC_SPRING.replace("- damping", "+ damping"), SPRING_USE, ""));
+        assert!(!corrected.contains(&"W0317".to_string()), "{corrected:?}");
+    }
+
+    /// A potential with a well limits the step; an untruncated one with energy at its
+    /// cutoff is warned about; an unused law is pointed out.
+    #[test]
+    fn potential_warnings_fire_when_they_should() {
+        let well = "potential well(a: particle, b: particle) -> joule {
+            param k: newton / meter;
+            return 0.5 * k * (distance(a, b) - 1 meter)^2;
+        }";
+        let shifted = warnings(&pair_model(well, "well(k=10 newton/meter, cutoff=2 meter)", ""));
+        assert!(!shifted.contains(&"W0314".to_string()), "a well sets the step: {shifted:?}");
+        assert!(!shifted.contains(&"W0315".to_string()), "energy_shift is the default: {shifted:?}");
+        let bare = warnings(&pair_model(well, "well(k=10 newton/meter, cutoff=2 meter, truncation=none)", ""));
+        assert!(bare.contains(&"W0315".to_string()), "{bare:?}");
+        let (_, diagnostics, _) = build(&format!("project p {{ dimensions: 2; {well} }}"));
+        assert_eq!(diagnostics.codes(), ["W0316"]);
+    }
+
+    /// A potential that reads charges is shifted at its cutoff pair by pair, with each
+    /// pair's own charges. Two opposite charges at 1 m with a 2 m cutoff:
+    /// `U − U(r_c) = k q_a q_b (1/r − 1/r_c)`.
+    #[test]
+    fn a_charged_potential_is_shifted_pair_by_pair() {
+        let law = "potential coulomb_like(a: particle, b: particle) -> joule {
+            param k: newton * meter^2 / coulomb^2;
+            return k * a.charge * b.charge / distance(a, b);
+        }";
+        let compiled = ok(&pair_model(law, "coulomb_like(k=2 newton meter^2 / coulomb^2, cutoff=2 meter)", "charge: alternating(3 coulomb);"));
+        assert!(compiled.model.domains[0].summary.contains("shifted pair by pair"), "{}", compiled.model.domains[0].summary);
+        let mut observations = lattice_ir::Observations::new();
+        compiled.domains[0].observe(&mut observations);
+        let energy = observations.value("s.potential_energy").unwrap();
+        let expected = 2.0 * 3.0 * -3.0 * (1.0 / 1.0 - 1.0 / 2.0);
+        assert!((energy - expected).abs() < 1e-12, "{energy} against {expected}");
+    }
+
+    /// Both truncations of a user potential give the built-in's pair energy: the two
+    /// particles of `pair_model` sit 1 m apart, inside a 2.5 m cutoff. The formulas
+    /// differ (`σ/r` against `1/r²`), so the agreement is to their rounding, 64 ε_mach of
+    /// the energy's terms, as the validation suite derives.
+    #[test]
+    fn user_truncations_match_the_builtin_energies() {
+        use lattice_domain_particle::{LennardJones, Truncation};
+        let law = "potential lj(a: particle, b: particle) -> joule {
+            param epsilon: joule;
+            param sigma: meter;
+            let s6 = (sigma / distance(a, b))^6;
+            return 4 * epsilon * (s6^2 - s6);
+        }";
+        let (epsilon, sigma, cutoff, r) = (1.0, 0.95, 2.5, 1.0);
+        for (written, truncation) in [("energy_shift", Truncation::EnergyShift), ("force_shift", Truncation::ForceShift)] {
+            let compiled = ok(&pair_model(
+                law,
+                &format!("lj(epsilon={epsilon} joule, sigma={sigma} meter, cutoff={cutoff} meter, truncation={written})"),
+                "",
+            ));
+            let mut observations = lattice_ir::Observations::new();
+            compiled.domains[0].observe(&mut observations);
+            let user = observations.value("s.potential_energy").unwrap();
+            let builtin = LennardJones::with_truncation(epsilon, sigma, cutoff, truncation).pair_energy(r);
+            let s6 = (sigma / r).powi(6);
+            let terms = 4.0 * epsilon * (s6 * s6 + s6);
+            assert!((user - builtin).abs() <= 64.0 * f64::EPSILON * terms, "{written}: {user} against {builtin}");
+        }
+    }
+
+    /// A potential that divides by a member the set gives as zero is refused, rather
+    /// than shifting every pair by an infinity.
+    #[test]
+    fn a_potential_infinite_at_its_cutoff_is_refused() {
+        let law = "potential bad(a: particle, b: particle) -> joule {
+            return 1 joule * coulomb^2 / (a.charge * b.charge) * meter / distance(a, b);
+        }";
+        let (_, codes) = err(&pair_model(law, "bad(cutoff=2 meter)", ""));
+        assert!(codes.contains(&"E0405".to_string()), "{codes:?}");
     }
 }

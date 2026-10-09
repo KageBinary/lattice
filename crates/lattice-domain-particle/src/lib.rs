@@ -78,6 +78,7 @@ mod image;
 mod integrator;
 mod neighbors;
 mod thermostat;
+pub mod user;
 mod verlet;
 
 pub use bonded::{Angle, Bond, HarmonicAngle, HarmonicBond};
@@ -90,6 +91,7 @@ pub use forces::{
 pub use image::MinimumImage;
 pub use integrator::{Integrator, LangevinBath, PARTICLE_GRAIN};
 pub use neighbors::CellList;
+pub use user::{UserLaw, UserLawKind};
 pub use thermostat::{ornstein_uhlenbeck_coefficients, rescale_velocities, Thermostat, BOLTZMANN};
 pub use verlet::{Exclusions, NeighborList, VerletList};
 

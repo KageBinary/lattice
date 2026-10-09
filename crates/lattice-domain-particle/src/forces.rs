@@ -62,10 +62,17 @@ impl ForceContext<'_> {
 /// A contribution to the forces on a particle system.
 pub trait ForceLaw: fmt::Debug + Send + Sync {
     /// Short name, used in diagnostics and the model report.
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// True if this law derives from a potential and therefore conserves energy.
     fn is_conservative(&self) -> bool;
+
+    /// True if this law's forces sum to zero over the system, so total momentum is
+    /// untouched by it: a pair or bonded law, equal and opposite by construction. An
+    /// external field — gravity, drag, a well — pushes the whole system and does not.
+    fn conserves_momentum(&self) -> bool {
+        true
+    }
 
     /// The interaction cutoff, if this law needs a neighbour list.
     fn cutoff(&self) -> Option<f64> {
@@ -131,7 +138,7 @@ fn lightest_mass(store: &ParticleStore) -> Option<f64> {
 /// and velocity Verlet are stable below `2/ω`, and MD practice resolves the fastest
 /// period with 20–50 steps. The conservative end is taken, since a dense phase
 /// samples steeper parts of a potential than its minimum.
-fn pair_mode_limit(store: &ParticleStore, stiffness: f64) -> Option<StableStep> {
+pub(crate) fn pair_mode_limit(store: &ParticleStore, stiffness: f64) -> Option<StableStep> {
     let m_min = lightest_mass(store)?;
     if stiffness <= 0.0 {
         return None;
@@ -176,6 +183,10 @@ impl ForceLaw for UniformAcceleration {
 
     fn is_conservative(&self) -> bool {
         true
+    }
+
+    fn conserves_momentum(&self) -> bool {
+        false
     }
 
     fn accumulate(&self, view: &mut ForceAccumulation<'_>, _ctx: &ForceContext<'_>) {
@@ -225,6 +236,10 @@ impl ForceLaw for LinearDrag {
     }
 
     fn is_conservative(&self) -> bool {
+        false
+    }
+
+    fn conserves_momentum(&self) -> bool {
         false
     }
 
@@ -284,6 +299,10 @@ impl ForceLaw for HarmonicWell {
 
     fn is_conservative(&self) -> bool {
         true
+    }
+
+    fn conserves_momentum(&self) -> bool {
+        false
     }
 
     fn accumulate(&self, view: &mut ForceAccumulation<'_>, _ctx: &ForceContext<'_>) {

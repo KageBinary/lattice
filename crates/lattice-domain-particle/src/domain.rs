@@ -520,7 +520,7 @@ impl ParticleDomain {
     }
 
     /// Names of the active force laws, for the model report.
-    pub fn force_names(&self) -> Vec<&'static str> {
+    pub fn force_names(&self) -> Vec<&str> {
         self.forces.iter().map(|f| f.name()).collect()
     }
 
@@ -653,10 +653,14 @@ impl ParticleDomain {
 
     /// True when nothing external acts on the total momentum.
     ///
-    /// Pair and bonded laws conserve it by construction; a Langevin bath kicks every
-    /// particle independently and does not.
+    /// Pair and bonded laws conserve it by construction. A Langevin bath kicks every
+    /// particle independently, an external field (gravity, drag, a well, a user law on
+    /// one particle) pushes the whole system, and a reflecting wall reverses whatever
+    /// reaches it; none of those does.
     pub fn is_momentum_conserving(&self) -> bool {
         !matches!(self.thermostat, Some(Thermostat::Langevin { .. }))
+            && self.forces.iter().all(|f| f.conserves_momentum())
+            && self.bounds.is_none_or(|b| b.x != ParticleBoundary::Reflective && b.y != ParticleBoundary::Reflective)
     }
 }
 
@@ -1538,6 +1542,35 @@ mod tests {
         // The difference from `is_energy_conserving`, pinned: that test also gives up
         // on an open boundary, and the observation deliberately does not.
         assert!(!open.is_energy_conserving());
+    }
+
+    /// Momentum is an invariant only when nothing external acts: a well pushes the
+    /// whole system, so does gravity, and a reflecting wall reverses what reaches it.
+    #[test]
+    fn momentum_is_an_invariant_only_when_nothing_external_acts() {
+        let kind_of = |d: &ParticleDomain, name: &str| {
+            let mut obs = Observations::new();
+            d.observe(&mut obs);
+            obs.get(&format!("{name}.momentum_x")).map(|o| o.kind)
+        };
+        let pair = |name: &str| {
+            let mut d = ParticleDomain::new(name, 2);
+            d.spawn(ParticleSpec::at([1.0, 1.0]).with_mass(1.0)).unwrap();
+            d.spawn(ParticleSpec::at([2.0, 1.0]).with_mass(1.0)).unwrap();
+            d
+        };
+
+        let mut free = pair("free");
+        free.initialize();
+        assert!(matches!(kind_of(&free, "free"), Some(lattice_ir::ObservationKind::Invariant(_))));
+
+        let mut well = pair("well").with_force(HarmonicWell::new([0.0, 0.0], 1.0));
+        well.initialize();
+        assert!(matches!(kind_of(&well, "well"), Some(lattice_ir::ObservationKind::Metric)), "a well is external");
+
+        let mut walled = pair("walled").with_bounds(BoundaryBox::new([0.0, 0.0], [4.0, 4.0], ParticleBoundary::Reflective));
+        walled.initialize();
+        assert!(matches!(kind_of(&walled, "walled"), Some(lattice_ir::ObservationKind::Metric)), "a wall reflects");
     }
 
     #[test]

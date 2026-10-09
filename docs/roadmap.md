@@ -689,8 +689,8 @@ rest build on its parameter surface.
 | Stage | Result | State |
 |---|---|---|
 | M6.1a | the law grammar, `let` constants, and a type and unit checker | ✅ |
-| M6.1b | a std-only `lattice-expr` crate: a scalar interpreter, user `force`/`potential` in the particle domain, derived forces and per-law contracts | next |
-| M6.1c | §8.3's reaction form: `stoichiometry`, `heat_release`, rate laws reading concentrations and temperature | |
+| M6.1b | a std-only `lattice-expr` crate: a scalar interpreter, user `force`/`potential` in the particle domain, derived forces and per-law contracts | ✅ |
+| M6.1c | §8.3's reaction form: `stoichiometry`, `heat_release`, rate laws reading concentrations and temperature | next |
 | M6.1d | a batched interpreter bit-identical to the scalar one, non-finite tracing to source, `lattice inspect expr` | |
 | M6.2 | `observer` laws and the Rust observer SDK — the exit condition's "and observer" | |
 | M6.3 | WGSL lowering, with a budget derived per expression as M4.2 did per kernel | |
@@ -760,6 +760,116 @@ law named like a built-in force is refused. Each has a fixture.
   `epsilon` and then reads `epsilon(…)` as a call. The grammar already worked this way
   for `f(x)`, and changing it would break call syntax. The checker now names the case
   and gives the fix: "`epsilon` is a value, not a function; write `epsilon * (…)`".
+
+### M6.1b — Laws that run ✅
+
+A `force` or `potential` on particles now compiles and runs, with no `E0900`.
+
+- **`lattice-expr`** is a new standard-library-only crate, the twentieth. It holds a law
+  as a program of `f64` operations in single-assignment form. Its builder removes
+  repeated subexpressions and folds constants, and nothing else, so it never changes a
+  value. A forward-mode transform gives a potential's exact derivative as a second
+  program. The interpreter runs on a stack register file and allocates nothing.
+- **The compiler** lowers a checked law into that program, splitting vectors into
+  components in the author's operation order. At the use site it binds parameters by
+  name, reads `cutoff=` and `truncation=`, and writes the law's contract into the model
+  report. For a pair potential that contract says "energy to integration error", "up to
+  the force step `U′(r_c)`", or "jumps by `U(r_c)` at each crossing", per truncation,
+  and claims angular momentum only in open space, since a periodic seam breaks it.
+- **The particle domain** runs a `UserLaw` like any built-in. A pair force is applied
+  equal and opposite, with the neighbour list's own separation. A pair potential's force
+  is `U′(r) d̂`, the derivative the compiler took, never a finite difference.
+- **Masses and charges.** A potential that reads `mass` or `charge` has its truncation
+  constants evaluated per pair, with that pair's members. The compiler samples it with
+  the set's own mass and each charge pairing the set contains (all four orderings of
+  `±q`, for `alternating(q)`). One that is not finite at its cutoff for those particles, such as
+  one dividing by a charge the set gives as zero, is refused (`E0405`).
+
+Four new warnings tell the user what the engine cannot promise:
+- `W0314`: a law that does not limit the timestep: a force, whose stiffness cannot be
+  read off its formula, or a potential with no well inside its cutoff.
+- `W0315`: an untruncated potential whose energy at the cutoff is not zero.
+- `W0316`: an unused law.
+- `W0317`: a pair force whose velocity terms do positive work on the pair.
+
+One fix outside the laws themselves, of the same kind as M6.1a's drag fix: momentum is
+now an invariant only when nothing external acts. A new `ForceLaw::conserves_momentum`
+is false for gravity, drag, a harmonic well and a user law on one particle, and a
+reflecting wall also rules it out. Before, a scene with gravity reported a momentum
+conservation failure every step.
+
+A pair potential with a well inside its cutoff limits the step like a built-in: the
+compiler finds the well by sampling and differentiates the program twice for `U″` there.
+
+Validation, four new cases (`lattice validate --filter laws`) and one extended:
+
+- **Bit-identical to the built-in.** A Lennard-Jones force written in the built-in's
+  operation order gives the built-in's trajectory exactly: 100 atoms over 1,000 steps,
+  0 of 400 position and velocity values differing.
+- **Matches the built-in's force.** The force derived from a natural-form potential,
+  `4ε(s¹² − s⁶)`, agrees with the built-in's to 2.4 ε_mach of the force's terms, against
+  a bound of 64 derived from the two formulas' operation counts.
+- **Exactly the gradient.** The compiled derivative agrees with a central difference of
+  the energy to 0.84 of that difference's own derived error bound.
+- **Decays at the analytic rate.** §8.3's damped spring, Richardson-extrapolated from
+  two steps to cancel velocity Verlet's first-order damping error, decays at `c/2μ` to
+  6.7e-5 relative. The bound is `(ω₀ dt)² = 1.3e-3`, an order-of-magnitude bound and
+  stated as one. The first-order error, order 1.01, is printed beside the half-step
+  lag's linearized prediction. The measurement is 12% below that prediction, which is
+  not explained, so the coefficient is not asserted.
+- **Thread-count identity.** The existing case now runs a user-defined potential (a trap
+  with a vector parameter) alongside the built-ins on 80,000 particles: bit-identical on
+  1, 2, 3 and 8 threads.
+
+`lattice bench particles-lj-expr` times `particles-lj`'s fluid with Lennard-Jones as a
+user potential, under the same correctness checks. It runs 3.7× slower than the
+built-in at 1,024 atoms and 4.8× slower at 16,384 (median of three, idle machine). The
+built-in skips the square root and the derivative pass, and M6.1d's batched interpreter
+is where that gap is meant to close. An exact benchmark name now selects that benchmark
+alone; `particles-lj` used to match `particles-lj-expr` too.
+
+[`examples/damped_spring.lattice`](../examples/damped_spring.lattice) is §8.3's spring.
+1,258 tests, 47 invalid fixtures, 73 validation cases. The compiler's tests assert each
+of `W0314`–`W0317`, including that §8.3's spring as written draws `W0317` and the
+corrected one does not, and that both truncations of a user potential match the
+built-in's energies.
+
+### What M6.1b taught us
+
+- **The spec's own example is wrong again, and the engine now catches it.** §8.3's
+  spring subtracts its damping term. With the force returned on `a` and `d` pointing
+  from `a` to `b`, that term does positive work, and the beads gained energy: 3.46 J of
+  kinetic energy from a spring holding 0.8 J. Under the other convention, the spring term
+  would be the wrong one instead. Spec §25.2's double slit was wrong in M5.2 too. This
+  time the fix is a sampled check that applies to every user, not just the example:
+  `W0317` measures the work a pair force's velocity terms do and flags a damper with the
+  wrong sign.
+- **A bound has to be derived for the case that exercises it, and checked when it
+  fails.** The gradient case failed twice before it passed, and neither time was the
+  compiler at fault.
+  - The first failure was the rounding of `r ± h`: the step actually taken was not `2h`.
+    The fix divides by `(r+h) − (r−h)`, which is exact.
+  - The second was two slips in the bound itself: `powi(s, 6)`'s error counted as `9u`
+    instead of `11u`, and `U‴`'s coefficient taken as 11·12·13 instead of 12·13·14.
+    Only the second was binding, because the worst point, on the repulsive wall, is
+    truncation-dominated. The case now prints the worst point's error components, so
+    the next failure says which term to look at.
+- **A velocity-dependent force sees the half-kicked velocity.** Velocity Verlet evaluates
+  forces with `v(t + dt/2)`, so a damper lags half a step and its decay rate is wrong at
+  first order in `dt`. The first draft asserted that order inside a bare ±0.2 band and
+  claimed to check a coefficient it only printed; the spec audit caught both.
+  Richardson extrapolation cancels the first-order term whatever its coefficient, so the
+  case now asserts the answer, `c/2μ`, not the error's shape.
+- **Sampling a law means sampling it with real particles.** The first draft sampled
+  every pair potential at zero mass and zero charge: for its truncation constants, its
+  well, its warnings and its report line. A charged potential `k q_a q_b / r` therefore
+  came out unshifted and with no well, under a contract that said otherwise, and one
+  dividing by a charge would have shifted every pair by an infinity. The blind review
+  traced it. The constants are now per pair at run time, and the compiler samples with
+  the set's own particles.
+- **The trait's names were `'static`, and a user's is not.** `ForceLaw::name` returned
+  `&'static str`, so no law could name itself after its declaration. The trait now
+  returns a borrowed `&str`; every built-in still satisfies it unchanged.
 
 ## Outside the milestones: the playground
 

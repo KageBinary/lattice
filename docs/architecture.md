@@ -512,9 +512,11 @@ order, while its CPU pair-scatter reference remains unchanged.
 
 - **No iterative coupling scheduler.** One-way and loose staggered exchanges are
   implemented; fixed-point groups need checkpointing and convergence controls.
-- **No user-defined expressions.** Spec §8.3's expression language, which compiles
-  custom force and rate laws to CPU and GPU kernels, is M6. Until then the builtin
-  vocabulary is a closed set, and an unrecognized function is an error that *lists what
+- **User-defined laws run on the CPU only, and only for particles.** Spec §8.3's
+  expression language now compiles `force` and `potential` laws to a program in the
+  `lattice-expr` crate, run by an interpreter in the particle domain's force loop (M6.1b).
+  Rate laws (M6.1c) and GPU lowering (M6.3) are not built, and the builtin vocabulary
+  elsewhere is still a closed set: an unrecognized function is an error that *lists what
   is available*.
 - **No general GPU model scheduler.** The released GPU solvers provide composable
   command encoding, but arbitrary coupled models still execute on the CPU.

@@ -9,6 +9,7 @@ description = "2D particle dynamics: integrators, force laws, neighbour search"
 [dependencies]
 lattice-ir.workspace = true
 lattice-units.workspace = true
+lattice-expr.workspace = true
 
 [lints]
 workspace = true

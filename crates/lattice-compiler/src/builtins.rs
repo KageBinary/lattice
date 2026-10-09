@@ -534,6 +534,8 @@ pub enum ForceSpec {
         /// Damping α, 1/m.
         damping: f64,
     },
+    /// A user-defined law (spec §8.3), bound at its use site.
+    User(Box<crate::user_force::UserForce>),
 }
 
 /// The damping a `coulomb` force takes when none is written: `α R = 2.4`, Fennell and
@@ -567,6 +569,7 @@ impl ForceSpec {
             ForceSpec::Coulomb { cutoff, damping } => {
                 format!("Coulomb (damped shifted force) cutoff = {cutoff:.4e} m, alpha = {damping:.4e} 1/m")
             }
+            ForceSpec::User(user) => user.description.clone(),
         }
     }
 
@@ -581,6 +584,7 @@ impl ForceSpec {
             ForceSpec::LennardJones { cutoff, .. } => Some(*cutoff),
             ForceSpec::SoftRepulsion { range, .. } => Some(*range),
             ForceSpec::Coulomb { cutoff, .. } => Some(*cutoff),
+            ForceSpec::User(user) => user.law.pair_cutoff(),
             _ => None,
         }
     }

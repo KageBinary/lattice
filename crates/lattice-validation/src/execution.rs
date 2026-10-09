@@ -59,7 +59,7 @@ pub(crate) static CASES: &[Case] = &[
         name: "particle_trajectories_match_across_thread_counts",
         domain: "cpu",
         level: Level::CrossBackend,
-        claim: "per-particle force laws and every integrator give bit-identical trajectories on 1, 2, 3 and 8 threads",
+        claim: "per-particle force laws, a user-defined law, and every integrator give bit-identical trajectories on 1, 2, 3 and 8 threads",
         run: particle_trajectories_match,
     },
     Case {
@@ -226,7 +226,9 @@ fn particle_domain() -> ParticleDomain {
     let mut domain = ParticleDomain::new("cloud", PARTICLE_COUNT)
         .with_integrator(Integrator::VelocityVerlet)
         .with_force(UniformAcceleration::earth_gravity())
-        .with_force(HarmonicWell::new([0.5, 0.5], 3.0));
+        .with_force(HarmonicWell::new([0.5, 0.5], 3.0))
+        // A user-defined law (spec §8.3), so the promise covers compiled laws too.
+        .with_force(crate::laws::user_trap());
     for index in 0..PARTICLE_COUNT {
         let t = index as f64 * 7.0e-4;
         domain

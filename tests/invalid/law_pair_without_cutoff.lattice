@@ -1,0 +1,22 @@
+// expect: E0203
+// A pair law is evaluated through a neighbour list, which needs to know how far to
+// look: the use site gives the cutoff.
+
+project law_pair_without_cutoff {
+  dimensions: 2;
+
+  force spring(a: particle, b: particle) -> vec2<newton> {
+    param rest_length: meter;
+    param stiffness: newton / meter;
+    let d = minimum_image(b.position - a.position);
+    return stiffness * (length(d) - rest_length) * normalize(d);
+  }
+
+  particles beads {
+    count: 4;
+    region: [4 meter, 4 meter];
+    spacing: 1 meter;
+    mass: 1 kilogram;
+    force: spring(rest_length=1 meter, stiffness=40 newton/meter);
+  }
+}

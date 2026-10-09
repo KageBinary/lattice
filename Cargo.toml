@@ -16,6 +16,7 @@ lattice-units = { path = "crates/lattice-units", version = "0.1.0" }
 lattice-compute = { path = "crates/lattice-compute", version = "0.1.0" }
 lattice-cpu = { path = "crates/lattice-cpu", version = "0.1.0" }
 lattice-ir = { path = "crates/lattice-ir", version = "0.1.0" }
+lattice-expr = { path = "crates/lattice-expr", version = "0.1.0" }
 lattice-syntax = { path = "crates/lattice-syntax", version = "0.1.0" }
 lattice-compiler = { path = "crates/lattice-compiler", version = "0.1.0" }
 lattice-runtime = { path = "crates/lattice-runtime", version = "0.1.0" }

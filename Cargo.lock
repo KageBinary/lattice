@@ -1663,6 +1663,7 @@ dependencies = [
  "lattice-domain-particle",
  "lattice-domain-quantum2d",
  "lattice-domain-rigid2d",
+ "lattice-expr",
  "lattice-ir",
  "lattice-runtime",
  "lattice-syntax",
@@ -1709,6 +1710,7 @@ dependencies = [
 name = "lattice-domain-particle"
 version = "0.1.0"
 dependencies = [
+ "lattice-expr",
  "lattice-ir",
  "lattice-units",
 ]
@@ -1727,6 +1729,10 @@ version = "0.1.0"
 dependencies = [
  "lattice-ir",
 ]
+
+[[package]]
+name = "lattice-expr"
+version = "0.1.0"
 
 [[package]]
 name = "lattice-ir"
@@ -1779,6 +1785,7 @@ version = "0.1.0"
 name = "lattice-validation"
 version = "0.1.0"
 dependencies = [
+ "lattice-compiler",
  "lattice-compute",
  "lattice-coupling",
  "lattice-domain-chemistry",

@@ -243,6 +243,8 @@ struct Compiler<'a> {
     laws: Vec<TypedLaw>,
     /// Every declared law's name, checked or not, so a use site can say what it names.
     law_names: Vec<String>,
+    /// The laws some particle set used, so an unused one can be pointed out.
+    used_laws: std::collections::BTreeSet<String>,
     notes: Vec<String>,
 }
 
@@ -296,6 +298,7 @@ impl<'a> Compiler<'a> {
             constants: Vec::new(),
             laws: Vec::new(),
             law_names: Vec::new(),
+            used_laws: std::collections::BTreeSet::new(),
             notes: Vec::new(),
         }
     }
@@ -338,10 +341,8 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Type-check every user-defined law (spec §8.3).
-    ///
-    /// Until M6.1b a law that checks still cannot run, and says so: a model whose
-    /// force was silently dropped would run and give confident, wrong numbers.
+    /// Type-check every user-defined law (spec §8.3). A law that checks is bound where
+    /// a particle set uses it; one that is never used is pointed out (`W0316`).
     fn declare_laws(&mut self, project: &Project) {
         // A law named like a built-in force would silently take `force: drag(…)` from
         // it; the built-in names are not free.
@@ -363,19 +364,8 @@ impl<'a> Compiler<'a> {
             .filter(|name| !builtins::FORCES.contains(&name.as_str()))
             .collect();
         self.laws = laws::check_laws(project, &evaluator, &mut self.diagnostics);
-        // A law refused for its name above is not also told that it checks.
+        // A law refused for its name above is not offered to use sites.
         self.laws.retain(|law| !builtins::FORCES.contains(&law.name.as_str()));
-        for law in &self.laws {
-            self.diagnostics.push(
-                Diagnostic::error(format!("`{}` checks, but user-defined laws cannot run yet", law.name))
-                    .with_code("E0900")
-                    .at(law.span, "type- and unit-checked")
-                    .note(
-                        "this is milestone M6.1a: laws are parsed, typed and unit-checked; \
-                         running them arrives in M6.1b",
-                    ),
-            );
-        }
     }
 
     fn error(&mut self, diagnostic: Diagnostic) {
@@ -395,6 +385,7 @@ impl<'a> Compiler<'a> {
         for decl in project.declarations_of("particles") {
             self.declare_particles(decl);
         }
+        self.warn_about_unused_laws(project);
         // Materials, then bodies, then joints: each refers to the one before it by
         // name, and resolving forward references would buy nothing but the ability to
         // write a scene in a confusing order.
@@ -974,6 +965,31 @@ impl<'a> Compiler<'a> {
             }
         };
 
+        let charges = decl.setting("charge").map_or(Charges::Neutral, |setting| {
+            let value = &setting.value;
+            match builtins::Call::match_expr(value) {
+                Some(call) if call.name == "alternating" => {
+                    call.reject_unknown(&["charge"], &mut self.diagnostics);
+                    call.require("charge", 0, &mut self.diagnostics)
+                        .and_then(|q| evaluator.require(q, Dimension::CHARGE, "the alternating charge", &mut self.diagnostics))
+                        .map_or(Charges::Neutral, Charges::Alternating)
+                }
+                _ => evaluator
+                    .require(value, Dimension::CHARGE, "`charge`", &mut self.diagnostics)
+                    .map_or(Charges::Neutral, Charges::Uniform),
+            }
+        });
+        // A user law that reads charges is sampled with the pairings this set contains.
+        let sample = crate::user_force::PairSample {
+            mass,
+            charges: match charges {
+                Charges::Neutral => vec![(0.0, 0.0)],
+                Charges::Uniform(q) => vec![(q, q)],
+                // Every ordering: a law need not be symmetric in `a` and `b`.
+                Charges::Alternating(q) => vec![(q, q), (q, -q), (-q, q), (-q, -q)],
+            },
+        };
+
         // `force:` may appear more than once, which is how a scene combines gravity
         // with drag.
         let mut forces = Vec::new();
@@ -983,12 +999,13 @@ impl<'a> Compiler<'a> {
                 _ => setting.value.as_name(),
             };
             if let Some(name) = callee.filter(|name| self.law_names.iter().any(|law| law == name)) {
-                self.error(
-                    Diagnostic::error(format!("`{name}` is a user-defined law, and using one is not implemented yet"))
-                        .with_code("E0900")
-                        .at(setting.value.span, "arrives in M6.1b")
-                        .note("this is milestone M6.1a: the law is checked where it is declared"),
-                );
+                self.used_laws.insert(name.to_string());
+                // A law that failed its check was reported where it was declared; it
+                // has nothing to bind.
+                let Some(law) = self.laws.iter().find(|law| law.name == name) else { continue };
+                if let Some(user) = crate::user_force::bind(law, &setting.value, &evaluator, &sample, &mut self.diagnostics) {
+                    forces.push(ForceSpec::User(Box::new(user)));
+                }
                 continue;
             }
             if let Some(force) = builtins::force(&setting.value, &evaluator, &mut self.diagnostics) {
@@ -1091,20 +1108,6 @@ impl<'a> Compiler<'a> {
                 Layout::Lattice
             }
         };
-        let charges = decl.setting("charge").map_or(Charges::Neutral, |setting| {
-            let value = &setting.value;
-            match builtins::Call::match_expr(value) {
-                Some(call) if call.name == "alternating" => {
-                    call.reject_unknown(&["charge"], &mut self.diagnostics);
-                    call.require("charge", 0, &mut self.diagnostics)
-                        .and_then(|q| evaluator.require(q, Dimension::CHARGE, "the alternating charge", &mut self.diagnostics))
-                        .map_or(Charges::Neutral, Charges::Alternating)
-                }
-                _ => evaluator
-                    .require(value, Dimension::CHARGE, "`charge`", &mut self.diagnostics)
-                    .map_or(Charges::Neutral, Charges::Uniform),
-            }
-        });
         if bonds.iter().any(|b| b.length.is_none()) && spacing.is_none() {
             let span = decl.settings.iter().find(|s| s.key.text == "bonds").map_or(decl.name.span, |s| s.value.span);
             self.error(
@@ -1255,6 +1258,22 @@ impl<'a> Compiler<'a> {
                 .with_code("E0900")
                 .at(domain.family.span, format!("needs the {milestone} module"))
                 .note(format!("this is milestone {milestone}")),
+            );
+        }
+    }
+
+    /// A law no particle set uses is checked and then does nothing, which is worth
+    /// saying: the likeliest cause is a use site that names a built-in instead.
+    fn warn_about_unused_laws(&mut self, project: &Project) {
+        for law in project.laws() {
+            if self.used_laws.contains(&law.name.text) || !self.laws.iter().any(|l| l.name == law.name.text) {
+                continue;
+            }
+            self.diagnostics.push(
+                Diagnostic::warning(format!("law `{}` is declared but no particle set uses it", law.name.text))
+                    .with_code("W0316")
+                    .at(law.name.span, "unused")
+                    .help(format!("use it with `force: {}(…);` in a `particles` block", law.name.text)),
             );
         }
     }
@@ -2347,6 +2366,7 @@ impl<'a> Compiler<'a> {
                 ForceSpec::Coulomb { cutoff, damping } => {
                     domain.with_force(Coulomb::damped_shifted_force(cutoff, damping))
                 }
+                ForceSpec::User(ref user) => domain.with_force(user.law.clone()),
             };
         }
         self.warn_about_charges(&set);

@@ -20,8 +20,9 @@
 //!
 //! The kinds differ in what they may read, and the restriction is the point. A pair
 //! `potential` sees the two particles only through `distance(a, b)`, so the force it
-//! implies is central and equal and opposite: momentum and angular momentum are
-//! conserved by construction, whatever the author wrote. Energy is conserved by the
+//! implies is central and equal and opposite: momentum is conserved by construction,
+//! whatever the author wrote, and angular momentum too in open space (a periodic seam
+//! breaks it, as it does for every central force). Energy is conserved by the
 //! integrator only where the energy is smooth. The language admits `if`, `abs`, `min`
 //! and `max`, so a law can jump or kink, and at a jump the derived force is silent and
 //! the integrator crosses it with a step change in energy. A solver contract for a
@@ -333,6 +334,9 @@ pub struct TypedLaw {
     pub result: TExpr,
     /// True when anything reads a velocity — which rules out energy conservation.
     pub reads_velocity: bool,
+    /// True when anything reads a mass or a charge, so the law differs from pair to pair
+    /// and nothing about it can be sampled without the particles' own values.
+    pub reads_members: bool,
     /// The declaration.
     pub span: Span,
 }
@@ -393,6 +397,7 @@ fn check_law(law: &LawDecl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnos
         params: Vec::new(),
         locals: Vec::new(),
         reads_velocity: false,
+        reads_members: false,
         failed: false,
     };
     checker.header(law);
@@ -422,6 +427,7 @@ fn check_law(law: &LawDecl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnos
         locals: checker.locals,
         result,
         reads_velocity: checker.reads_velocity,
+        reads_members: checker.reads_members,
         span: law.span,
     })
 }
@@ -434,6 +440,7 @@ struct Checker<'e, 'a, 'd> {
     params: Vec<LawParamInfo>,
     locals: Vec<LawLocal>,
     reads_velocity: bool,
+    reads_members: bool,
     /// Set by any error, so a law that reported one is not returned half-checked.
     failed: bool,
 }
@@ -556,6 +563,19 @@ impl Checker<'_, '_, '_> {
                     self.locals.push(LawLocal { name: name.text.clone(), value });
                 }
                 StmtKind::Param { name, ty, default } => {
+                    // A pair law's use site binds `cutoff=` and `truncation=` itself; a
+                    // `param` of either name would capture the argument and leave the law
+                    // with no cutoff, unusable.
+                    if self.is_pair() && matches!(name.text.as_str(), "cutoff" | "truncation") {
+                        self.error(
+                            Diagnostic::error(format!("`{}` is reserved in a pair law", name.text))
+                                .with_code("E0201")
+                                .at(name.span, "bound by the use site")
+                                .note("a pair law's use site writes `cutoff=` and `truncation=` for the engine")
+                                .help("give the parameter another name"),
+                        );
+                        continue;
+                    }
                     self.check_new_name(name);
                     // The evaluator reports a bad unit itself, but only the checker knows
                     // the law has failed: a law with an unreadable `param` is not one
@@ -801,6 +821,9 @@ impl Checker<'_, '_, '_> {
                     return None;
                 }
                 self.reads_velocity = true;
+            }
+            if matches!(found, Member::Mass | Member::Charge) {
+                self.reads_members = true;
             }
             if found == Member::Position && self.kind == LawKind::Potential && self.is_pair() {
                 self.error(
@@ -1412,6 +1435,26 @@ mod tests {
             ["E0410"],
             "a list is not a vector inside a law"
         );
+    }
+
+    /// A pair law's use site binds `cutoff=` and `truncation=`; a `param` of either name
+    /// would capture them.
+    #[test]
+    fn a_pair_law_cannot_declare_the_use_site_names() {
+        for name in ["cutoff", "truncation"] {
+            assert_eq!(
+                codes(&format!(
+                    "project p {{ potential u(a: particle, b: particle) -> joule {{
+                        param {name}: meter;
+                        return 1 joule;
+                    }} }}"
+                )),
+                ["E0201"],
+                "{name}"
+            );
+        }
+        // On one particle there is no cutoff to collide with.
+        ok("project p { force f(a: particle) -> vec2<newton> { param cutoff: newton; return vec2(cutoff, 0 newton); } }");
     }
 
     #[test]

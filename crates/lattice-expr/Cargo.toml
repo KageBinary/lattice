@@ -1,0 +1,14 @@
+[package]
+name = "lattice-expr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Compiled user-defined laws for Project Lattice: a scalar program, its interpreter, and its derivative"
+
+# Dependency-free, as the solver crates that evaluate laws in their hot loops are
+# (spec §24.1). The compiler lowers a typed law into a `Program`; the domains run it.
+[dependencies]
+
+[lints]
+workspace = true

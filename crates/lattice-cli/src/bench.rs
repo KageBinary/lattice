@@ -159,6 +159,15 @@ pub fn all() -> &'static [Benchmark] {
             run: bench_particles_lj,
         },
         Benchmark {
+            name: "particles-lj-expr",
+            description: "particles-lj's fluid with Lennard-Jones written as a user-defined \
+                          potential (spec §8.3), its force the compiler's derivative — the \
+                          interpreter's cost against the hand-written loop",
+            correctness: "the same energy and momentum drift bounds as particles-lj, and no \
+                          particle silently dropped",
+            run: bench_particles_lj_expr,
+        },
+        Benchmark {
             name: "heat-explicit",
             description: "explicit diffusion on a uniform grid — the §15.6 \
                           'heat/diffusion grid' target",
@@ -185,6 +194,11 @@ pub fn all() -> &'static [Benchmark] {
 
 /// Look up benchmarks whose name contains `pattern`.
 pub fn matching(pattern: &str) -> Vec<Benchmark> {
+    // An exact name runs that benchmark alone: `particles-lj` is a prefix of
+    // `particles-lj-expr`, and asking for the first must not time the second too.
+    if let Some(exact) = all().iter().copied().find(|b| b.name == pattern) {
+        return vec![exact];
+    }
     all().iter().copied().filter(|b| b.name.contains(pattern)).collect()
 }
 
@@ -263,6 +277,37 @@ fn bench_particles_gravity(scale: usize, executor: &Executor) -> BenchOutcome {
 }
 
 fn bench_particles_lj(scale: usize, executor: &Executor) -> BenchOutcome {
+    bench_lj_with(scale, executor, || LennardJones::with_default_cutoff(1.0, 1.0))
+}
+
+/// The user-defined Lennard-Jones potential of `particles-lj-expr`: the natural form,
+/// whose force is the compiler's derivative of it.
+const LJ_POTENTIAL: &str = "potential lj(a: particle, b: particle) -> joule {
+    param epsilon: joule;
+    param sigma: meter;
+    let s6 = (sigma / distance(a, b))^6;
+    return 4 * epsilon * (s6^2 - s6);
+}";
+
+/// `particles-lj`'s scene with the force a user-defined potential (spec §8.3): what
+/// the interpreter costs against the hand-written loop, under the same correctness
+/// conditions.
+fn bench_particles_lj_expr(scale: usize, executor: &Executor) -> BenchOutcome {
+    let law = lattice_compiler::user_force::law_from_source(
+        LJ_POTENTIAL,
+        "lj(epsilon=1 joule, sigma=1 meter, cutoff=2.5 meter)",
+    )
+    .expect("the benchmark's law compiles");
+    bench_lj_with(scale, executor, move || law.clone())
+}
+
+/// A Lennard-Jones fluid in a periodic box with the given law: the scene both LJ
+/// benchmarks time.
+fn bench_lj_with<L: lattice_domain_particle::ForceLaw + 'static>(
+    scale: usize,
+    executor: &Executor,
+    law: impl Fn() -> L,
+) -> BenchOutcome {
     let side = 32 * scale;
     let count = side * side;
     let spacing = 1.4;
@@ -275,7 +320,7 @@ fn bench_particles_lj(scale: usize, executor: &Executor) -> BenchOutcome {
         let mut d = ParticleDomain::new("lj", count)
             .with_integrator(Integrator::VelocityVerlet)
             .with_bounds(BoundaryBox::periodic([0.0, 0.0], [box_size, box_size]))
-            .with_force(LennardJones::with_default_cutoff(1.0, 1.0));
+            .with_force(law());
 
         let mut rng = Pcg32::seed_from_u64(20260805);
         let velocities: Vec<[f64; 2]> =
@@ -723,7 +768,9 @@ mod tests {
     #[test]
     fn filtering_selects_benchmarks_by_name() {
         assert_eq!(matching("heat").len(), 2);
-        assert_eq!(matching("particles").len(), 2);
+        assert_eq!(matching("particles").len(), 3);
+        assert_eq!(matching("particles-lj").len(), 1, "an exact name is that benchmark alone");
+        assert_eq!(matching("lj").len(), 2, "a fragment still matches every name containing it");
         assert!(matching("nonexistent").is_empty());
     }
 

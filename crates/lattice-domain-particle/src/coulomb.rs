@@ -44,46 +44,9 @@ use crate::forces::{ForceContext, ForceLaw};
 /// `2/√π`.
 const TWO_OVER_SQRT_PI: f64 = core::f64::consts::FRAC_2_SQRT_PI;
 
-/// The complementary error function, `1 − erf(x)`, to a relative error of a few parts
-/// in 10¹³ over the whole real line.
-///
-/// Written here because the standard library has none and §24.1 keeps dependencies
-/// out of the hot loop. Two forms, each where it is accurate:
-///
-/// - `x < 2`: `erf(x) = (2/√π) e^{−x²} Σ 2ⁿ x^{2n+1} / (1·3·…·(2n+1))`, whose terms are
-///   all positive, so nothing cancels until the final `1 − erf`, which at `x = 2` costs
-///   about two digits;
-/// - `x ≥ 2`: the continued fraction `erfc(x) = (e^{−x²}/√π) / (x + ½/(x + 1/(x + 3/2/(x + …))))`,
-///   evaluated from a fixed depth backwards, which at `x = 2` has converged to
-///   round-off by sixty levels.
-pub fn erfc(x: f64) -> f64 {
-    if x.is_nan() {
-        return f64::NAN;
-    }
-    if x < 0.0 {
-        return 2.0 - erfc(-x);
-    }
-    if x < 2.0 {
-        let x2 = x * x;
-        let (mut term, mut sum) = (x, x);
-        let mut n = 0u32;
-        while term > 1e-17 * sum {
-            n += 1;
-            term *= 2.0 * x2 / f64::from(2 * n + 1);
-            sum += term;
-        }
-        return 1.0 - TWO_OVER_SQRT_PI * (-x2).exp() * sum;
-    }
-    if x > 27.0 {
-        // e^{−x²} underflows.
-        return 0.0;
-    }
-    let mut tail = x;
-    for n in (1..=60u32).rev() {
-        tail = x + 0.5 * f64::from(n) / tail;
-    }
-    (-x * x).exp() / (core::f64::consts::PI.sqrt() * tail)
-}
+/// The complementary error function, shared with the expression compiler so a law's
+/// `erfc` and the built-in Coulomb sum compute the same bits.
+pub use lattice_expr::erfc;
 
 /// `erfcx(x) = e^{x²} erfc(x)` on `[0, top]` as a Chebyshev series, fitted once.
 ///

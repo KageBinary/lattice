@@ -63,7 +63,7 @@ honesty over feature count**:
 | **Compiler** | Name and unit resolution, dimensional checking of every expression, solver selection, buffer planning, operation graph, model report | 16 invalid fixtures each rejected for its declared reason |
 | **Runtime** | Clock, timestep negotiation across domains, observers on a cadence, run artifacts | Refuses unstable steps before running; halts on the first non-finite value |
 | **Storage** | Structure-of-arrays particles with stable handles, halo'd grid fields, bump arenas, reproducible RNG | 112 tests; no allocation in stepping loops |
-| **Particles** | Explicit Euler, semi-implicit Euler, velocity Verlet; gravity, drag, harmonic wells, Lennard-Jones; uniform cell list | Free fall, oscillator period, energy drift, convergence order, momentum conservation |
+| **Particles** | Explicit Euler, semi-implicit Euler, velocity Verlet; gravity, drag, harmonic wells, Lennard-Jones; uniform cell list; user-defined `force` and `potential` laws (spec §8.3), compiled to a program with an exact derivative | Free fall, oscillator period, energy drift, convergence order, momentum conservation; a user-written Lennard-Jones force bit-identical to the built-in over 1,000 steps; §8.3's damped spring decaying at `c/2μ` |
 | **Molecular dynamics** | Harmonic bonds and angles on declared topology; energy- and force-shifted Lennard-Jones, soft repulsion, damped shifted force Coulomb; Verlet lists with skin and bonded exclusions; Langevin (BAOAB) and velocity-rescaling thermostats; temperature, virial pressure, RDF and MSD | Bond period at the reduced mass; force-shifted energy error order 2.00; Verlet list equals a fresh cell list to 2e-16; empty RDF core and a first shell 4% inside the pair minimum 2^(1/6)σ; bath temperature and Ornstein–Uhlenbeck diffusion within their sampling error; Berendsen relaxation exact to 3e-15; a rock-salt Madelung energy within its derived truncation bound |
 | **Quantum** | One particle's wavefunction on a 2D grid: split-step Fourier (spectral, periodic) and Crank–Nicolson (five-point, walls); an in-house radix-2 and Bluestein FFT; complex absorbing layers with the absorbed probability accounted; imaginary-time eigenstates; walls with slits, barriers, harmonic traps; detectors integrating the probability current, and counting single clicks drawn from it; Born-rule position sampling; FFTs split across the worker pool | Box spectrum to 4e-15 and its continuum limit at order 2.00; oscillator levels to 2e-7 ħω; free-packet spreading to 1e-13; tunnelling within 0.09% of the analytic transmission; double-slit norm plus absorbed probability to 1.5e-14; Crank–Nicolson converging to split-step at order 2.02; Born samples and screen clicks pass χ² tests against the density and the current; the parallel split step bit-identical to the sequential one |
 | **Rigid bodies** | Circles, boxes, convex polygons, segments; sweep-and-prune broadphase, SAT narrowphase, friction and restitution; distance, rope, pin, spring and motor joints; sequential-impulse solver with warm starting | Elastic collision exchanges velocities exactly; inelastic loses exactly the predicted energy; pendulum period within 0.008% of analytic; Coulomb friction threshold to the digit |
@@ -73,7 +73,7 @@ honesty over feature count**:
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
 | **Execution** | A worker pool and an explicit partitioning executor; parallel diffusion stencils and per-particle integration; `--threads` and a `--compare` mode that measures its own speedup | Parallel and scalar agree *bit for bit* — every cell, every particle, the CG iteration count, and the reproducibility hash. 4.8× at 512², 1.9× on 262k particles, and nothing slower than it was |
 | **Backends** | A dependency-free backend boundary — devices, buffers, §10.5 precision modes, a kernel cache keyed the way §15.5 asks — with the scalar CPU path and a portable `wgpu` compute backend behind it; explicit diffusion and Crank–Nicolson both device-resident, the latter with a conjugate gradient whose reduction has a *stated* association order; `--backend gpu` on the benchmark harness | The GPU differs from the CPU reference by 4.3 `f32` ulps over 200 explicit steps, using 0.3% of a budget *derived* from `f32` rounding rather than fitted — and agrees to the bit where nothing rounds. 130× the scalar CPU on a 1024² stencil, and 4.1× *slower* end-to-end at 256²; both are published, because neither is honest alone. The implicit path refuses a residual tolerance below `ε·(1 + ‖A‖₂)` instead of failing to reach it, and its budget is dominated by the two solves' stopping criteria rather than by precision |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1235 tests including doctests across 19 crates with all features |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1258 tests including doctests across 20 crates with all features |
 | **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, curves, conservation drift and the solver's contract; phase on a cyclic wheel, vector fields as magnitude and arrows | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
@@ -83,9 +83,10 @@ milestones. Coulomb is the real-space half of an Ewald sum, with no reciprocal-s
 part, and the quantum module has no GPU path. See
 [the roadmap](docs/roadmap.md#what-m5-still-leaves-out).
 
-User-defined laws (spec §8.3) are in progress: a `force` or `potential` parses and is
-type- and unit-checked, but cannot run until M6.1b, and says so with `E0900`. See
-[the roadmap's M6 section](docs/roadmap.md#m6--extensibility-in-progress).
+User-defined laws (spec §8.3) are in progress. A `force` or `potential` on particles is
+checked, compiled and run on the CPU, through an interpreter about 4× slower than a
+hand-written built-in. Rate laws, observers, GPU lowering and the Python API are still
+to come. See [the roadmap's M6 section](docs/roadmap.md#m6--extensibility-in-progress).
 
 GPU execution is deliberately limited to the released kernels and boundary modes.
 General GPU execution of arbitrary coupled `.lattice` projects is not implemented;
@@ -98,7 +99,7 @@ residual tolerances disagree by four orders of magnitude more than `f32` storage
 an `f32` solve *cannot* be asked for the CPU's `1e-10` — the backend refuses it, naming the
 floor `ε·(1 + ‖A‖₂)` it came from. See [docs/backends.md](docs/backends.md). The backend is
 off by default, because `wgpu` is a few hundred crates and the rest of the CLI has none:
-`--features gpu` turns `lattice validate`'s 69 cases into 80 when an adapter is available.
+`--features gpu` turns `lattice validate`'s 73 cases into 84 when an adapter is available.
 
 The measured lesson of the implicit path is that **the stall is the program**: the diffusion
 stencil runs 27× the CPU at 256², and a CG iteration runs 1.8×, because §10.3 requires the
@@ -162,7 +163,7 @@ $ ./target/release/lattice-view examples/diffusing_pulse.lattice --play
 ### A model
 
 Models are written in the `.lattice` language — see
-[docs/language.md](docs/language.md) for the reference, and `examples/` for eleven
+[docs/language.md](docs/language.md) for the reference, and `examples/` for thirteen
 working scenes.
 
 ```
@@ -376,7 +377,10 @@ lattice/
     lattice-syntax/           lexer, AST, parser, source-positioned diagnostics
     lattice-ir/               typed IDs, SoA storage, grids, arenas, solver contracts,
                               compiled model, operation graph, render channels
-    lattice-compiler/         name and unit resolution, dimensional checking, lowering
+    lattice-compiler/         name and unit resolution, dimensional checking, lowering,
+                              the law checker (spec §8.3)
+    lattice-expr/             compiled user laws: the program, its interpreter, and
+                              its exact derivative
     lattice-runtime/          clock, timestep negotiation, stepping, run artifacts
     lattice-domain-particle/  integrators, force laws, neighbour search
     lattice-domain-grid2d/    diffusion operator, boundaries, conjugate gradient
@@ -409,7 +413,7 @@ lattice/
 
 ## Dependencies
 
-Sixteen of the nineteen crates have no external dependencies. Everything from units through the compiler to
+Seventeen of the twenty crates have no external dependencies. Everything from units through the compiler to
 the validation lab builds from `std` alone — including, somewhat to my own surprise, the
 whole M1 compiler and its diagnostics, and the M4 worker pool.
 

@@ -1,0 +1,22 @@
+// expect: E0203
+// A `param` with no default must be bound where the law is used: a spring with no
+// stiffness is not a spring.
+
+project law_param_not_bound {
+  dimensions: 2;
+
+  force spring(a: particle, b: particle) -> vec2<newton> {
+    param rest_length: meter;
+    param stiffness: newton / meter;
+    let d = minimum_image(b.position - a.position);
+    return stiffness * (length(d) - rest_length) * normalize(d);
+  }
+
+  particles beads {
+    count: 4;
+    region: [4 meter, 4 meter];
+    spacing: 1 meter;
+    mass: 1 kilogram;
+    force: spring(rest_length=1 meter, cutoff=1.5 meter);
+  }
+}

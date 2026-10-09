@@ -1,0 +1,21 @@
+// expect: E0204
+// A use site binds the law's own parameters by name, and the message lists them.
+
+project law_unknown_param {
+  dimensions: 2;
+
+  force spring(a: particle, b: particle) -> vec2<newton> {
+    param rest_length: meter;
+    param stiffness: newton / meter;
+    let d = minimum_image(b.position - a.position);
+    return stiffness * (length(d) - rest_length) * normalize(d);
+  }
+
+  particles beads {
+    count: 4;
+    region: [4 meter, 4 meter];
+    spacing: 1 meter;
+    mass: 1 kilogram;
+    force: spring(rest_length=1 meter, stifness=40 newton/meter, cutoff=1.5 meter);
+  }
+}

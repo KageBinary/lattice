@@ -626,11 +626,9 @@ rather than refuse. Spec §25.2's own example triggers two of them.
 ## User-defined laws
 
 Spec §8.3's *"restricted, typed, side-effect-free language"* for force laws. A law is
-declared once and used by name where a built-in force would be.
-
-> **Status (M6.1a):** laws parse, and are type- and unit-checked with every diagnostic
-> below, but a law that checks still ends in `E0900`: running one arrives in M6.1b.
-> A use site such as `force: spring(…)` names M6.1b too.
+declared once, checked for types and units, compiled to a program, and used by name
+where a built-in force would be. A complete model is
+[`examples/damped_spring.lattice`](../examples/damped_spring.lattice).
 
 ```
 force spring(a: particle, b: particle) -> vec2<newton> {
@@ -640,7 +638,7 @@ force spring(a: particle, b: particle) -> vec2<newton> {
     let dx = minimum_image(b.position - a.position);
     let extension = length(dx) - rest_length;
     return stiffness * extension * normalize(dx)
-         - damping * dot(b.velocity - a.velocity, normalize(dx)) * normalize(dx);
+         + damping * dot(b.velocity - a.velocity, normalize(dx)) * normalize(dx);
 }
 
 potential lj(a: particle, b: particle) -> joule {
@@ -651,21 +649,77 @@ potential lj(a: particle, b: particle) -> joule {
 }
 ```
 
-That is §8.3's spring as the spec writes it, with one addition: the spec leaves
-`rest_length`, `stiffness` and `damping` unbound, and here each is a `param` with its
-unit. A `param`'s value is given where the law is used
-(`force: spring(rest_length=1 meter, stiffness=40 newton/meter, damping=0.2 kilogram/second)`),
-or falls back to its `= default`.
+That is §8.3's spring with two changes:
+- **Parameters.** The spec leaves `rest_length`, `stiffness` and `damping` unbound;
+  here each is a `param` with its unit.
+- **The damping sign.** The spec writes `- damping * …`, which feeds energy into the
+  pair rather than taking it out. A pair force returns the force on `a`, with
+  `minimum_image(b.position - a.position)` pointing from `a` to `b`, so damping on `a`
+  is `+c (v_rel · d̂) d̂`. Under the other convention, a force on `b`, the spring term
+  would be wrong instead. The compiler catches the spec's version (`W0317`, below).
+
+### Using a law
+
+```
+particles beads {
+  …
+  force: spring(rest_length=1 meter, stiffness=40 newton/meter,
+                damping=0.2 kilogram/second, cutoff=1.9 meter);
+}
+```
+
+- **Parameters** are bound by name and must have the units their `param` declared. One
+  that is not bound takes its `= default`, or is an error (`E0203`). A vector `param` is
+  bound as `[x, y]`, as a setting writes vectors, or as `vec2(x, y)`.
+- **`cutoff=`** is required by a pair law. Pairs are found through the neighbour list,
+  and the law is evaluated only inside its cutoff.
+- **`truncation=`** applies to a pair `potential`: `energy_shift` (the default, as for
+  `lennard_jones`), `force_shift`, or `none`. `none` with a non-zero energy at the cutoff
+  is warned about (`W0315`), with the size of the jump each crossing makes.
+- **Masses and charges.** A potential that reads `a.charge` or `a.mass` differs from pair
+  to pair, so its energy and slope at the cutoff are evaluated for each pair, with that
+  pair's members, at the cost of a second evaluation per pair. The compiler's checks
+  sample it with the set's own mass and each pairing of charges the set contains: for
+  `alternating(q)`, all four orderings of `±q`, since a law need not be symmetric in `a` and `b`.
+- **The model report** prints the law, what it was bound to, and what it conserves, as
+  the built-ins' contracts do.
+
+A pair law's force is applied equal and opposite: the engine adds the returned force to
+`a` and its negation to `b`, with the separation the neighbour list measured. A law
+written in a built-in's operation order therefore reproduces that built-in to the bit,
+and the validation suite checks this for Lennard-Jones.
+
+**Speed.** A law runs in an interpreter. `lattice bench particles-lj-expr` (Lennard-Jones
+as a natural-form `potential`) runs at 3.7× the built-in's step time with 1,024 atoms
+and 4.8× with 16,384 (median of three, idle machine), under the same correctness checks.
+
+### The timestep
+
+A pair `potential` with a well inside its cutoff limits the step like a built-in. The
+compiler samples it, finds the well, and differentiates the program twice for the
+curvature `U″` there, which sets the fastest pair vibration.
+
+A `force`'s stiffness cannot be read off its formula, and neither can that of a
+potential with no well. Those laws do not limit the step (`W0314`), so the solve's `dt`
+is trusted, and should be small enough for the fastest motion the law causes.
+
+### A sign check for dampers
+
+A pair `force` that reads velocities is sampled at compile time. The pair is placed at
+half its cutoff, `b` is moved at 1 m/s along each axis in each direction, and the work
+the velocity-dependent part of the force does on the pair is measured. A damper must do
+negative work. Positive work is `W0317`: almost always a sign error, as in spec §8.3's
+example. A force across the relative velocity, such as a magnetic one, does no work and
+passes.
 
 ### Kinds, and what each promises
 
-What each kind may read is enforced now; what it conserves is what the solver
-contract will state once laws run (M6.1b), and the read restrictions are what make
-those statements true.
+What each kind may read is enforced by the checker, and the read restrictions are what
+make each kind's contract true.
 
 | Kind | Header | Returns | May read | Conserves |
 |---|---|---|---|---|
-| `potential` | `(a: particle, b: particle)` | `joule` | `distance(a, b)`, masses, charges | momentum and angular momentum by construction (the force is `−U′(r) r̂`); energy where `U` is continuous |
+| `potential` | `(a: particle, b: particle)` | `joule` | `distance(a, b)`, masses, charges | momentum by construction, and angular momentum in open space (the force is `−U′(r) r̂`, central; a periodic seam breaks it); energy where `U` is continuous |
 | `potential` | `(a: particle)` | `joule` | `a.position`, mass, charge | energy where `U` is continuous (an external field) |
 | `force` | `(a: particle, b: particle)` | `vec2<newton>` | everything | momentum: the engine applies the opposite force to `b` |
 | `force` | `(a: particle)` | `vec2<newton>` | everything | nothing |
@@ -707,11 +761,18 @@ even with a space between, so `4 epsilon (s - 1)` is refused with the fix
 | `E0113` | an `if` without an `else` |
 | `E0410` | shapes that do not combine: a vector times a vector, a vector where a scalar is required |
 | `E0411` | the declared signature: not particles in the header, the wrong return type, or the body returning something else |
-| `E0412` | a name this law may not read here: a position in a pair potential, a velocity in any potential, `minimum_image` outside a pair |
+| `E0412` | a name this law may not read here: a position in a pair potential, a velocity in any potential, `minimum_image` outside a pair, or of anything but `b.position - a.position` (or its negation) |
 | `E0413` | a call: unknown function, wrong number of arguments, or a value called as a function |
 | `E0414` | a condition that is not a truth value |
 | `E0415` | a body with no `return`, or statements after it |
+| `E0203`, `E0204` | at a use site: a `param` with no value or default, a pair law with no `cutoff`; an unknown or positional argument |
+| `E0201`, `E0208`, `E0405` | at a use site: a parameter bound twice; a `truncation` that is not `energy_shift`, `force_shift` or `none`; a cutoff that is not a positive length, or a potential that is not finite at its cutoff for the set's particles (one that divides by a charge the set gives as zero) |
+| `E0413` | also: a law too large for the interpreter's register file (512 values) |
 | `W0313` | a `let` or `param` whose name is also a unit |
+| `W0314` | a law that does not limit the timestep: a `force`, or a potential with no well inside its cutoff |
+| `W0315` | an untruncated pair potential whose energy at the cutoff is not zero |
+| `W0316` | a law no particle set uses |
+| `W0317` | a pair force whose velocity terms do positive work on the pair: a damper with the wrong sign |
 
 ## Solving
 
@@ -758,11 +819,11 @@ visualize probability_density;         // the domain picks an encoding
 | `E021x` | geometry and chemistry: unknown builtin (`E0210`), invalid shape or formula (`E0211`), unbalanced reaction (`E0212`) |
 | `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range; in laws, `E0410`–`E0415` (see [User-defined laws](#user-defined-laws)) |
 | `E09xx` | not implemented yet — the message names the milestone |
-| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), charges that do not suit a Coulomb law (`W0311`–`W0312`), and a name that hides a unit (`W0313`) |
+| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), charges that do not suit a Coulomb law (`W0311`–`W0312`), a name that hides a unit (`W0313`), and user laws (`W0314`–`W0317`) |
 
 Every rejection carries a source position and either a suggested fix or the rule it
 enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the
-45 models in `tests/invalid/`.
+47 models in `tests/invalid/`.
 
 ---
 
@@ -776,7 +837,6 @@ numbers.
 | Construct | Milestone |
 |---|---|
 | `domain fluid2d` | M4 |
-| running a `force` or `potential` law, and using one in `force:` (spec §8.3) | M6.1b |
 | a reaction's `stoichiometry:`, `heat_release:`, or a `rate:` that reads `c(…)`, a member or `temperature` (spec §8.3) | M6.1c |
 | `observer` laws | M6.2 |
 

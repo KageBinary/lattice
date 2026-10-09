@@ -10,6 +10,7 @@ description = "Resolves names and units, checks dimensions, and lowers a parsed 
 lattice-units.workspace = true
 lattice-syntax.workspace = true
 lattice-ir.workspace = true
+lattice-expr.workspace = true
 lattice-domain-grid2d.workspace = true
 lattice-domain-rigid2d.workspace = true
 lattice-domain-chemistry.workspace = true
