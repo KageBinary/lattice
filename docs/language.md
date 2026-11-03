@@ -390,6 +390,7 @@ move any load, which is a servo nobody has.
 ```
 domain chemistry chamber {
   grid: vessel;            // every species in a mixture reacts on one grid
+  temperature: 300 kelvin; // optional; 298.15 K unless set, or a coupling supplies a field
 }
 
 species fuel on vessel = left_half(40 mole / meter^2) {
@@ -460,12 +461,83 @@ error[E0400]: `rate` for a reaction of order 2 has the wrong dimension
 
 | Setting | Meaning |
 |---|---|
-| `reactants` | required; a sum of species with optional coefficients |
+| `reactants` | a sum of species with optional coefficients; required unless `stoichiometry` is given |
 | `products` | a sum of species, or omitted for a sink |
-| `rate` | required; in `(m^2/mol)^(order-1)/s` |
-| `reverse_rate` | makes the reaction reversible; the equilibrium constant is the ratio |
+| `stoichiometry` | both sides at once, `A + B -> C` (spec §8.3); excludes `reactants` and `products` (`E0209`) |
+| `rate` | required: a rate constant in `(m^2/mol)^(order-1)/s`, or a rate law (below) |
+| `reverse_rate` | makes a mass-action reaction reversible; the equilibrium constant is the ratio |
 | `activation_energy` | Arrhenius: `k(T) = A exp(-Ea/RT)`, with the declared `rate` as `A` |
 | `enthalpy` | J/mol of extent. **Negative is exothermic** — the chemistry convention |
+| `heat_release` | J/mol of extent, **positive is exothermic** (spec §8.3): `enthalpy` negated; the two exclude each other (`E0209`) |
+
+### Rate laws
+
+Spec §8.3 writes a reaction's rate as a formula of the state:
+
+```
+let k = 40 meter^2 / (mole second);
+
+reaction neutralization {
+    stoichiometry: H_plus + OH_minus -> H2O;
+    rate: k * c(H_plus) * c(OH_minus);
+    heat_release: 57.3 kilojoule / mole;
+}
+```
+
+A `rate:` that reads the state is a **rate law**: not a constant for mass action to
+multiply, but the reaction's net rate itself, in `mol/(m^2 s)` (moles of extent per
+square metre per second), and the compiler checks that unit. One that reads nothing is
+a rate constant, as before, so the two kinds mix freely in one network. A complete model
+is [`examples/neutralization.lattice`](../examples/neutralization.lattice).
+
+A rate law is a law, checked and compiled like a `force` (see
+[User-defined laws](#user-defined-laws)), with no header or body: one expression. It
+may use the model's constants, units, and the scalar functions of a law, and reads the
+state through three names:
+
+| | |
+|---|---|
+| `c(X)` | the concentration of species `X` in this cell, mol/m², floored at zero as mass action floors it |
+| `temperature` | the cell's temperature, K: the mixture's `temperature:`, or the field a coupling supplies |
+| `arrhenius(Ea)` | `exp(-Ea / (R T))` at the cell's temperature, `Ea` in J/mol; `1` where the temperature is not a positive finite number, as the built-in factor does |
+
+A law written as mass action is mass action to the bit:
+`k * arrhenius(Ea) * (c(A) * c(B))` computes the built-in's operations in the built-in's
+order, which the validation suite checks over a whole reaction-diffusion run. The
+parentheses matter: without them the product associates differently, which is the same
+rate rounded differently. One published number does differ: the stiffness ratio. Mass
+action measures a reaction's timescale from its one-way rates, and a law has none, so a
+law's comes from `|∂R/∂c|`. For a first-order reaction the two agree. For others the
+ratio can differ while the concentrations stay identical.
+
+A law can say what mass action cannot: Michaelis–Menten,
+`vmax * c(S) / (km + c(S))`; inhibition; a reversible pair in one formula,
+`kf * c(A) - kr * c(B)`, which runs backwards where it is negative. It therefore owns
+its own reverse step and temperature dependence, and `reverse_rate` or
+`activation_energy` beside it is an error (`E0209`).
+
+**What a law does not promise.** Atoms and charge are still conserved, because the
+stoichiometry fixes what each unit of extent converts; the balance check is unchanged.
+But mass action vanishes when a reactant runs out, and a law need not: a constant, or a
+law missing one of its reactants, keeps consuming a species that is gone and drives it
+negative. The compiler samples each law — every species at the largest concentration it
+starts with (1 mol/m² for one that starts empty), at the mixture's temperature, then
+each species the reaction converts set to zero in turn — and warns (`W0318`) when the
+law would still consume it. That is a sample, not a proof, and the model report says
+so. In particular it is taken at the mixture's own `temperature:`, not at the field a
+coupling supplies, so a law whose sign changes with temperature is checked at one
+temperature only. A law that is not finite at the starting state itself is refused (`E0405`).
+
+| Code | When |
+|---|---|
+| `E0400` | the law is not a rate in `mol/(m^2 s)`, `arrhenius` given something other than J/mol, or a constant `rate:` in the unit of a rate (a rate constant was meant; a constant rate would be zeroth order) |
+| `E0202` | `c(X)` of a species the mixture does not hold |
+| `E0412` | a species named as a value (`A` for `c(A)`, or `A.concentration`), or a particle function in a rate law |
+| `E0413` | `c` or `arrhenius` outside a rate law, or called with the wrong arguments |
+| `E0209` | two settings that say one thing: `stoichiometry` with `reactants` or `products`, `enthalpy` with `heat_release`, a rate law with `reverse_rate` or `activation_energy` |
+| `E0405` | a law that is not finite at the starting state; a mixture `temperature` that is not above absolute zero |
+| `W0318` | a law that does not vanish when a species it consumes runs out |
+| `W0319` | a rate law that reads `temperature` where the model has a constant of that name: the constant wins, as declared names always do |
 
 ## Coupling
 
@@ -625,7 +697,8 @@ rather than refuse. Spec §25.2's own example triggers two of them.
 
 ## User-defined laws
 
-Spec §8.3's *"restricted, typed, side-effect-free language"* for force laws. A law is
+Spec §8.3's *"restricted, typed, side-effect-free language"* for force laws (and, in
+the same language, a reaction's rate: see [Rate laws](#rate-laws)). A law is
 declared once, checked for types and units, compiled to a program, and used by name
 where a built-in force would be. A complete model is
 [`examples/damped_spring.lattice`](../examples/damped_spring.lattice).
@@ -819,11 +892,11 @@ visualize probability_density;         // the domain picks an encoding
 | `E021x` | geometry and chemistry: unknown builtin (`E0210`), invalid shape or formula (`E0211`), unbalanced reaction (`E0212`) |
 | `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range; in laws, `E0410`–`E0415` (see [User-defined laws](#user-defined-laws)) |
 | `E09xx` | not implemented yet — the message names the milestone |
-| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), charges that do not suit a Coulomb law (`W0311`–`W0312`), a name that hides a unit (`W0313`), and user laws (`W0314`–`W0317`) |
+| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), charges that do not suit a Coulomb law (`W0311`–`W0312`), a name that hides a unit (`W0313`), user laws (`W0314`–`W0317`), and rate laws (`W0318`–`W0319`) |
 
 Every rejection carries a source position and either a suggested fix or the rule it
 enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the
-47 models in `tests/invalid/`.
+50 models in `tests/invalid/`.
 
 ---
 
@@ -837,7 +910,6 @@ numbers.
 | Construct | Milestone |
 |---|---|
 | `domain fluid2d` | M4 |
-| a reaction's `stoichiometry:`, `heat_release:`, or a `rate:` that reads `c(…)`, a member or `temperature` (spec §8.3) | M6.1c |
 | `observer` laws | M6.2 |
 
 Stochastic kinetics (Gillespie) is not implemented either, but it has no syntax of its

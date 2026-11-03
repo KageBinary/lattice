@@ -20,6 +20,15 @@
 //! from another domain. But the *relationship* is a property of the reaction, so it is
 //! declared with the reaction and evaluated where the rate is. The coupling edge
 //! carries the temperature; it does not carry the chemistry.
+//!
+//! # Rate laws the model writes
+//!
+//! Spec §8.3's reaction form writes the rate itself — `rate: k * c(H_plus) *
+//! c(OH_minus);` — rather than a constant for mass action to multiply. Such a law is a
+//! [`RateExpression`]: compiled by the model compiler, evaluated here, and free to be
+//! Michaelis–Menten, inhibited, or anything else a local formula can say.
+
+use lattice_expr::{Op, Program, MAX_REGISTERS};
 
 /// The molar gas constant, J/(mol·K).
 ///
@@ -176,6 +185,132 @@ impl RateLaw {
         }
         text
     }
+}
+
+/// A rate law written in the model (spec §8.3): `rate: k * c(H_plus) * c(OH_minus);`.
+///
+/// A compiled [`Program`] that returns the reaction's net rate, mol/(m²·s). Its inputs
+/// are the mixture's concentrations, one per species in the network's order, and its
+/// one parameter is the cell's temperature, K. The compiler floors each concentration it
+/// reads at zero, as [`mass_action_rate`] does, so a law written as mass action is mass
+/// action to the bit.
+///
+/// # What mass action promised and a law does not
+///
+/// A mass-action rate vanishes when a reactant runs out, so it can never drive a
+/// concentration negative. A law is arbitrary: `k` alone, a zeroth-order rate, keeps
+/// consuming a reactant that is gone. The compiler samples each law for that and warns;
+/// the domain's `.min` metrics show it if it happens. Atoms are conserved regardless,
+/// because the stoichiometry, not the rate, fixes what each unit of extent converts.
+#[derive(Clone, PartialEq, Debug)]
+pub struct RateExpression {
+    program: Program,
+    /// `(species, program)` for each species the law reads; each program returns the
+    /// rate and its exact derivative with respect to that concentration.
+    partials: Vec<(usize, Program)>,
+    text: String,
+}
+
+/// Registers for a law that fits this many operations live in a small stack array, so
+/// a short law does not zero a whole [`MAX_REGISTERS`] file on every evaluation.
+const SMALL_PROGRAM: usize = 64;
+
+impl RateExpression {
+    /// A rate law from its program and the source text it was compiled from.
+    ///
+    /// # Panics
+    ///
+    /// If the program does not return exactly one value, reads other than one
+    /// parameter, or it or one of its derivatives does not fit [`MAX_REGISTERS`]: all
+    /// compiler bugs, since [`RateExpression::partials_fit`] is what the compiler checks.
+    pub fn new(program: Program, text: impl Into<String>) -> RateExpression {
+        assert_eq!(program.output_count(), 1, "a rate law returns one value");
+        assert_eq!(program.param_count(), 1, "a rate law's one parameter is the temperature");
+        assert!(program.fits(), "a rate law fits the register file");
+        let partials: Vec<(usize, Program)> =
+            reads(&program).into_iter().map(|species| (species, program.derivative(species as u32))).collect();
+        assert!(partials.iter().all(|(_, p)| p.fits()), "a rate law's derivatives fit the register file");
+        RateExpression { program, partials, text: text.into() }
+    }
+
+    /// The largest number of operations among a law's derivative programs, which must
+    /// fit [`MAX_REGISTERS`] as the law itself must.
+    pub fn partials_fit(program: &Program) -> Result<(), usize> {
+        let largest = reads(program).into_iter().map(|s| program.derivative(s as u32).ops().len()).max().unwrap_or(0);
+        if largest <= MAX_REGISTERS { Ok(()) } else { Err(largest) }
+    }
+
+    /// The law as the model wrote it.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// How many concentrations the law expects: the network's species count.
+    pub fn species(&self) -> usize {
+        self.program.input_count()
+    }
+
+    /// The species the law reads, in index order.
+    pub fn reads(&self) -> impl Iterator<Item = usize> + '_ {
+        self.partials.iter().map(|(species, _)| *species)
+    }
+
+    /// The compiled program.
+    pub fn program(&self) -> &Program {
+        &self.program
+    }
+
+    /// The net rate, mol/(m²·s), or zero when the concentration vector is the wrong
+    /// length — the same answer [`mass_action_rate`] gives for a missing species.
+    pub fn rate(&self, concentrations: &[f64], temperature: f64) -> f64 {
+        let mut out = [0.0];
+        if self.evaluate(&self.program, concentrations, temperature, &mut out) { out[0] } else { 0.0 }
+    }
+
+    /// The fastest pseudo-first-order rate in the law, 1/s: the largest `|∂R/∂c_j|`.
+    ///
+    /// The derivative rather than `R/c`, because a law that is reversible inside its own
+    /// formula has a net rate of zero at equilibrium and a timescale all the same.
+    pub fn inverse_time(&self, concentrations: &[f64], temperature: f64) -> f64 {
+        let mut fastest: f64 = 0.0;
+        let mut out = [0.0; 2];
+        for (_, partial) in &self.partials {
+            if self.evaluate(partial, concentrations, temperature, &mut out) && out[1].is_finite() {
+                fastest = fastest.max(out[1].abs());
+            }
+        }
+        fastest
+    }
+
+    fn evaluate(&self, program: &Program, concentrations: &[f64], temperature: f64, out: &mut [f64]) -> bool {
+        if concentrations.len() != program.input_count() {
+            return false;
+        }
+        let params = [temperature];
+        if program.ops().len() <= SMALL_PROGRAM {
+            let mut regs = [0.0; SMALL_PROGRAM];
+            program.eval(concentrations, &params, &mut regs, out);
+        } else {
+            let mut regs = [0.0; MAX_REGISTERS];
+            program.eval(concentrations, &params, &mut regs, out);
+        }
+        true
+    }
+}
+
+/// The inputs a program reads, in index order: for a rate law, the species.
+fn reads(program: &Program) -> Vec<usize> {
+    let mut read: Vec<usize> = program
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            Op::Input(n) => Some(*n as usize),
+            _ => None,
+        })
+        .collect();
+    read.sort_unstable();
+    read.dedup();
+    read
 }
 
 /// The rate of a mass-action reaction, mol/(m²·s).
@@ -349,6 +484,26 @@ mod tests {
         assert!(text.contains("m^2/(mol·s)"), "{text}");
         assert!(text.contains("K = 5.0000e-1"), "{text}");
         assert!(text.contains("Arrhenius"), "{text}");
+    }
+
+    /// A law can fit the register file while its derivative, which the kinetics also
+    /// runs on it, does not; the compiler has to be able to ask.
+    #[test]
+    fn a_law_whose_derivative_does_not_fit_is_detectable() {
+        use lattice_expr::Builder;
+        // Π (c + i) over 130 factors: about 390 operations, and its derivative about
+        // twice that.
+        let mut b = Builder::new(1, 1);
+        let c = b.push(Op::Input(0));
+        let mut product = c;
+        for i in 1..=130 {
+            let shift = b.constant(f64::from(i));
+            let factor = b.push(Op::Add(c, shift));
+            product = b.push(Op::Mul(product, factor));
+        }
+        let program = b.finish(vec![product]);
+        assert!(program.fits(), "{} operations", program.ops().len());
+        assert!(RateExpression::partials_fit(&program).is_err());
     }
 
     #[test]

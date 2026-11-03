@@ -44,6 +44,7 @@ mod laws;
 mod molecular;
 mod particles;
 mod quantum;
+mod rate_laws;
 mod rigid;
 
 use std::time::{Duration, Instant};
@@ -262,6 +263,7 @@ pub fn all_cases() -> Vec<Case> {
     cases.extend_from_slice(particles::CASES);
     cases.extend_from_slice(molecular::CASES);
     cases.extend_from_slice(laws::CASES);
+    cases.extend_from_slice(rate_laws::CASES);
     cases.extend_from_slice(quantum::CASES);
     cases.extend_from_slice(heat::CASES);
     cases.extend_from_slice(rigid::CASES);

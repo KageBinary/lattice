@@ -9,6 +9,7 @@ description = "Reaction networks, kinetics, and reaction-diffusion"
 [dependencies]
 lattice-ir.workspace = true
 lattice-domain-grid2d.workspace = true
+lattice-expr.workspace = true
 
 [lints]
 workspace = true

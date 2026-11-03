@@ -1,0 +1,80 @@
+// Spec §8.3's reaction, as the spec writes it.
+//
+//   reaction neutralization {
+//       stoichiometry: H_plus + OH_minus -> H2O;
+//       rate: k * c(H_plus) * c(OH_minus);
+//       heat_release: 57.3 kilojoule / mole;
+//   }
+//
+// The `rate:` here is not a constant for mass action to multiply. It reads the
+// concentrations, so it is the reaction's rate itself, in mol/(m^2 s), and the compiler
+// checks that it comes out in that unit. Written this way it can be any local law;
+// written as mass action, as here, it computes exactly what `rate: k;` would.
+//
+// `heat_release` is `enthalpy` with the sign a reader expects: 57.3 kJ/mol out, which
+// is an enthalpy of -57.3 kJ/mol. The heat goes to a temperature field through a
+// coupling edge, and the ledger reports whether what arrived is what was sent.
+//
+// The numbers are slowed for a run that finishes in seconds. Real neutralization is
+// diffusion-limited at ~1.4e11 per molar per second, and real ions diffuse at ~1e-8
+// m^2/s; a 2D model per unit area would also need a film thickness to convert either.
+//
+//   lattice run  examples/neutralization.lattice
+//   lattice-view examples/neutralization.lattice --play
+
+project neutralization {
+  dimensions: 2;
+  fidelity: engineering_2d;
+  duration: 20 second;
+
+  let k = 40 meter^2 / (mole second);
+
+  grid beaker { size: [64, 32]; extent: [0.2 meter, 0.1 meter]; }
+
+  domain chemistry water {
+    grid: beaker;
+    temperature: 298.15 kelvin;
+  }
+
+  species H_plus on beaker = left_half(1 mole / meter^2) {
+    formula:     H;
+    charge:      1;
+    diffusivity: 4e-5 meter^2 / second;
+    boundary:    insulated;
+  }
+
+  species OH_minus on beaker = right_half(1 mole / meter^2) {
+    formula:     OH;
+    charge:      -1;
+    diffusivity: 2e-5 meter^2 / second;
+    boundary:    insulated;
+  }
+
+  species H2O on beaker = 0 mole / meter^2 {
+    formula:     H2O;
+    diffusivity: 1e-5 meter^2 / second;
+    boundary:    insulated;
+  }
+
+  reaction neutralization {
+    stoichiometry: H_plus + OH_minus -> H2O;
+    rate: k * c(H_plus) * c(OH_minus);
+    heat_release: 57.3 kilojoule / mole;
+  }
+
+  field temperature on beaker = 298.15 kelvin {
+    diffusivity:   1.4e-5 meter^2 / second;
+    heat_capacity: 4.0e5 joule / (meter^2 kelvin);
+    boundary:      insulated;
+  }
+
+  solve reactions(water)  with strang(dt = 0.05 second);
+  solve heat(temperature) with crank_nicolson(dt = 0.05 second);
+
+  couple water.heat_release -> temperature.source conserve energy;
+
+  observe water       every 0.5 second;
+  observe temperature every 0.5 second;
+
+  visualize H2O as heatmap;
+}

@@ -254,6 +254,17 @@ struct MixtureInfo {
     grid: String,
     span: Span,
     solved: bool,
+    /// The `temperature:` every cell reacts at, K, when the model sets one.
+    temperature: Option<f64>,
+}
+
+/// What [`Compiler::build_network`] produced: the network, its species in slot order,
+/// and where each rate law was written.
+struct BuiltNetwork {
+    network: ReactionNetwork,
+    names: Vec<String>,
+    /// `(reaction index, the rate's span)` for each reaction whose rate is a law.
+    laws: Vec<(usize, Span)>,
 }
 
 /// Settings for a rigid world, from `domain rigid2d <name> { … }`.
@@ -1393,9 +1404,24 @@ impl<'a> Compiler<'a> {
             return;
         }
 
+        // Read rather than accepted and dropped, as it once was: a rate law that reads
+        // `temperature` makes the number matter.
+        let temperature = decl.setting("temperature").and_then(|setting| {
+            let value =
+                evaluator.require(&setting.value, Dimension::TEMPERATURE, "a mixture's temperature", &mut self.diagnostics)?;
+            if value > 0.0 && value.is_finite() {
+                return Some(value);
+            }
+            self.diagnostics.push(
+                Diagnostic::error("a mixture's temperature must be above absolute zero")
+                    .with_code("E0405")
+                    .at(setting.value.span, format!("this is {value} K")),
+            );
+            None
+        });
         self.mixtures.insert(
             decl.name.text.clone(),
-            MixtureInfo { grid: grid.to_string(), span: decl.name.span, solved: false },
+            MixtureInfo { grid: grid.to_string(), span: decl.name.span, solved: false, temperature },
         );
     }
 
@@ -1403,7 +1429,7 @@ impl<'a> Compiler<'a> {
     ///
     /// Returned rather than stored, because a network is only meaningful alongside the
     /// species list it indexes into — and that list is the mixture's.
-    fn build_network(&mut self, grid: &str) -> (ReactionNetwork, Vec<String>) {
+    fn build_network(&mut self, grid: &str) -> BuiltNetwork {
         let mut network = ReactionNetwork::new();
         let mut names = Vec::new();
         let mut index_of: BTreeMap<String, usize> = BTreeMap::new();
@@ -1428,26 +1454,17 @@ impl<'a> Compiler<'a> {
 
         let evaluator = self.evaluator();
         let declarations = core::mem::take(&mut self.reaction_decls);
+        let mut laws = Vec::new();
         for decl in &declarations {
             self.check_settings(decl, chemistry::REACTION_SETTINGS);
-            let is_constant = |name: &str| self.constants.iter().any(|(constant, _)| constant == name);
-            if let Some((span, what)) = chemistry::planned_rate_law(decl, &is_constant) {
-                self.error(
-                    Diagnostic::error(format!("{what} is not implemented yet"))
-                        .with_code("E0900")
-                        .at(span, "arrives in M6.1c")
-                        .note(
-                            "spec §8.3's reaction form (`stoichiometry:`, `heat_release:`, and a \
-                             `rate:` that reads concentrations or the temperature) is milestone \
-                             M6.1c; until then write `reactants:`, `products:`, a rate constant \
-                             and `enthalpy:`",
-                        ),
-                );
-                continue;
-            }
             if let Some(reaction) =
-                chemistry::reaction(decl, &index_of, &evaluator, &mut self.diagnostics)
+                chemistry::reaction(decl, &index_of, &names, &evaluator, &mut self.diagnostics)
             {
+                if reaction.expression.is_some()
+                    && let Some(rate) = decl.setting("rate")
+                {
+                    laws.push((network.reactions().len(), rate.value.span));
+                }
                 network.add_reaction(reaction);
             }
         }
@@ -1487,7 +1504,80 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        (network, names)
+        BuiltNetwork { network, names, laws }
+    }
+
+    /// Warn about a rate law that keeps consuming a species that has run out (`W0318`),
+    /// and refuse one that is not finite where the mixture starts (`E0405`).
+    ///
+    /// The refusal samples every species at the largest concentration it starts with,
+    /// zero for one that starts empty, which is the state the first step sees.
+    ///
+    /// Mass action vanishes when a reactant does, so it cannot drive a concentration
+    /// negative; a law can. Sampled, not proved: every species at its starting peak
+    /// (1 mol/m² for one that starts empty), at the mixture's temperature, then each
+    /// species the reaction converts set to zero in turn. A law that still consumes it there will take it below zero. A temperature
+    /// field a coupling supplies is not sampled: a law whose sign depends on the
+    /// temperature is checked at the mixture's own.
+    fn check_rate_laws(&mut self, domain: &ReactingMixture, laws: &[(usize, Span)]) {
+        let network = domain.network();
+        let species = network.len();
+        // The starting state as it is, empty species included: a law that is not finite
+        // there fails on the first step, so it is refused.
+        let start: Vec<f64> = (0..species)
+            .map(|index| domain.concentration(index).map_or(0.0, lattice_ir::ScalarField::max_interior))
+            .collect();
+        // The probes' base: a species that starts empty is sampled at 1 mol/m², so that
+        // setting another one to zero tests that one, not the empty one.
+        let base: Vec<f64> =
+            start.iter().map(|&peak| if peak > 0.0 && peak.is_finite() { peak } else { 1.0 }).collect();
+        let temperature = domain.temperature();
+        for &(index, span) in laws {
+            let reaction = &network.reactions()[index];
+            let Some(law) = &reaction.expression else { continue };
+            let rate = law.rate(&start, temperature);
+            if !rate.is_finite() {
+                self.error(
+                    Diagnostic::error(format!("the rate of `{}` is not finite where the mixture starts", reaction.name))
+                        .with_code("E0405")
+                        .at(span, format!("{rate} at {temperature} K"))
+                        .note(
+                            "sampled with every species at the largest concentration it starts with, \
+                             zero for one that starts empty",
+                        )
+                        .help("check for a division by a concentration or a constant that can be zero"),
+                );
+                continue;
+            }
+            let net = reaction.stoichiometry(species);
+            for (slot, &change) in net.iter().enumerate() {
+                if change == 0.0 {
+                    continue;
+                }
+                let mut probe = base.clone();
+                probe[slot] = 0.0;
+                let rate = law.rate(&probe, temperature);
+                let consumes = !rate.is_finite() || (change < 0.0 && rate > 0.0) || (change > 0.0 && rate < 0.0);
+                if !consumes {
+                    continue;
+                }
+                let name = &network.species()[slot].name;
+                self.diagnostics.push(
+                    Diagnostic::warning(format!(
+                        "the rate of `{}` does not vanish when `{name}` runs out",
+                        reaction.name
+                    ))
+                    .with_code("W0318")
+                    .at(span, format!("{rate:.4e} mol/(m^2 s) with no `{name}` left"))
+                    .note(format!(
+                        "with `{name}` at zero and every other species at its starting peak, the law still \
+                         {} `{name}`, so its concentration will go negative; mass action cannot do this",
+                        if rate.is_finite() { "consumes" } else { "is not finite for" }
+                    ))
+                    .help(format!("make the law vanish with `c({name})`, as mass action does")),
+                );
+            }
+        }
     }
 
     fn lower_reactions(&mut self, solve: &SolveStmt, method: &builtins::Method, out: &mut Lowering) {
@@ -1532,7 +1622,7 @@ impl<'a> Compiler<'a> {
             entry.solved = true;
         }
 
-        let (network, species_names) = self.build_network(&mixture.grid);
+        let BuiltNetwork { network, names: species_names, laws } = self.build_network(&mixture.grid);
         if network.is_empty() {
             self.error(
                 Diagnostic::error(format!("mixture `{name}` has no species"))
@@ -1544,7 +1634,8 @@ impl<'a> Compiler<'a> {
         }
 
         let grid = self.grids[&mixture.grid].grid;
-        let mut domain = ReactingMixture::new(name.to_string(), grid, network);
+        let mut domain = ReactingMixture::new(name.to_string(), grid, network)
+            .with_temperature(mixture.temperature.unwrap_or(lattice_domain_chemistry::DEFAULT_TEMPERATURE));
         for (index, species) in species_names.iter().enumerate() {
             let field = self.fields[species].clone();
             if let Some(entry) = self.fields.get_mut(species) {
@@ -1556,6 +1647,8 @@ impl<'a> Compiler<'a> {
                 concentration.init_from_position(&grid, |p| initializer.sample(p, &grid));
             }
         }
+
+        self.check_rate_laws(&domain, &laws);
 
         let buffer = out.buffers.allocate(
             name.to_string(),
@@ -1588,11 +1681,30 @@ impl<'a> Compiler<'a> {
             .map(|reaction| reaction.equation(domain.network().species()))
             .collect();
         for (reaction, equation) in domain.network().reactions().iter().zip(&equations) {
-            self.notes.push(format!(
-                "reaction `{}`: {equation}, {}",
-                reaction.name,
-                reaction.rate.describe(reaction.order())
-            ));
+            let heat = if reaction.enthalpy == 0.0 {
+                String::new()
+            } else {
+                format!(", releases {:.4e} J/mol", -reaction.enthalpy)
+            };
+            self.notes.push(format!("reaction `{}`: {equation}, {}{heat}", reaction.name, reaction.describe_rate()));
+            if let Some(law) = &reaction.expression {
+                let reads: Vec<&str> =
+                    law.reads().map(|slot| domain.network().species()[slot].name.as_str()).collect();
+                let temperature = if law.program().ops().iter().any(|op| matches!(op, lattice_expr::Op::Param(_))) {
+                    "and the cell's temperature"
+                } else {
+                    "and not the temperature"
+                };
+                self.notes.push(format!(
+                    "rate law `{}`: reads {} {temperature}. Contract: atoms and charge are conserved as \
+                     far as the stoichiometry balances them, whatever the law; staying non-negative is \
+                     sampled at the starting state and the mixture's own temperature, not proved \
+                     (W0318); thermodynamic consistency is \
+                     not checked",
+                    reaction.name,
+                    if reads.is_empty() { "no concentration".to_string() } else { reads.join(", ") },
+                ));
+            }
         }
 
         self.domain_index.insert(name.to_string(), out.specs.len());
@@ -1601,9 +1713,10 @@ impl<'a> Compiler<'a> {
             name: name.to_string(),
             family: "chemistry.reaction_diffusion[strang]".to_string(),
             summary: format!(
-                "{} species on `{}`, {reactions} reactions: {}",
+                "{} species on `{}` at {} K unless a coupling supplies the temperature, {reactions} reactions: {}",
                 species_names.len(),
                 mixture.grid,
+                domain.temperature(),
                 if equations.is_empty() { "none".to_string() } else { equations.join("; ") }
             ),
             buffers: vec![buffer],

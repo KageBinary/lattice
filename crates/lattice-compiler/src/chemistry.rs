@@ -40,16 +40,35 @@
 //! A species that does *not* state a composition makes the check impossible, and that
 //! is reported as a warning rather than an error: it is a real gap in what can be
 //! verified, but it is also a legitimate way to write an abstract `A -> B` model.
+//!
+//! # Spec §8.3's form
+//!
+//! ```text
+//! reaction neutralization {
+//!     stoichiometry: H_plus + OH_minus -> H2O;
+//!     rate: k * c(H_plus) * c(OH_minus);
+//!     heat_release: 57.3 kilojoule / mole;
+//! }
+//! ```
+//!
+//! `stoichiometry:` is `reactants:` and `products:` in one line, and `heat_release:` is
+//! `enthalpy:` with the sign a reader expects: positive releases heat. A `rate:` that
+//! reads the state — `c(X)`, `temperature`, `arrhenius(Ea)` — is not a constant for mass
+//! action to multiply but the reaction's rate itself, in mol/(m²·s), checked by
+//! [`laws::check_rate`] and compiled to a [`RateExpression`]. One that reads nothing is
+//! a rate constant, as before, so the two forms mix freely in one network.
 
 use std::collections::BTreeMap;
 
 use lattice_domain_chemistry::{
-    Composition, FormulaError, RateLaw, Reaction, Species, Term,
+    Composition, FormulaError, RateExpression, RateLaw, Reaction, Species, Term,
 };
 use lattice_syntax::{Decl, Diagnostic, Diagnostics, Expr, ExprKind, Span};
 use lattice_units::Dimension;
 
 use crate::eval::Evaluator;
+use crate::laws;
+use crate::lower_law::lower_rate;
 
 /// Settings a `reaction` declaration accepts.
 pub const REACTION_SETTINGS: &[&str] = &[
@@ -59,33 +78,23 @@ pub const REACTION_SETTINGS: &[&str] = &[
     "reverse_rate",
     "activation_energy",
     "enthalpy",
-    // Spec §8.3's form, recognized so it is reported as planned (M6.1c), not unknown.
+    // Spec §8.3's form.
     "stoichiometry",
     "heat_release",
 ];
 
-/// The first part of a reaction written in spec §8.3's form, which M6.1c implements:
-/// `stoichiometry:`, `heat_release:`, or a `rate:` that reads the state — a call such as
-/// `c(H_plus)` or `arrhenius(…)`, a member such as `A.concentration`, or `temperature`.
-/// Returns where it is and what it is. `is_constant` names the model's `let`
-/// constants, so a constant called `temperature` is not mistaken for the state.
-pub fn planned_rate_law(decl: &Decl, is_constant: &dyn Fn(&str) -> bool) -> Option<(Span, &'static str)> {
-    if let Some(setting) = decl.setting("stoichiometry") {
-        return Some((setting.key.span, "`stoichiometry:`"));
-    }
-    if let Some(setting) = decl.setting("heat_release") {
-        return Some((setting.key.span, "`heat_release:`"));
-    }
-    let rate = decl.setting("rate")?;
-    reads_state(&rate.value, is_constant).then_some((rate.value.span, "a rate law that reads the state"))
-}
-
-fn reads_state(expr: &Expr, is_constant: &dyn Fn(&str) -> bool) -> bool {
+/// True when a `rate:` reads the state, and so is a rate law rather than a constant: it
+/// calls something (`c(H_plus)`, `arrhenius(…)`), reads a member, or names `temperature`
+/// or a species. The model's constants are not the state, so a constant called
+/// `temperature` leaves a constant rate a constant.
+pub fn is_rate_law(expr: &Expr, evaluator: &Evaluator<'_>, species: &[String]) -> bool {
     match &expr.kind {
-        ExprKind::Call(..) | ExprKind::Member(..) => true,
-        ExprKind::Name(name) => name == "temperature" && !is_constant(name),
-        ExprKind::Unary(_, inner) | ExprKind::Power(inner, _) => reads_state(inner, is_constant),
-        ExprKind::Binary(_, a, b) => reads_state(a, is_constant) || reads_state(b, is_constant),
+        ExprKind::Call(..) | ExprKind::Member(..) | ExprKind::If(..) => true,
+        ExprKind::Name(name) => {
+            (name == "temperature" || species.contains(name)) && !evaluator.is_constant(name)
+        }
+        ExprKind::Unary(_, inner) | ExprKind::Power(inner, _) => is_rate_law(inner, evaluator, species),
+        ExprKind::Binary(_, a, b) => is_rate_law(a, evaluator, species) || is_rate_law(b, evaluator, species),
         _ => false,
     }
 }
@@ -177,30 +186,16 @@ fn constant(expr: &Expr) -> Option<f64> {
 
 /// Read a `reaction` declaration into a solver reaction.
 ///
-/// `index_of` resolves a species name to its slot in the network.
+/// `index_of` resolves a species name to its slot in the network, and `species` lists
+/// the names in slot order, which is the order a rate law's `c(…)` indexes.
 pub fn reaction(
     decl: &Decl,
     index_of: &BTreeMap<String, usize>,
+    species: &[String],
     evaluator: &Evaluator<'_>,
     diagnostics: &mut Diagnostics,
 ) -> Option<Reaction> {
-    let read_side = |key: &str, diagnostics: &mut Diagnostics| -> Option<Vec<SideTerm>> {
-        let setting = decl.setting(key)?;
-        side(&setting.value, evaluator, diagnostics)
-    };
-
-    let Some(reactants) = read_side("reactants", diagnostics) else {
-        diagnostics.push(
-            Diagnostic::error(format!("reaction `{}` needs `reactants`", decl.name.text))
-                .with_code("E0203")
-                .at(decl.name.span, "missing `reactants`")
-                .help("add `reactants: 2 fuel + oxidizer;`"),
-        );
-        return None;
-    };
-    // Products may be empty — a species leaving the system to something the model does
-    // not track is a legitimate sink, and `products: (nothing)` has no syntax.
-    let products = decl.setting("products").and_then(|s| side(&s.value, evaluator, diagnostics));
+    let (reactants, products) = sides(decl, evaluator, diagnostics)?;
 
     let resolve = |terms: &[SideTerm], diagnostics: &mut Diagnostics| -> Option<Vec<Term>> {
         terms
@@ -230,6 +225,45 @@ pub fn reaction(
         Some(terms) => resolve(terms, diagnostics)?,
         None => Vec::new(),
     };
+
+    let enthalpy = enthalpy(decl, evaluator, diagnostics);
+
+    // A rate law is the rate itself; it brings its own temperature dependence and its
+    // own reverse step, so the settings for mass action's have nothing to modify.
+    if let Some(rate) = decl.setting("rate").filter(|rate| is_rate_law(&rate.value, evaluator, species)) {
+        for key in ["reverse_rate", "activation_energy"] {
+            if let Some(setting) = decl.setting(key) {
+                diagnostics.push(
+                    Diagnostic::error(format!("`{key}` modifies a rate constant, and this rate is a law"))
+                        .with_code("E0209")
+                        .at(setting.key.span, "for mass action")
+                        .also(rate.value.span, "a rate law, which says its own")
+                        .help(if key == "reverse_rate" {
+                            "subtract the reverse rate inside the law: `kf * c(A) - kr * c(B)`"
+                        } else {
+                            "write the temperature dependence into the law: `k * arrhenius(50 kilojoule / mole) * c(A)`"
+                        }),
+                );
+            }
+        }
+        let typed = laws::check_rate(&decl.name, &rate.value, species, evaluator, diagnostics)?;
+        let program = match lower_rate(&typed, species.len()) {
+            Ok(program) => program,
+            Err(diagnostic) => {
+                diagnostics.push(*diagnostic);
+                return None;
+            }
+        };
+        if decl.setting("reverse_rate").is_some() || decl.setting("activation_energy").is_some() {
+            return None;
+        }
+        let text = evaluator.file().slice(rate.value.span).to_string();
+        let law = RateExpression::new(program, text);
+        return Some(
+            Reaction::with_expression(decl.name.text.clone(), reactant_terms, product_terms, law)
+                .with_enthalpy(enthalpy?),
+        );
+    }
 
     // The order sets the rate constant's dimension, so it has to be known before the
     // constant can be checked — which is why the sides are read first.
@@ -268,20 +302,116 @@ pub fn reaction(
         }
     }
 
-    let enthalpy = decl
-        .setting("enthalpy")
-        .and_then(|setting| {
-            let expected = Dimension::ENERGY
-                .try_div(Dimension::AMOUNT)
-                .expect("energy per amount is representable");
-            evaluator.require(&setting.value, expected, "`enthalpy`", diagnostics)
-        })
-        .unwrap_or(0.0);
-
     Some(
         Reaction::new(decl.name.text.clone(), reactant_terms, product_terms, law)
-            .with_enthalpy(enthalpy),
+            .with_enthalpy(enthalpy?),
     )
+}
+
+/// The two sides, from `reactants:` and `products:` or from spec §8.3's
+/// `stoichiometry: A + B -> C;`, which says both at once and so excludes them.
+fn sides(
+    decl: &Decl,
+    evaluator: &Evaluator<'_>,
+    diagnostics: &mut Diagnostics,
+) -> Option<(Vec<SideTerm>, Option<Vec<SideTerm>>)> {
+    if let Some(stoichiometry) = decl.setting("stoichiometry") {
+        let mut conflict = false;
+        for key in ["reactants", "products"] {
+            if let Some(setting) = decl.setting(key) {
+                diagnostics.push(
+                    Diagnostic::error(format!("`stoichiometry` and `{key}` both say what reacts"))
+                        .with_code("E0209")
+                        .at(setting.key.span, format!("sets the {key}"))
+                        .also(stoichiometry.key.span, "sets both sides")
+                        .help("keep one: `stoichiometry: A + B -> C;`, or `reactants:` with `products:`"),
+                );
+                conflict = true;
+            }
+        }
+        let ExprKind::Yields(left, right) = &stoichiometry.value.kind else {
+            diagnostics.push(
+                Diagnostic::error("a stoichiometry is written `reactants -> products`")
+                    .with_code("E0401")
+                    .at(stoichiometry.value.span, "no `->`")
+                    .help("write `stoichiometry: H_plus + OH_minus -> H2O;`"),
+            );
+            return None;
+        };
+        let reactants = side(left, evaluator, diagnostics);
+        let products = side(right, evaluator, diagnostics);
+        return if conflict { None } else { Some((reactants?, Some(products?))) };
+    }
+
+    let Some(setting) = decl.setting("reactants") else {
+        diagnostics.push(
+            Diagnostic::error(format!("reaction `{}` needs `reactants`", decl.name.text))
+                .with_code("E0203")
+                .at(decl.name.span, "missing `reactants`")
+                .help("add `reactants: 2 fuel + oxidizer;`, or `stoichiometry: 2 fuel + oxidizer -> exhaust;`"),
+        );
+        return None;
+    };
+    let reactants = side(&setting.value, evaluator, diagnostics)?;
+    // Products may be empty — a species leaving the system to something the model does
+    // not track is a legitimate sink, and `products: (nothing)` has no syntax.
+    let products = decl.setting("products").and_then(|s| side(&s.value, evaluator, diagnostics));
+    Some((reactants, products))
+}
+
+/// The enthalpy of reaction, J/mol, from `enthalpy:` or from spec §8.3's
+/// `heat_release:`, its negation: chemistry writes an exothermic enthalpy as negative,
+/// and a heat *release* reads the way a reader expects, positive for heat out. `None`
+/// after reporting a problem; zero when neither is written.
+fn enthalpy(decl: &Decl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnostics) -> Option<f64> {
+    let expected = Dimension::ENERGY.try_div(Dimension::AMOUNT).expect("energy per amount is representable");
+    match (decl.setting("enthalpy"), decl.setting("heat_release")) {
+        (Some(enthalpy), Some(release)) => {
+            diagnostics.push(
+                Diagnostic::error("`enthalpy` and `heat_release` both say how much heat the reaction moves")
+                    .with_code("E0209")
+                    .at(enthalpy.key.span, "negative for heat out")
+                    .also(release.key.span, "positive for heat out")
+                    .help("keep one; `heat_release: 57.3 kilojoule / mole` is `enthalpy: -57.3 kilojoule / mole`"),
+            );
+            None
+        }
+        (Some(enthalpy), None) => evaluator.require(&enthalpy.value, expected, "`enthalpy`", diagnostics),
+        (None, Some(release)) => {
+            evaluator.require(&release.value, expected, "`heat_release`", diagnostics).map(|heat| -heat)
+        }
+        (None, None) => Some(0.0),
+    }
+}
+
+/// Compile a rate law written alone, as a reaction's `rate:` would compile it, for a
+/// mixture whose species are `species` in slot order. For validation and tests, which
+/// hold a law against a closed form without building a whole model; the text is
+/// the law's own, so it may use units but no model constants.
+///
+/// Returns the rendered diagnostics if the law does not compile.
+pub fn rate_law_from_source(species: &[&str], rate: &str) -> Result<RateExpression, String> {
+    let file = lattice_syntax::SourceFile::new("rate.lattice", format!("project law {{ rate: {rate}; }}"));
+    let (project, mut diagnostics) = lattice_syntax::parse(&file);
+    let Some(project) = project.filter(|_| !diagnostics.has_errors()) else {
+        return Err(diagnostics.render(&file));
+    };
+    let Some(setting) = project.setting("rate") else { return Err(diagnostics.render(&file)) };
+    let units = lattice_units::UnitRegistry::si();
+    let evaluator = Evaluator::new(&file, &units);
+    let names: Vec<String> = species.iter().map(|s| s.to_string()).collect();
+    let typed = laws::check_rate(&setting.key, &setting.value, &names, &evaluator, &mut diagnostics);
+    let program = typed.as_ref().map(|typed| lower_rate(typed, names.len()));
+    match program {
+        Some(Ok(program)) if !diagnostics.has_errors() => {
+            Ok(RateExpression::new(program, file.slice(setting.value.span).to_string()))
+        }
+        Some(Err(diagnostic)) => {
+            diagnostics.push(*diagnostic);
+            Err(diagnostics.render(&file))
+        }
+        _ => Err(diagnostics.render(&file)),
+    }
 }
 
 /// Read a rate constant, checking its unit against the reaction's order.
@@ -308,6 +438,26 @@ fn rate_constant(
     };
 
     let expected = rate_dimension(order)?;
+    // A rate where a rate constant belongs: the author meant a law, and a constant law
+    // is zeroth order, which keeps consuming a reactant that has run out. Said plainly
+    // rather than as a bare unit mismatch.
+    let mut quiet = Diagnostics::new();
+    if expected != Dimension::AREAL_REACTION_RATE
+        && evaluator.quantity(&setting.value, &mut quiet).is_some_and(|q| q.dimension() == Dimension::AREAL_REACTION_RATE)
+    {
+        diagnostics.push(
+            Diagnostic::error(format!("`{key}` is a rate, and a constant `{key}:` is a rate constant"))
+                .with_code("E0400")
+                .at(setting.value.span, format!("mol/(m^2 s), where order {order} needs {}", RateLaw::si_unit_for_order(order)))
+                .note(
+                    "a `rate:` that reads no concentration is mass action's rate constant; one that \
+                     reads them with `c(…)` is the rate itself. A constant rate would be zeroth \
+                     order, and would keep consuming a reactant after it ran out",
+                )
+                .help("write the law, such as `k * c(A)`, or give the rate constant in its own unit"),
+        );
+        return None;
+    }
     let value = evaluator.require(
         &setting.value,
         expected,

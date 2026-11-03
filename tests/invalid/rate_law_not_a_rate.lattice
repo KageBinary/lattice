@@ -1,0 +1,24 @@
+// expect: E0400
+// Spec 8.3's reaction with `k` given as a first-order constant. A `rate:` that reads
+// concentrations is the rate itself, in mol/(m^2 s); with `k` in 1/s, `k * c * c` is
+// a concentration squared per second, and the compiler says so at the rate.
+
+project rate_law_not_a_rate {
+  dimensions: 2;
+  duration: 1 second;
+  let k = 1.4e11 / second;
+
+  grid cell { size: [4, 4]; extent: [1 meter, 1 meter]; }
+  species H_plus on cell = 1 mole / meter^2 { formula: H; charge: 1; diffusivity: 0 meter^2 / second; }
+  species OH_minus on cell = 1 mole / meter^2 { formula: OH; charge: -1; diffusivity: 0 meter^2 / second; }
+  species H2O on cell = 0 mole / meter^2 { formula: H2O; diffusivity: 0 meter^2 / second; }
+  domain chemistry water { grid: cell; }
+
+  reaction neutralization {
+    stoichiometry: H_plus + OH_minus -> H2O;
+    rate: k * c(H_plus) * c(OH_minus);
+    heat_release: 57.3 kilojoule / mole;
+  }
+
+  solve reactions(water) with strang(dt=0.01 second);
+}

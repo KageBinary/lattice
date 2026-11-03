@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::rate::RateLaw;
+use crate::rate::{RateExpression, RateLaw};
 use crate::species::Species;
 
 /// One side of a reaction: how much of which species.
@@ -90,8 +90,10 @@ pub struct Reaction {
     pub reactants: Vec<Term>,
     /// What is produced.
     pub products: Vec<Term>,
-    /// How fast it goes.
+    /// How fast it goes, by mass action. Unused when [`Reaction::expression`] is set.
     pub rate: RateLaw,
+    /// A rate law the model wrote (spec §8.3), which replaces mass action.
+    pub expression: Option<RateExpression>,
     /// Enthalpy of reaction, J per mole of extent.
     ///
     /// Negative is exothermic — the convention chemistry uses and the opposite of what
@@ -108,7 +110,27 @@ impl Reaction {
         products: Vec<Term>,
         rate: RateLaw,
     ) -> Reaction {
-        Reaction { name: name.into(), reactants, products, rate, enthalpy: 0.0 }
+        Reaction { name: name.into(), reactants, products, rate, expression: None, enthalpy: 0.0 }
+    }
+
+    /// A reaction whose rate is a law the model wrote rather than mass action.
+    ///
+    /// The law reads the whole mixture, not just the two sides, so its length is checked
+    /// against the network's species when [`Kinetics`](crate::Kinetics) is built.
+    pub fn with_expression(
+        name: impl Into<String>,
+        reactants: Vec<Term>,
+        products: Vec<Term>,
+        expression: RateExpression,
+    ) -> Reaction {
+        Reaction {
+            name: name.into(),
+            reactants,
+            products,
+            rate: RateLaw::mass_action(0.0),
+            expression: Some(expression),
+            enthalpy: 0.0,
+        }
     }
 
     /// Set the enthalpy of reaction, J/mol. Negative is exothermic.
@@ -225,8 +247,17 @@ impl Reaction {
                 .collect::<Vec<_>>()
                 .join(" + ")
         };
-        let arrow = if self.rate.is_reversible() { "<->" } else { "->" };
+        let arrow = if self.expression.is_none() && self.rate.is_reversible() { "<->" } else { "->" };
         format!("{} {arrow} {}", side(&self.reactants), side(&self.products))
+    }
+
+    /// How the rate is computed, for the model report: the mass-action constants with
+    /// their units, or the law as written.
+    pub fn describe_rate(&self) -> String {
+        match &self.expression {
+            Some(law) => format!("rate law `{}` (mol/(m^2 s), net)", law.text()),
+            None => self.rate.describe(self.order()),
+        }
     }
 
     /// Total order of the forward step — the sum of the reactant coefficients.

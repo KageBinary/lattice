@@ -717,7 +717,8 @@ project orbit {
         assert!(summary.contains("conserves nothing by construction"), "{summary}");
     }
 
-    /// A rate that reads `temperature` is the state — unless `temperature` is a constant.
+    /// A rate that reads `temperature` is the state, and so a rate law, which must come
+    /// out in mol/(m² s) — unless `temperature` is a constant, when the rate is one too.
     #[test]
     fn a_constant_named_temperature_is_not_the_state() {
         let mixture = |extra: &str, rate: &str| {
@@ -734,9 +735,165 @@ project orbit {
                  }}"
             )
         };
-        let (_, codes) = err(&mixture("", "temperature / (300 kelvin second)"));
-        assert!(codes.contains(&"E0900".to_string()), "{codes:?}");
+        // A law, and 1/s is a rate constant's unit, not a rate's.
+        let (text, codes) = err(&mixture("", "temperature / (300 kelvin second)"));
+        assert!(codes.contains(&"E0400".to_string()) && text.contains("not a reaction rate"), "{text}");
+        ok(&mixture("", "temperature / (300 kelvin second) * c(A)"));
+        // A constant: a first-order rate constant, as before M6.1c.
         ok(&mixture("let temperature = 300 kelvin;", "temperature / (300 kelvin second)"));
+        // And a law that reads concentrations sees the constant too, and is told so.
+        let (_, diagnostics, _) = build(&mixture("let temperature = 300 kelvin;", "temperature / (300 kelvin second) * c(A)"));
+        assert!(!diagnostics.has_errors() && diagnostics.codes().contains(&"W0319"), "{:?}", diagnostics.codes());
+    }
+
+    // --- spec §8.3's reaction form (M6.1c) ---------------------------------------
+
+    /// A mixture of `A`, `B` and `C` on a 4×4 grid, `A` and `B` starting at 1 mol/m² and
+    /// `C` empty, holding one reaction with the given body.
+    fn reaction_model(extra: &str, body: &str) -> String {
+        format!(
+            "project p {{
+               duration: 1 second;
+               {extra}
+               grid g {{ size: [4, 4]; extent: [1 meter, 1 meter]; }}
+               species A on g = 1 mole / meter^2 {{ formula: H; diffusivity: 0 meter^2 / second; }}
+               species B on g = 1 mole / meter^2 {{ formula: H; diffusivity: 0 meter^2 / second; }}
+               species C on g = 0 mole / meter^2 {{ formula: H2; diffusivity: 0 meter^2 / second; }}
+               domain chemistry mix {{ grid: g; }}
+               reaction r {{ {body} }}
+               solve reactions(mix) with strang(dt=0.1 second);
+             }}"
+        )
+    }
+
+    fn reaction_codes(extra: &str, body: &str) -> (String, Vec<String>) {
+        let (_, diagnostics, file) = build(&reaction_model(extra, body));
+        (diagnostics.render(&file), diagnostics.codes().into_iter().map(String::from).collect())
+    }
+
+    /// Spec §8.3's three settings compile, and `heat_release` is `enthalpy` negated.
+    #[test]
+    fn the_spec_reaction_form_compiles() {
+        let compiled = ok(&reaction_model(
+            "let k = 2 meter^2 / (mole second);",
+            "stoichiometry: A + B -> C; rate: k * c(A) * c(B); heat_release: 57.3 kilojoule / mole;",
+        ));
+        let report = compiled.model.report();
+        assert!(report.contains("A + B -> C, rate law `k * c(A) * c(B)`"), "{report}");
+        assert!(report.contains("releases 5.7300e4 J/mol"), "{report}");
+        assert!(report.contains("reads A, B and not the temperature"), "{report}");
+
+        // `heat_release: x` and `enthalpy: -x` describe the same reaction.
+        let enthalpy = ok(&reaction_model(
+            "",
+            "reactants: A + B; products: C; rate: 2 meter^2 / (mole second); enthalpy: -57.3 kilojoule / mole;",
+        ));
+        assert!(enthalpy.model.report().contains("releases 5.7300e4 J/mol"));
+    }
+
+    /// The §8.3 settings exclude the ones that say the same thing another way, and a
+    /// rate law excludes the settings that modify a rate constant.
+    #[test]
+    fn the_spec_reaction_form_refuses_double_statements() {
+        for body in [
+            "stoichiometry: A + B -> C; reactants: A + B; rate: 1 meter^2 / (mole second);",
+            "stoichiometry: A + B -> C; rate: 1 meter^2 / (mole second); enthalpy: -1 joule / mole; heat_release: 1 joule / mole;",
+            "stoichiometry: A + B -> C; rate: 1 meter^2 / (mole second) * c(A) * c(B); reverse_rate: 1 / second;",
+            "stoichiometry: A + B -> C; rate: 1 meter^2 / (mole second) * c(A) * c(B); activation_energy: 1 joule / mole;",
+        ] {
+            let (text, codes) = reaction_codes("", body);
+            assert!(codes.contains(&"E0209".to_string()), "{body}\n{text}");
+        }
+        let (text, codes) = reaction_codes("", "stoichiometry: A + B; rate: 1 meter^2 / (mole second);");
+        assert!(codes.contains(&"E0401".to_string()) && text.contains("reactants -> products"), "{text}");
+    }
+
+    /// What a rate law may read, and what it is told when it reaches for something else.
+    #[test]
+    fn a_rate_law_reads_concentrations_and_temperature() {
+        let k = "let k = 1 meter^2 / (mole second);";
+        for (body, code, phrase) in [
+            ("stoichiometry: A + B -> C; rate: k * c(A) * c(D);", "E0202", "its species are A, B, C"),
+            ("stoichiometry: A + B -> C; rate: k * A * c(B);", "E0412", "its concentration is `c(A)`"),
+            ("stoichiometry: A + B -> C; rate: k * A.concentration * c(B);", "E0412", "`c(A)`"),
+            ("stoichiometry: A + B -> C; rate: k * c(A);", "E0400", "not a reaction rate"),
+            ("stoichiometry: A + B -> C; rate: k * c(A) * c(B) * arrhenius(2 joule);", "E0400", "per mole"),
+            ("stoichiometry: A + B -> C; rate: k * c(A) * c(B) * distance(A, B);", "E0412", "a rate law has none"),
+        ] {
+            let (text, codes) = reaction_codes(k, body);
+            assert!(codes.contains(&code.to_string()) && text.contains(phrase), "{body}: expected {code}\n{text}");
+        }
+        // Temperature, directly and through `arrhenius`, and every helper a law has.
+        for rate in [
+            "k * arrhenius(40 kilojoule / mole) * c(A) * c(B)",
+            "k * c(A) * c(B) * temperature / (300 kelvin)",
+            "k * max(c(A), 0 mole / meter^2) * c(B) * exp(-(1 joule / mole) / (8.314 joule / (mole kelvin) * temperature))",
+        ] {
+            let (text, codes) = reaction_codes(k, &format!("stoichiometry: A + B -> C; rate: {rate};"));
+            assert!(!codes.iter().any(|c| c.starts_with('E')), "{rate}\n{text}");
+        }
+        // `c` belongs to rate laws, not to forces.
+        let (text, codes) = err(
+            "project p { force f(a: particle) -> vec2<newton> { return c(A) * vec2(1 newton, 0 newton); } }",
+        );
+        assert!(codes.contains(&"E0413".to_string()) && text.contains("rate law"), "{text}");
+    }
+
+    /// A law that keeps consuming a species that has run out is warned about; mass
+    /// action, and a law shaped like it, is not.
+    #[test]
+    fn a_rate_law_that_can_go_negative_is_warned_about() {
+        let k = "let k = 1 meter^2 / (mole second); let v = 1 mole / (meter^2 second);";
+        let warned = |rate: &str| {
+            let (text, codes) = reaction_codes(k, &format!("stoichiometry: A + B -> C; rate: {rate};"));
+            assert!(!codes.iter().any(|c| c.starts_with('E')), "{rate}\n{text}");
+            codes.contains(&"W0318".to_string())
+        };
+        assert!(warned("v + 0 * k * c(A) * c(B)"), "a zeroth-order rate consumes reactants that are gone");
+        assert!(warned("k * c(A) * (1 mole / meter^2)"), "it does not vanish with B");
+        assert!(warned("-k * c(A) * c(B)"), "it runs backwards and consumes C, which starts empty");
+        assert!(!warned("k * c(A) * c(B)"));
+        // Reversible inside the law: each direction vanishes with what it consumes.
+        assert!(!warned("k * c(A) * c(B) - 1 / second * c(C)"));
+        // Michaelis–Menten in A, first order in B.
+        assert!(!warned("v * c(A) / (0.5 mole / meter^2 + c(A)) * c(B) / (1 mole / meter^2)"));
+
+        // A constant in the unit of a rate is not taken for a zeroth-order law: a
+        // constant `rate:` is a rate constant, and the message says which was meant.
+        let (text, codes) = reaction_codes(k, "stoichiometry: A + B -> C; rate: v;");
+        assert!(codes.contains(&"E0400".to_string()) && text.contains("a constant `rate:` is a rate constant"), "{text}");
+    }
+
+    /// A rate law that is not finite where the mixture starts is refused.
+    #[test]
+    fn a_rate_law_that_is_not_finite_is_refused() {
+        let (text, codes) = reaction_codes(
+            "let k = 1 meter^2 / (mole second);",
+            "stoichiometry: A + B -> C; rate: k * c(A) * c(B) * (1 mole / meter^2) / c(C);",
+        );
+        // C starts empty, so the law divides by zero on the first step: refused, not
+        // warned about. (A blind review found this once passed with only W0318.)
+        assert!(codes.contains(&"E0405".to_string()) && text.contains("not finite"), "{text}");
+        let (text, codes) = reaction_codes(
+            "let k = 1 meter^2 / (mole second); let none = 0 mole / meter^2;",
+            "stoichiometry: A + B -> C; rate: k * c(A) * c(B) * (1 mole / meter^2) / none;",
+        );
+        assert!(codes.contains(&"E0405".to_string()) && text.contains("not finite"), "{text}");
+    }
+
+    /// A mixture's `temperature:` reaches the domain; it was once accepted and dropped.
+    #[test]
+    fn a_mixture_temperature_is_read() {
+        let compiled = ok(&reaction_model("", "stoichiometry: A + B -> C; rate: 1 meter^2 / (mole second);")
+            .replace("domain chemistry mix { grid: g; }", "domain chemistry mix { grid: g; temperature: 350 kelvin; }"));
+        let summary = &compiled.model.domains[0].summary;
+        assert!(summary.contains("at 350 K"), "{summary}");
+        let default = ok(&reaction_model("", "stoichiometry: A + B -> C; rate: 1 meter^2 / (mole second);"));
+        assert!(default.model.domains[0].summary.contains("at 298.15 K"), "{}", default.model.domains[0].summary);
+        let source = reaction_model("", "stoichiometry: A + B -> C; rate: 1 meter^2 / (mole second);")
+            .replace("domain chemistry mix { grid: g; }", "domain chemistry mix { grid: g; temperature: -4 kelvin; }");
+        let (text, codes) = err(&source);
+        assert!(codes.contains(&"E0405".to_string()), "{text}");
     }
 
     // --- user laws at their use site (M6.1b) -------------------------------------

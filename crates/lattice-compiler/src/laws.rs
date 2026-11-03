@@ -80,6 +80,10 @@ pub enum LawKind {
     Force,
     /// `potential u(a) -> joule` or `potential u(a, b) -> joule`.
     Potential,
+    /// A reaction's `rate:` written as a law (spec §8.3), `k * c(A) * c(B)`: no header
+    /// and no body, just the expression. It reads concentrations through `c(…)` and the
+    /// cell's `temperature`, and returns a rate in mol/(m²·s).
+    Rate,
 }
 
 impl LawKind {
@@ -96,6 +100,7 @@ impl LawKind {
         match self {
             LawKind::Force => Ty::Vec2(Dimension::FORCE),
             LawKind::Potential => Ty::Scalar(Dimension::ENERGY),
+            LawKind::Rate => Ty::Scalar(Dimension::AREAL_REACTION_RATE),
         }
     }
 
@@ -103,6 +108,7 @@ impl LawKind {
         match self {
             LawKind::Force => "vec2<newton>",
             LawKind::Potential => "joule",
+            LawKind::Rate => "mole / (meter^2 second)",
         }
     }
 }
@@ -279,6 +285,14 @@ pub enum TExprKind {
     },
     /// The separation of the header's two particles, through the nearest image.
     Distance,
+    /// In a rate law, `c(X)`: the `n`th species' concentration, floored at zero.
+    Concentration(usize),
+    /// In a rate law, the cell's temperature.
+    Temperature,
+    /// In a rate law, `arrhenius(Ea)`: `exp(−Ea / R T)` at the cell's temperature, or
+    /// `1` where the temperature is not a positive finite number, as the built-in
+    /// Arrhenius factor does.
+    Arrhenius(Box<TExpr>),
     /// `.x` (0) or `.y` (1) of a vector.
     Component(Box<TExpr>, usize),
     /// `-x`
@@ -337,6 +351,9 @@ pub struct TypedLaw {
     /// True when anything reads a mass or a charge, so the law differs from pair to pair
     /// and nothing about it can be sampled without the particles' own values.
     pub reads_members: bool,
+    /// True when a rate law reads the cell's temperature, directly or through
+    /// `arrhenius`.
+    pub reads_temperature: bool,
     /// The declaration.
     pub span: Span,
 }
@@ -389,17 +406,7 @@ fn check_law(law: &LawDecl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnos
         return None;
     };
 
-    let mut checker = Checker {
-        evaluator,
-        diagnostics,
-        kind,
-        particles: Vec::new(),
-        params: Vec::new(),
-        locals: Vec::new(),
-        reads_velocity: false,
-        reads_members: false,
-        failed: false,
-    };
+    let mut checker = Checker::new(evaluator, diagnostics, kind, &[]);
     checker.header(law);
     let result = checker.body(law);
     let returns = checker.declared_return(law);
@@ -428,7 +435,55 @@ fn check_law(law: &LawDecl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnos
         result,
         reads_velocity: checker.reads_velocity,
         reads_members: checker.reads_members,
+        reads_temperature: false,
         span: law.span,
+    })
+}
+
+/// Check a reaction's `rate:` written as a law (spec §8.3): `k * c(H_plus) * c(OH_minus)`.
+///
+/// `species` names the mixture's species in the network's order, which is the order
+/// `c(…)` indexes. The law must come out in mol/(m²·s), a reaction rate per unit area.
+/// Returns a [`TypedLaw`] of kind [`LawKind::Rate`] with no particles, `param`s or
+/// `let`s, named after the reaction.
+pub fn check_rate(
+    reaction: &Ident,
+    value: &Expr,
+    species: &[String],
+    evaluator: &Evaluator<'_>,
+    diagnostics: &mut Diagnostics,
+) -> Option<TypedLaw> {
+    let mut checker = Checker::new(evaluator, diagnostics, LawKind::Rate, species);
+    let result = checker.expr(value);
+    let expected = LawKind::Rate.returns();
+    let mut result = result?;
+    checker.coerce_zero(&mut result, expected);
+    if result.ty != expected {
+        checker.error(
+            Diagnostic::error(format!("the rate of `{}` is not a reaction rate", reaction.text))
+                .with_code("E0400")
+                .at(result.span, format!("this is {}", result.ty.describe()))
+                .note(
+                    "a `rate:` that reads concentrations is the reaction's rate itself, in \
+                     mol/(m^2 s): how many moles of extent per square metre per second",
+                )
+                .help("a second-order law is `k * c(A) * c(B)` with `k` in meter^2 / (mole second)"),
+        );
+    }
+    if checker.failed {
+        return None;
+    }
+    Some(TypedLaw {
+        kind: LawKind::Rate,
+        name: reaction.text.clone(),
+        particles: Vec::new(),
+        params: Vec::new(),
+        locals: Vec::new(),
+        result,
+        reads_velocity: false,
+        reads_members: false,
+        reads_temperature: checker.reads_temperature,
+        span: value.span,
     })
 }
 
@@ -439,10 +494,31 @@ struct Checker<'e, 'a, 'd> {
     particles: Vec<Ident>,
     params: Vec<LawParamInfo>,
     locals: Vec<LawLocal>,
+    /// A rate law's species, in the order `c(…)` indexes.
+    species: Vec<String>,
     reads_velocity: bool,
     reads_members: bool,
+    reads_temperature: bool,
     /// Set by any error, so a law that reported one is not returned half-checked.
     failed: bool,
+}
+
+impl<'e, 'a, 'd> Checker<'e, 'a, 'd> {
+    fn new(evaluator: &'e Evaluator<'a>, diagnostics: &'d mut Diagnostics, kind: LawKind, species: &[String]) -> Self {
+        Checker {
+            evaluator,
+            diagnostics,
+            kind,
+            particles: Vec::new(),
+            params: Vec::new(),
+            locals: Vec::new(),
+            species: species.to_vec(),
+            reads_velocity: false,
+            reads_members: false,
+            reads_temperature: false,
+            failed: false,
+        }
+    }
 }
 
 impl Checker<'_, '_, '_> {
@@ -768,6 +844,31 @@ impl Checker<'_, '_, '_> {
         if let Some(index) = self.params.iter().position(|p| p.name == name) {
             return Some(TExpr { kind: TExprKind::Param(index), ty: self.params[index].ty, span });
         }
+        if self.kind == LawKind::Rate && name == "temperature" {
+            if self.evaluator.is_constant(name) {
+                // The model's own constant wins, as declared names do everywhere; but a
+                // rate law that reads concentrations probably meant the cell's.
+                self.diagnostics.push(
+                    Diagnostic::warning("`temperature` here is the model's constant, not the cell's temperature")
+                        .with_code("W0319")
+                        .at(span, "the `let temperature` constant")
+                        .note("a declared constant hides the state of the same name, in a rate law as anywhere else")
+                        .help("rename the constant if the law should follow the cell's temperature"),
+                );
+            } else {
+                self.reads_temperature = true;
+                return Some(TExpr { kind: TExprKind::Temperature, ty: Ty::Scalar(Dimension::TEMPERATURE), span });
+            }
+        }
+        if self.kind == LawKind::Rate && self.species.iter().any(|s| s == name) && !self.evaluator.is_constant(name) {
+            self.error(
+                Diagnostic::error(format!("`{name}` is a species, not a value"))
+                    .with_code("E0412")
+                    .at(span, "a species")
+                    .help(format!("its concentration is `c({name})`")),
+            );
+            return None;
+        }
         if self.particles.iter().any(|p| p.text == name) {
             self.error(
                 Diagnostic::error(format!("`{name}` is a particle, not a value"))
@@ -873,6 +974,31 @@ impl Checker<'_, '_, '_> {
             return None;
         };
 
+        // A rate law's two readers of the state, which no other law has.
+        match (name, self.kind == LawKind::Rate) {
+            ("c", true) => return self.concentration(arguments, span),
+            ("arrhenius", true) => return self.arrhenius(arguments, span),
+            ("c" | "arrhenius", false) => {
+                self.error(
+                    Diagnostic::error(format!("`{name}` belongs to a reaction's rate law"))
+                        .with_code("E0413")
+                        .at(callee.span, format!("in a {}", if self.kind == LawKind::Force { "force" } else { "potential" }))
+                        .note("concentrations and the temperature are read in a reaction's `rate:`, not on particles"),
+                );
+                return None;
+            }
+            ("distance" | "minimum_image", true) => {
+                self.error(
+                    Diagnostic::error(format!("`{name}` reads particles, and a rate law has none"))
+                        .with_code("E0412")
+                        .span(callee.span)
+                        .note("a rate law reads concentrations through `c(…)` and the cell's `temperature`"),
+                );
+                return None;
+            }
+            _ => {}
+        }
+
         // `distance(a, b)` takes the header's particles themselves.
         if name == "distance" {
             return self.distance(arguments, span);
@@ -887,8 +1013,16 @@ impl Checker<'_, '_, '_> {
                     .note("a name followed by `(` is a call, even with a space between them")
                     .help(format!("to multiply, write `{name} * (…)`"))
             } else {
-                let mut known: Vec<&str> = Builtin::ALL.iter().map(|b| b.name()).collect();
-                known.push("distance");
+                let mut known: Vec<&str> = Builtin::ALL
+                    .iter()
+                    .filter(|b| self.kind != LawKind::Rate || **b != Builtin::MinimumImage)
+                    .map(|b| b.name())
+                    .collect();
+                if self.kind == LawKind::Rate {
+                    known.extend(["c", "arrhenius"]);
+                } else {
+                    known.push("distance");
+                }
                 Diagnostic::error(format!("`{name}` is not a function a law can call"))
                     .with_code("E0413")
                     .span(callee.span)
@@ -927,6 +1061,75 @@ impl Checker<'_, '_, '_> {
         let mut args: Vec<TExpr> = args.into_iter().collect::<Option<_>>()?;
         let ty = self.builtin_type(builtin, &mut args, arguments, span)?;
         Some(TExpr { kind: TExprKind::Call(builtin, args), ty, span })
+    }
+
+    /// `c(X)`: the concentration of species `X` in this cell.
+    fn concentration(&mut self, arguments: &[lattice_syntax::Argument], span: Span) -> Option<TExpr> {
+        let name = match arguments {
+            [argument] if argument.name.is_none() => argument.value.as_name(),
+            _ => None,
+        };
+        let Some(name) = name else {
+            self.error(
+                Diagnostic::error("`c` takes one species")
+                    .with_code("E0413")
+                    .span(span)
+                    .help("write `c(A)` for the concentration of species `A`"),
+            );
+            return None;
+        };
+        let Some(index) = self.species.iter().position(|s| s == name) else {
+            self.error(
+                Diagnostic::error(format!("there is no species called `{name}` in this mixture"))
+                    .with_code("E0202")
+                    .at(arguments[0].value.span, "unknown species")
+                    .help(if self.species.is_empty() {
+                        "the mixture has no species".to_string()
+                    } else {
+                        format!("its species are {}", self.species.join(", "))
+                    }),
+            );
+            return None;
+        };
+        Some(TExpr { kind: TExprKind::Concentration(index), ty: Ty::Scalar(Dimension::AREAL_CONCENTRATION), span })
+    }
+
+    /// `arrhenius(Ea)`: the Arrhenius factor at the cell's temperature.
+    fn arrhenius(&mut self, arguments: &[lattice_syntax::Argument], span: Span) -> Option<TExpr> {
+        let [argument] = arguments else {
+            self.error(
+                Diagnostic::error(format!("`arrhenius` takes one argument, found {}", arguments.len()))
+                    .with_code("E0413")
+                    .span(span)
+                    .help("write `arrhenius(50 kilojoule / mole)` for an activation energy"),
+            );
+            return None;
+        };
+        if let Some(named) = &argument.name {
+            self.error(
+                Diagnostic::error("`arrhenius` takes its activation energy in order, not by name")
+                    .with_code("E0413")
+                    .span(named.span),
+            );
+            return None;
+        }
+        let energy = self.expr(&argument.value)?;
+        let per_mole = Dimension::ENERGY.try_div(Dimension::AMOUNT).expect("energy per amount is representable");
+        if energy.ty != Ty::Scalar(per_mole) {
+            self.error(
+                Diagnostic::error("`arrhenius` takes an activation energy per mole")
+                    .with_code("E0400")
+                    .at(energy.span, format!("this is {}", energy.ty.describe()))
+                    .help("write it in joule / mole or kilojoule / mole"),
+            );
+            return None;
+        }
+        self.reads_temperature = true;
+        Some(TExpr {
+            kind: TExprKind::Arrhenius(Box::new(energy)),
+            ty: Ty::Scalar(Dimension::DIMENSIONLESS),
+            span,
+        })
     }
 
     fn distance(&mut self, arguments: &[lattice_syntax::Argument], span: Span) -> Option<TExpr> {

@@ -61,6 +61,7 @@ pub fn lower(law: &TypedLaw) -> Result<LoweredLaw, Box<Diagnostic>> {
         (LawKind::Force, false) => UserLawKind::BodyForce,
         (LawKind::Potential, true) => UserLawKind::PairPotential,
         (LawKind::Potential, false) => UserLawKind::BodyPotential,
+        (LawKind::Rate, _) => unreachable!("a rate law is lowered by `lower_rate`"),
     };
     let mut offsets = Vec::with_capacity(law.params.len());
     let mut slots = 0u32;
@@ -99,6 +100,38 @@ pub fn lower(law: &TypedLaw) -> Result<LoweredLaw, Box<Diagnostic>> {
             ))));
     }
     Ok(LoweredLaw { kind, program, energy, param_slots: slots as usize, branches })
+}
+
+/// Lower a checked rate law for a mixture of `species` species.
+///
+/// The program's inputs are the concentrations in the network's order and its one
+/// parameter is the temperature, the layout
+/// [`RateExpression`](lattice_domain_chemistry::RateExpression) evaluates. `c(X)` reads
+/// `max(c_X, 0)` and `arrhenius(Ea)` computes `exp(−Ea / (R T))` in the order the
+/// built-in Arrhenius factor does, so a law written as mass action reproduces the
+/// built-in's bits.
+pub fn lower_rate(law: &TypedLaw, species: usize) -> Result<Program, Box<Diagnostic>> {
+    debug_assert_eq!(law.kind, LawKind::Rate);
+    let mut lowering =
+        Lowering { b: Builder::new(species as u32, 1), law, offsets: Vec::new(), locals: Vec::new(), branches: false };
+    let rate = lowering.expr(&law.result)?.scalar();
+    let program = lowering.b.finish(vec![rate]);
+    // The kinetics also runs each derivative on the same register file, to measure the
+    // law's timescale, so those must fit too.
+    let size = match lattice_domain_chemistry::RateExpression::partials_fit(&program) {
+        _ if !program.fits() => Some(format!("{} operations", program.ops().len())),
+        Err(largest) => Some(format!("{largest} operations in its derivative")),
+        Ok(()) => None,
+    };
+    if let Some(size) = size {
+        return Err(Box::new(
+            Diagnostic::error(format!("the rate of `{}` is too large to compile", law.name))
+                .with_code("E0413")
+                .at(law.span, size)
+                .note(format!("a law runs on a fixed register file of {} values", lattice_expr::MAX_REGISTERS)),
+        ));
+    }
+    Ok(program)
 }
 
 struct Lowering<'a> {
@@ -143,6 +176,33 @@ impl Lowering<'_> {
                 }
             }
             TExprKind::Distance => Value::Scalar(self.input(layout::R)),
+            TExprKind::Concentration(species) => {
+                // Floored as mass action floors it: a reactant a few ulps below zero is
+                // round-off, and `NaN.max(0)` is `0`.
+                let raw = self.input(*species as u32);
+                let zero = self.b.constant(0.0);
+                Value::Scalar(self.b.push(Op::Max(raw, zero)))
+            }
+            TExprKind::Temperature => Value::Scalar(self.b.push(Op::Param(0))),
+            TExprKind::Arrhenius(energy) => {
+                let energy = self.expr(energy)?.scalar();
+                let temperature = self.b.push(Op::Param(0));
+                // `(−Ea / (R · T)).exp()`, the built-in's order.
+                let negated = self.b.push(Op::Neg(energy));
+                let gas = self.b.constant(lattice_domain_chemistry::GAS_CONSTANT);
+                let rt = self.b.push(Op::Mul(gas, temperature));
+                let exponent = self.b.push(Op::Div(negated, rt));
+                let factor = self.b.push(Op::Exp(exponent));
+                // And its guard: a temperature that is not positive and finite gives a
+                // factor of one rather than an overflow or a division by zero.
+                let zero = self.b.constant(0.0);
+                let infinity = self.b.constant(f64::INFINITY);
+                let positive = self.b.push(Op::Lt(zero, temperature));
+                let finite = self.b.push(Op::Lt(temperature, infinity));
+                let physical = self.b.push(Op::And(positive, finite));
+                let one = self.b.constant(1.0);
+                Value::Scalar(self.b.push(Op::Select(physical, factor, one)))
+            }
             TExprKind::Component(v, k) => {
                 let (x, y) = self.expr(v)?.vector();
                 Value::Scalar(if *k == 0 { x } else { y })

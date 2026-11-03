@@ -1695,6 +1695,7 @@ name = "lattice-domain-chemistry"
 version = "0.1.0"
 dependencies = [
  "lattice-domain-grid2d",
+ "lattice-expr",
  "lattice-ir",
 ]
 
@@ -1796,6 +1797,7 @@ dependencies = [
  "lattice-ir",
  "lattice-observe",
  "lattice-runtime",
+ "lattice-syntax",
  "lattice-wgpu",
 ]
 

@@ -48,6 +48,9 @@ use lattice_ir::{
 use crate::kinetics::{Kinetics, KineticsReport};
 use crate::network::ReactionNetwork;
 
+/// The temperature a mixture reacts at when nothing says otherwise, K: 25 °C.
+pub const DEFAULT_TEMPERATURE: f64 = 298.15;
+
 /// Species diffusing and reacting on a shared grid.
 #[derive(Debug)]
 pub struct ReactingMixture {
@@ -102,7 +105,7 @@ impl ReactingMixture {
             grid,
             kinetics: Kinetics::new(network),
             transport,
-            uniform_temperature: 298.15,
+            uniform_temperature: DEFAULT_TEMPERATURE,
             temperature: None,
             heat: ScalarField::new(&grid, 1),
             cell: vec![0.0; count],
@@ -117,6 +120,11 @@ impl ReactingMixture {
     pub fn with_temperature(mut self, temperature: f64) -> ReactingMixture {
         self.uniform_temperature = temperature;
         self
+    }
+
+    /// The temperature every cell reacts at when no coupling supplies a field, K.
+    pub fn temperature(&self) -> f64 {
+        self.uniform_temperature
     }
 
     /// Tighten the reaction integration. See [`Kinetics::with_accuracy`].
@@ -291,6 +299,7 @@ static CONTRACT: SolverContract = SolverContract {
     governing_equations: &[
         "dc_i/dt = div(D_i grad c_i) + sum_r nu_ir R_r(c, T)",
         "R_r = k_f(T) prod c^nu - k_r(T) prod c^nu   (mass action)",
+        "R_r = f_r(c, T)                              (a rate law the model wrote, spec 8.3)",
         "k(T) = A exp(-Ea / R T)                     (Arrhenius)",
         "q = -sum_r dH_r R_r                          (heat released, W/m^2)",
     ],
@@ -304,8 +313,10 @@ static CONTRACT: SolverContract = SolverContract {
          concentration per unit volume would need a thickness nobody declared",
         "the mixture is dilute: species diffuse independently, with no cross-diffusion \
          and no effect of one species' gradient on another's flux",
-        "reactions are mass-action in the declared species, with no explicit solvent, \
-         activity coefficients, or ionic-strength corrections",
+        "reactions are mass-action in the declared species, or follow a rate law the \
+         model wrote, with no explicit solvent, activity coefficients, or ionic-strength \
+         corrections; a rate law reads each concentration floored at zero, as mass \
+         action does",
         "a rate constant's units follow the reaction's total order; a second-order \
          constant written where a first-order one belongs is wrong by a factor with \
          the dimensions of a concentration, and the compiler checks it",
@@ -322,8 +333,10 @@ static CONTRACT: SolverContract = SolverContract {
                    stochastic path; stiffer networks want an implicit solver, which \
                    spec 12.3 defers to an established library",
     stability: "the transport half is unconditionally stable (Crank-Nicolson). The \
-                reaction half sub-cycles to its own Jacobian, so it is stable at any \
-                requested step — but a step much longer than the reaction timescale is \
+                reaction half sub-cycles to its own Jacobian, estimated by finite \
+                differences of the rates, so it covers a rate law the model wrote as it \
+                covers mass action; it is stable at any requested step where that \
+                estimate holds over a sub-step — but a step much longer than the reaction timescale is \
                 resolved by taking many sub-steps, and the splitting error grows as \
                 dt^2 whatever the sub-steps do",
     conserves: &[Invariant::Mass, Invariant::Amount],
@@ -340,6 +353,13 @@ static CONTRACT: SolverContract = SolverContract {
         "the reaction integration is explicit and sub-cycled, so a stiff network \
          exhausts its sub-step budget rather than converging. The count of cells that \
          did is published every step",
+        "a rate law the model wrote need not vanish when a reactant runs out, so unlike \
+         mass action it can drive a concentration negative. The compiler samples each \
+         law for that and warns (W0318); a run that does it shows in the species' \
+         published minimum. Atoms are conserved regardless, because the stoichiometry \
+         fixes what each unit of extent converts",
+        "a rate law's thermodynamic consistency is not checked: nothing requires its \
+         equilibrium to agree with the heat it releases or with any other reaction's",
         "round-off can drive an exhausted reactant a few ulps below zero; that much is \
          clamped and summed into a published total, because a silent clamp is how a \
          mass check comes to fail for no visible reason",
@@ -355,6 +375,9 @@ static CONTRACT: SolverContract = SolverContract {
         "diffusion with no reaction reproduces the heat module's analytic kernel",
         "Strang splitting converges at second order in dt",
         "Gray-Scott produces patterns and conserves what it should",
+        "a rate law written as Arrhenius mass action reproduces the built-in's run to the bit",
+        "a Michaelis-Menten rate law against its implicit closed form",
+        "the heat a rate law's reaction publishes equals its extent times heat_release",
     ],
     references: &[
         "Strang, G. (1968). On the construction and comparison of difference schemes. \

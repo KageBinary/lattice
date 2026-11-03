@@ -690,8 +690,8 @@ rest build on its parameter surface.
 |---|---|---|
 | M6.1a | the law grammar, `let` constants, and a type and unit checker | ✅ |
 | M6.1b | a std-only `lattice-expr` crate: a scalar interpreter, user `force`/`potential` in the particle domain, derived forces and per-law contracts | ✅ |
-| M6.1c | §8.3's reaction form: `stoichiometry`, `heat_release`, rate laws reading concentrations and temperature | next |
-| M6.1d | a batched interpreter bit-identical to the scalar one, non-finite tracing to source, `lattice inspect expr` | |
+| M6.1c | §8.3's reaction form: `stoichiometry`, `heat_release`, rate laws reading concentrations and temperature | ✅ |
+| M6.1d | a batched interpreter bit-identical to the scalar one, non-finite tracing to source, `lattice inspect expr` | next |
 | M6.2 | `observer` laws and the Rust observer SDK — the exit condition's "and observer" | |
 | M6.3 | WGSL lowering, with a budget derived per expression as M4.2 did per kernel | |
 | M6.4 | batch sweeps over `let` constants and `param` bindings, re-bound without recompiling | |
@@ -870,6 +870,111 @@ built-in's energies.
 - **The trait's names were `'static`, and a user's is not.** `ForceLaw::name` returned
   `&'static str`, so no law could name itself after its declaration. The trait now
   returns a borrowed `&str`; every built-in still satisfies it unchanged.
+
+### M6.1c — Rate laws ✅
+
+Spec §8.3's reaction compiles as the spec writes it, and runs:
+
+```
+reaction neutralization {
+    stoichiometry: H_plus + OH_minus -> H2O;
+    rate: k * c(H_plus) * c(OH_minus);
+    heat_release: 57.3 kilojoule / mole;
+}
+```
+
+- **`stoichiometry: A + B -> C`** is `reactants:` and `products:` in one line. The
+  parser already read `->` in a setting, so no grammar changed.
+- **`heat_release:`** is `enthalpy:` with the sign a reader expects: positive is heat out.
+- **A `rate:` that reads the state** (`c(X)`, `temperature`, `arrhenius(Ea)`, a species
+  name) is a rate law: the reaction's net rate itself, in mol/(m²·s). One that reads
+  nothing is a rate constant, as before, so the overloaded `rate:` decided in M6.1a is
+  decided by what the expression reads, never by its unit.
+
+The checker in `laws.rs` gained a third kind, `LawKind::Rate`. It is one expression with
+no header and no body, and it reads concentrations through `c(…)` and the cell's
+temperature. `lower_rate` compiles it to a `lattice-expr` program whose inputs are the
+mixture's concentrations and whose one parameter is the temperature. The chemistry
+crate's new `RateExpression` evaluates it in place of mass action, with a derivative
+program per species it reads. Everything else is unchanged: sub-cycling, the
+finite-difference Jacobian bound, the energy carried through the Runge–Kutta stages, and
+Strang splitting.
+
+What a law cannot promise is written down, as P1 asks:
+- **The contract.** The reaction-diffusion contract gained the governing equation
+  `R_r = f_r(c, T)`, plus two non-conservation entries: a law need not vanish with its
+  reactants, and its thermodynamic consistency is not checked.
+- **The model report.** Each rate law gets a contract line: what it reads, that atoms
+  and charge are conserved as far as the stoichiometry balances them, and that staying
+  non-negative is sampled, not proved.
+- **`W0318`.** The compiler samples each law, with every species at its starting peak and
+  then each converted species set to zero in turn, at the mixture's own temperature
+  (not a coupled field's). It warns when the law would still consume a species that has
+  run out. Mass action cannot do this; a law missing a reactant can. (A bare constant
+  `rate: v` in mol/(m²·s) is refused outright, `E0400`, so only a constant disguised as
+  a law reaches this warning.)
+- **`W0319`.** A rate law that reads `temperature` while the model has a constant of that
+  name reads the constant, as declared names always win, and is told so.
+
+One fix outside the reaction form: **a mixture's `temperature:` was accepted and never
+read.** The setting was in the chemistry domain's allowed list from M3, and nothing
+applied it, so every mixture reacted at 298.15 K whatever it said. A rate law reading
+`temperature` made that a wrong answer rather than a dead setting. It is now read,
+checked to be above absolute zero, and printed in the domain's summary.
+
+Validation, three new cases (`lattice validate --filter laws`):
+
+- **Bit-identical to mass action.** A front of `A + B -> C` at 340 K, with Arrhenius,
+  compiled twice from the language: once with `rate:` and `activation_energy:`, once with
+  `rate: k * arrhenius(Ea) * (c(A) * c(B))`. After 60 Strang steps, 0 of 1,092
+  concentration values differ, and the published heat release agrees to the bit.
+- **Michaelis–Menten against its closed form.** Its solution is implicit,
+  `K ln(S/S₀) + S − S₀ = −V t`, so the error is measured as a Newton step from the
+  computed `S`. The bound is the integrator's own: a Richardson estimate from the same
+  run at half the accuracy bound, doubled, plus rounding. The error is 3.3e-8 against a
+  bound of 6.7e-8, and halving the accuracy bound shrinks it 18.4 times, against
+  fourth order's 16.
+- **Heat release is extent times heat.** §8.3's reaction, well mixed. The energy
+  published agrees with the water formed times 57.3 kJ/mol to 6e-16 relative, against a
+  rounding bound of 7.8e-13 derived from an analytic sub-step count. The bound counts
+  every rounding at its worst, so it has about 1,300× slack: it would catch heat
+  computed from a different rate than the one that formed the water, not one wrong in
+  the thirteenth digit. **What it does not check is the rate itself.** The extent is
+  printed beside the closed form for equal second-order reactants, `c₀ · 80/81`, but not
+  asserted against it, so a wrong law of the right sign would pass this case. The
+  Michaelis–Menten case is the one that checks a law's rate against an answer.
+- No rate law has been benchmarked. The interpreter's 3.7–4.8× cost is a pair
+  potential's, measured in M6.1b.
+
+[`examples/neutralization.lattice`](../examples/neutralization.lattice) is §8.3's
+reaction with its heat coupled to a temperature field. Its coupling ledger records 156 J
+sent over 400 exchanges. Neither the example nor a test checks what arrived against
+that; the coupled heat case in `lattice validate` is the one that checks a ledger. 1,269 tests,
+50 invalid fixtures (four new, and the one that asserted "not implemented" removed),
+76 validation cases (87 with `--features gpu`).
+
+### What M6.1c taught us
+
+- **A setting that is accepted and ignored is worse than an unknown one.** The mixture's
+  `temperature:` passed the unknown-setting check because it was on the allowed list, so
+  nothing warned. It had been dead since M3. The check that a setting is known says
+  nothing about whether it is used. The domain summary now prints the temperature, so a
+  dropped value would show.
+- **Bit-identity is a statement about association, and the law has to say it.**
+  `k * arrhenius(Ea) * c(A) * c(B)` is `((k f) a) b`. The built-in computes `(k f)(a b)`.
+  Both are the same rate, rounded differently. Written with the parentheses, the law
+  reproduces the built-in to the bit, and that needs `c(…)` to floor at zero exactly as
+  mass action does, including `NaN.max(0) = 0`. A user who wants the built-in's bits can
+  have them, and language.md says how.
+- **An overloaded setting needs one rule, and the rule should not be the unit.** A
+  constant in mol/(m²·s) could be read as a zeroth-order rate law. It is not: a constant
+  `rate:` is a rate constant, and the message says why. A constant rate keeps consuming a
+  reactant that is gone, the one thing mass action guarantees against.
+- **A timescale measure built for mass action has to be rebuilt for a law.** The
+  stiffness ratio used each direction's one-way rate, which a law does not have. A
+  reversible law at equilibrium has a net rate of zero and a timescale all the same. The
+  law's exact derivative with respect to each concentration it reads gives that
+  timescale, and for a first-order reaction it is the same number.
 
 ## Outside the milestones: the playground
 

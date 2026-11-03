@@ -19,6 +19,7 @@ lattice-compute = { workspace = true, optional = true }
 lattice-wgpu = { workspace = true, optional = true }
 lattice-ir.workspace = true
 lattice-compiler.workspace = true
+lattice-syntax.workspace = true
 lattice-observe.workspace = true
 lattice-domain-particle.workspace = true
 lattice-domain-grid2d.workspace = true

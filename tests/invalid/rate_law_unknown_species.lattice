@@ -1,0 +1,22 @@
+// expect: E0202
+// `c(...)` names a species of this mixture. A typo is caught with the list of what
+// the mixture holds.
+
+project rate_law_unknown_species {
+  dimensions: 2;
+  duration: 1 second;
+  let k = 1.4e11 meter^2 / (mole second);
+
+  grid cell { size: [4, 4]; extent: [1 meter, 1 meter]; }
+  species H_plus on cell = 1 mole / meter^2 { formula: H; charge: 1; diffusivity: 0 meter^2 / second; }
+  species OH_minus on cell = 1 mole / meter^2 { formula: OH; charge: -1; diffusivity: 0 meter^2 / second; }
+  species H2O on cell = 0 mole / meter^2 { formula: H2O; diffusivity: 0 meter^2 / second; }
+  domain chemistry water { grid: cell; }
+
+  reaction neutralization {
+    stoichiometry: H_plus + OH_minus -> H2O;
+    rate: k * c(H_plus) * c(OH_minu);
+  }
+
+  solve reactions(water) with strang(dt=0.01 second);
+}

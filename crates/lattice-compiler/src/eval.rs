@@ -59,6 +59,11 @@ impl<'a> Evaluator<'a> {
         self.scope.push((name.into(), value));
     }
 
+    /// True when the model declared a constant of this name.
+    pub fn is_constant(&self, name: &str) -> bool {
+        self.scope.iter().any(|(key, _)| key == name)
+    }
+
     /// The source file being compiled.
     pub fn file(&self) -> &SourceFile {
         self.file
@@ -341,8 +346,8 @@ impl<'a> Evaluator<'a> {
                         .at(expr.span, "member access")
                         .help(
                             "members such as `a.position` are runtime values, read inside a \
-                             `force` or `potential`; rate laws that read concentrations arrive \
-                             in milestone M6.1c",
+                             `force` or `potential`; a concentration is read in a reaction's \
+                             `rate:` as `c(A)`",
                         ),
                 );
                 None
@@ -648,10 +653,10 @@ mod tests {
     }
 
     #[test]
-    fn member_access_points_at_laws_and_the_rate_law_milestone() {
+    fn member_access_points_at_laws_and_rate_laws() {
         let (text, codes) = err("A.concentration");
         assert!(codes.contains(&"E0210".to_string()));
-        assert!(text.contains("inside a") && text.contains("M6.1c"), "{text}");
+        assert!(text.contains("inside a") && text.contains("`c(A)`"), "{text}");
     }
 
     #[test]

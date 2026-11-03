@@ -174,6 +174,14 @@ impl Plan {
         let mut product_starts = vec![0usize];
 
         for reaction in network.reactions() {
+            if let Some(law) = &reaction.expression {
+                assert_eq!(
+                    law.species(),
+                    species,
+                    "rate law of `{}` was compiled for another species list",
+                    reaction.name
+                );
+            }
             stoichiometry.extend(reaction.stoichiometry(species));
             reactants.extend(reaction.reactants.iter().map(|t| (t.species, t.coefficient)));
             reactant_starts.push(reactants.len());
@@ -185,6 +193,9 @@ impl Plan {
 
     fn reaction_rate(&self, index: usize, concentrations: &[f64], temperature: f64) -> f64 {
         let Some(reaction) = self.network.reactions().get(index) else { return 0.0 };
+        if let Some(law) = &reaction.expression {
+            return law.rate(concentrations, temperature);
+        }
         mass_action_rate(
             &reaction.rate,
             &self.reactants[self.reactant_starts[index]..self.reactant_starts[index + 1]],
@@ -228,6 +239,30 @@ impl Plan {
             .iter()
             .map(|&(slot, _)| concentrations.get(slot).copied().unwrap_or(0.0).abs())
             .fold(0.0, f64::max)
+    }
+
+    /// How fast one reaction goes as a first-order process, 1/s.
+    ///
+    /// For mass action, the faster direction's one-way rate over the largest reactant
+    /// concentration. For a rate law, which has no separate directions, the largest
+    /// derivative of the rate with respect to a concentration it reads: the same
+    /// quantity for a first-order reaction, and nonzero at an equilibrium the law
+    /// expresses inside its own formula.
+    ///
+    /// The two measures differ above first order. For `k·[A]·[B]`, mass action's is
+    /// `k·min([A], [B])` and the law's `k·max([A], [B])`, so a law written as mass
+    /// action reports a different stiffness ratio from the built-in. Only that
+    /// published ratio differs: neither measure sets a sub-step, which the Jacobian
+    /// bound in `spectral_radius` does for both.
+    fn inverse_time(&self, index: usize, concentrations: &[f64], temperature: f64) -> f64 {
+        let Some(reaction) = self.network.reactions().get(index) else { return 0.0 };
+        if let Some(law) = &reaction.expression {
+            return law.inverse_time(concentrations, temperature);
+        }
+        let (forward, reverse) = self.one_way_rates(index, concentrations, temperature);
+        let scale = self.reactant_scale(index, concentrations).max(f64::MIN_POSITIVE);
+        // A rate is mol/(m²·s); dividing by a concentration gives a 1/s timescale.
+        forward.max(reverse) / scale
     }
 
     /// The pseudo-first-order rate of each direction of one reaction, 1/s.
@@ -302,6 +337,12 @@ impl Kinetics {
     /// Flattens the stoichiometry and term lists once, so the inner loop indexes arrays
     /// rather than walking nested `Vec`s — the same reason the particle module stores
     /// structure-of-arrays.
+    ///
+    /// # Panics
+    ///
+    /// If a reaction's rate law was compiled for a different number of species than the
+    /// network has: a compiler bug, and one that would otherwise rate the reaction as
+    /// zero without a word.
     pub fn new(network: ReactionNetwork) -> Kinetics {
         let species = network.len();
         Kinetics {
@@ -438,10 +479,7 @@ impl Kinetics {
             // and a timescale of nanoseconds, and that combination is precisely what
             // makes a network stiff — measuring the net rate would report the stiffest
             // system here as perfectly tame.
-            let (forward, reverse) = self.plan.one_way_rates(index, concentrations, temperature);
-            let scale = self.plan.reactant_scale(index, concentrations).max(f64::MIN_POSITIVE);
-            // A rate is mol/(m²·s); dividing by a concentration gives a 1/s timescale.
-            let inverse_time = forward.max(reverse) / scale;
+            let inverse_time = self.plan.inverse_time(index, concentrations, temperature);
             if inverse_time > 0.0 {
                 fastest = fastest.max(inverse_time);
                 slowest = slowest.min(inverse_time);
@@ -999,6 +1037,90 @@ mod tests {
         let mut wrong = [1.0];
         decay.advance(&mut wrong, 300.0, 1.0);
         assert_eq!(wrong, [1.0]);
+    }
+
+    /// `k · max(c_A, 0) · max(c_B, 0)` in a mixture of `species`, written as the compiler
+    /// lowers `k * (c(A) * c(B))`.
+    fn second_order_law(k: f64, species: u32) -> crate::rate::RateExpression {
+        use lattice_expr::{Builder, Op};
+        let mut b = Builder::new(species, 1);
+        let zero = b.constant(0.0);
+        let a = b.push(Op::Input(0));
+        let a = b.push(Op::Max(a, zero));
+        let c = b.push(Op::Input(1));
+        let c = b.push(Op::Max(c, zero));
+        let k = b.constant(k);
+        let product = b.push(Op::Mul(a, c));
+        let rate = b.push(Op::Mul(k, product));
+        crate::rate::RateExpression::new(b.finish(vec![rate]), "k * (c(A) * c(B))")
+    }
+
+    fn pair_network(reaction: Reaction) -> ReactionNetwork {
+        let mut network = ReactionNetwork::new();
+        network.add_species(Species::new("A").with_formula("H").unwrap());
+        network.add_species(Species::new("B").with_formula("H").unwrap());
+        network.add_species(Species::new("C").with_formula("H2").unwrap());
+        network.add_reaction(reaction);
+        network
+    }
+
+    /// A rate law written as mass action is mass action: the same rates, so the same
+    /// integration, to the bit.
+    #[test]
+    fn a_rate_law_written_as_mass_action_integrates_identically() {
+        let sides = || (vec![Term::new(0, 1.0), Term::new(1, 1.0)], vec![Term::new(2, 1.0)]);
+        let (r, p) = sides();
+        let mut builtin = Kinetics::new(pair_network(Reaction::new("r", r, p, RateLaw::mass_action(3.0))));
+        let (r, p) = sides();
+        let mut law = Kinetics::new(pair_network(Reaction::with_expression("r", r, p, second_order_law(3.0, 3))));
+
+        let (mut x, mut y) = ([1.0, 0.6, 0.0], [1.0, 0.6, 0.0]);
+        let a = builtin.advance(&mut x, 300.0, 2.0);
+        let b = law.advance(&mut y, 300.0, 2.0);
+        assert_eq!(a.substeps, b.substeps);
+        for (u, v) in x.iter().zip(&y) {
+            assert_eq!(u.to_bits(), v.to_bits(), "{x:?} against {y:?}");
+        }
+        assert!(x[2] > 0.3, "it reacted: {x:?}");
+    }
+
+    /// A law that is reversible inside its own formula sits at a net rate of zero at
+    /// equilibrium, and its timescale must not vanish with it.
+    #[test]
+    fn a_rate_law_has_a_timescale_at_its_own_equilibrium() {
+        use lattice_expr::{Builder, Op};
+        // kf·A − kr·B with kf = 3, kr = 1: equilibrium at B/A = 3.
+        let mut b = Builder::new(2, 1);
+        let (a, c) = (b.push(Op::Input(0)), b.push(Op::Input(1)));
+        let (kf, kr) = (b.constant(3.0), b.constant(1.0));
+        let forward = b.push(Op::Mul(kf, a));
+        let reverse = b.push(Op::Mul(kr, c));
+        let rate = b.push(Op::Sub(forward, reverse));
+        let law = crate::rate::RateExpression::new(b.finish(vec![rate]), "3/s c(A) - 1/s c(B)");
+        assert_eq!(law.reads().collect::<Vec<_>>(), [0, 1]);
+        let settled = [0.25, 0.75];
+        assert_eq!(law.rate(&settled, 300.0), 0.0);
+        assert_eq!(law.inverse_time(&settled, 300.0), 3.0, "the larger of |dR/dA| = 3 and |dR/dB| = 1");
+        // And a vector of the wrong length rates as zero rather than indexing past it.
+        assert_eq!(law.rate(&[1.0], 300.0), 0.0);
+    }
+
+    /// A law compiled for another species list is a compiler bug, refused loudly.
+    #[test]
+    #[should_panic(expected = "another species list")]
+    fn a_rate_law_of_the_wrong_length_is_refused() {
+        let mut network = ReactionNetwork::new();
+        network.add_species(Species::new("A").with_formula("H").unwrap());
+        network.add_species(Species::new("C").with_formula("H").unwrap());
+        network.add_reaction(Reaction::with_expression(
+            "r",
+            vec![Term::new(0, 1.0)],
+            vec![Term::new(1, 1.0)],
+            second_order_law(1.0, 2),
+        ));
+        // The law was compiled for these two species; a third makes it the wrong length.
+        network.add_species(Species::new("D").with_formula("H").unwrap());
+        let _ = Kinetics::new(network);
     }
 
     #[test]
