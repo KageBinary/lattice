@@ -7,10 +7,13 @@
 //! domain's [`layout`]. It keeps the author's operation order exactly: `a * b * c` is
 //! `(a × b) × c`, a vector times a scalar is `x × s` and a scalar times a vector is
 //! `s × x`, so a law written as a built-in is written computes the built-in's bits.
+//!
+//! Every operation is pushed at the span of the sub-expression it implements, so a
+//! program can say which part of the law's source an operation came from.
 
 use lattice_domain_particle::user::{layout, UserLawKind};
-use lattice_expr::{Builder, Op, Program, Reg};
-use lattice_syntax::{BinaryOp, Diagnostic};
+use lattice_expr::{Builder, Op, Origin, Program, Reg};
+use lattice_syntax::{BinaryOp, Diagnostic, Span};
 
 use crate::laws::{Builtin, LawKind, Member, TExpr, TExprKind, Ty, TypedLaw};
 
@@ -134,6 +137,11 @@ pub fn lower_rate(law: &TypedLaw, species: usize) -> Result<Program, Box<Diagnos
     Ok(program)
 }
 
+/// The span of a sub-expression as the byte range a program records.
+fn origin(span: Span) -> Option<Origin> {
+    Some(Origin { start: span.start, end: span.end })
+}
+
 struct Lowering<'a> {
     b: Builder,
     law: &'a TypedLaw,
@@ -155,7 +163,16 @@ impl Lowering<'_> {
         }
     }
 
+    /// Lower a sub-expression of `parent`, then go back to pushing at `parent`'s span:
+    /// the child's own operations took the builder's origin to the child.
+    fn child(&mut self, parent: &TExpr, child: &TExpr) -> Result<Value, Box<Diagnostic>> {
+        let value = self.expr(child)?;
+        self.b.at(origin(parent.span));
+        Ok(value)
+    }
+
     fn expr(&mut self, e: &TExpr) -> Result<Value, Box<Diagnostic>> {
+        self.b.at(origin(e.span));
         Ok(match &e.kind {
             TExprKind::Const(v) => Value::Scalar(self.b.constant(*v)),
             TExprKind::Local(i) => self.locals[*i],
@@ -185,7 +202,7 @@ impl Lowering<'_> {
             }
             TExprKind::Temperature => Value::Scalar(self.b.push(Op::Param(0))),
             TExprKind::Arrhenius(energy) => {
-                let energy = self.expr(energy)?.scalar();
+                let energy = self.child(e, energy)?.scalar();
                 let temperature = self.b.push(Op::Param(0));
                 // `(−Ea / (R · T)).exp()`, the built-in's order.
                 let negated = self.b.push(Op::Neg(energy));
@@ -204,26 +221,26 @@ impl Lowering<'_> {
                 Value::Scalar(self.b.push(Op::Select(physical, factor, one)))
             }
             TExprKind::Component(v, k) => {
-                let (x, y) = self.expr(v)?.vector();
+                let (x, y) = self.child(e, v)?.vector();
                 Value::Scalar(if *k == 0 { x } else { y })
             }
-            TExprKind::Neg(v) => match self.expr(v)? {
+            TExprKind::Neg(v) => match self.child(e, v)? {
                 Value::Scalar(s) => Value::Scalar(self.b.push(Op::Neg(s))),
                 Value::Vector(x, y) => Value::Vector(self.b.push(Op::Neg(x)), self.b.push(Op::Neg(y))),
             },
             TExprKind::Not(v) => {
-                let s = self.expr(v)?.scalar();
+                let s = self.child(e, v)?.scalar();
                 Value::Scalar(self.b.push(Op::Not(s)))
             }
             TExprKind::Power(v, n) => {
-                let s = self.expr(v)?.scalar();
+                let s = self.child(e, v)?.scalar();
                 Value::Scalar(self.b.push(Op::Powi(s, *n)))
             }
-            TExprKind::Binary(op, l, r) => self.binary(*op, l, r)?,
+            TExprKind::Binary(op, l, r) => self.binary(*op, l, r, e)?,
             TExprKind::Select(c, a, b) => {
                 self.branches = true;
-                let c = self.expr(c)?.scalar();
-                match (self.expr(a)?, self.expr(b)?) {
+                let c = self.child(e, c)?.scalar();
+                match (self.child(e, a)?, self.child(e, b)?) {
                     (Value::Vector(ax, ay), Value::Vector(bx, by)) => {
                         Value::Vector(self.b.push(Op::Select(c, ax, bx)), self.b.push(Op::Select(c, ay, by)))
                     }
@@ -234,8 +251,8 @@ impl Lowering<'_> {
         })
     }
 
-    fn binary(&mut self, op: BinaryOp, l: &TExpr, r: &TExpr) -> Result<Value, Box<Diagnostic>> {
-        let (lv, rv) = (self.expr(l)?, self.expr(r)?);
+    fn binary(&mut self, op: BinaryOp, l: &TExpr, r: &TExpr, at: &TExpr) -> Result<Value, Box<Diagnostic>> {
+        let (lv, rv) = (self.child(at, l)?, self.child(at, r)?);
         let scalar = |b: &mut Builder, op: fn(Reg, Reg) -> Op| Value::Scalar(b.push(op(lv.scalar(), rv.scalar())));
         Ok(match op {
             BinaryOp::Add | BinaryOp::Sub => {
@@ -287,7 +304,7 @@ impl Lowering<'_> {
         }
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
-            values.push(self.expr(arg)?);
+            values.push(self.child(at, arg)?);
         }
         let s = |i: usize| values[i].scalar();
         let unary = |b: &mut Builder, op: fn(Reg) -> Op| Value::Scalar(b.push(op(s(0))));
@@ -465,6 +482,54 @@ mod tests {
             } }",
         );
         assert!(law.branches);
+    }
+
+    /// Each operation's origin is the sub-expression it implements, not the whole law.
+    #[test]
+    fn operations_carry_the_span_of_their_sub_expression() {
+        let source = "project p { potential well(a: particle, b: particle) -> joule {
+                param k: newton / meter;
+                return 0.5 * k * (distance(a, b) - 1 meter)^2;
+            } }";
+        let law = lowered(source);
+        let energy = law.energy.as_ref().unwrap();
+        let written = |program: &Program, reg: usize| {
+            let o = program.origin(reg as Reg).unwrap_or_else(|| panic!("r{reg} has no origin"));
+            &source[o.start as usize..o.end as usize]
+        };
+        let texts: Vec<&str> = (0..energy.ops().len()).map(|i| written(energy, i)).collect();
+        assert_eq!(
+            texts,
+            [
+                "0.5",
+                "k",
+                "0.5 * k",
+                "distance(a, b)",
+                "1",
+                "(distance(a, b) - 1 meter)",
+                "(distance(a, b) - 1 meter)^2",
+                "0.5 * k * (distance(a, b) - 1 meter)^2",
+            ]
+        );
+        // The derivative's operations inherit those origins: every one has one.
+        for i in 0..law.program.ops().len() {
+            written(&law.program, i);
+        }
+    }
+
+    /// What the example laws compute is fixed: these fingerprints were captured before
+    /// programs carried origins (M6.1d), and carrying them must not move a single one.
+    #[test]
+    fn example_law_fingerprints_are_unchanged() {
+        let spring = lowered(include_str!("../../../examples/damped_spring.lattice"));
+        assert_eq!(spring.program.fingerprint(), 0x8cd5_c476_1346_92ea, "damped_spring.lattice, `spring`");
+        // The chemistry domain numbers species by name order: H2O, H_plus, OH_minus.
+        let rate = crate::chemistry::rate_law_from_source(
+            &["H2O", "H_plus", "OH_minus"],
+            "(40 meter^2 / (mole second)) * c(H_plus) * c(OH_minus)",
+        )
+        .unwrap();
+        assert_eq!(rate.program().fingerprint(), 0xf56d_f032_2874_1302, "neutralization.lattice, the rate");
     }
 
     #[test]
