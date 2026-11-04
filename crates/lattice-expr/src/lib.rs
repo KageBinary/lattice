@@ -28,6 +28,15 @@
 //! Comparisons have no derivative; `if` takes the derivative of the arm it chose,
 //! which is right everywhere except at the switch itself.
 //!
+//! # Every operation remembers where it came from
+//!
+//! A [`Builder`] can be told the [`Origin`] of what it pushes next, a byte range in the
+//! source the compiler read. A [`Program`] keeps one per operation, so a failure deep in
+//! a law can be pointed at the sub-expression that caused it. Origins are metadata: they
+//! take no part in what a program computes, so `==` and [`Program::fingerprint`]
+//! ignore them, and two laws that compute the same thing are the same program wherever
+//! they were written.
+//!
 //! # No allocation while evaluating
 //!
 //! [`Program::eval`] runs on a register array the caller owns. Laws are small, and
@@ -41,6 +50,18 @@ pub type Reg = u32;
 
 /// The most operations a program may have, so its registers fit a stack array.
 pub const MAX_REGISTERS: usize = 512;
+
+/// A byte range in the law's source file, for the operation that came from it.
+///
+/// This crate stays independent of the syntax crate, so it holds the two offsets and no
+/// more.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Origin {
+    /// First byte.
+    pub start: u32,
+    /// One past the last byte.
+    pub end: u32,
+}
 
 /// One operation. Each writes the register numbered by its position.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -242,6 +263,10 @@ fn apply(op: Op, regs: &[f64], inputs: &[f64], params: &[f64]) -> f64 {
 #[derive(Debug)]
 pub struct Builder {
     ops: Vec<Op>,
+    /// Where each operation came from, parallel to `ops`.
+    origins: Vec<Option<Origin>>,
+    /// The origin given to what is pushed next.
+    origin: Option<Origin>,
     /// The constant value of each register, when it has one.
     constant: Vec<Option<f64>>,
     seen: HashMap<(u8, u64, u64, u64), Reg>,
@@ -252,7 +277,23 @@ pub struct Builder {
 impl Builder {
     /// A builder for a program of `inputs` inputs and `params` parameters.
     pub fn new(inputs: u32, params: u32) -> Builder {
-        Builder { ops: Vec::new(), constant: Vec::new(), seen: HashMap::new(), inputs, params }
+        Builder {
+            ops: Vec::new(),
+            origins: Vec::new(),
+            origin: None,
+            constant: Vec::new(),
+            seen: HashMap::new(),
+            inputs,
+            params,
+        }
+    }
+
+    /// Set the origin given to operations pushed from now on.
+    ///
+    /// An operation removed as a repeat keeps the origin of the first, and a folded
+    /// constant has the origin of the operation it replaced.
+    pub fn at(&mut self, origin: Option<Origin>) {
+        self.origin = origin;
     }
 
     /// Append an operation, or return the register that already holds the same value.
@@ -286,6 +327,7 @@ impl Builder {
         }
         let reg = self.ops.len() as Reg;
         self.ops.push(op);
+        self.origins.push(self.origin);
         self.constant.push(match op {
             Op::Const(v) => Some(v),
             _ => None,
@@ -319,30 +361,50 @@ impl Builder {
         }
         let mut renumber = vec![Reg::MAX; self.ops.len()];
         let mut ops = Vec::new();
+        let mut origins = Vec::new();
         for (index, op) in self.ops.iter().enumerate() {
             if live[index] {
                 renumber[index] = ops.len() as Reg;
                 ops.push(op.remap(|r| renumber[r as usize]));
+                origins.push(self.origins[index]);
             }
         }
         let outputs = outputs.iter().map(|&r| renumber[r as usize]).collect();
-        Program { ops, outputs, inputs: self.inputs, params: self.params }
+        Program { ops, origins, outputs, inputs: self.inputs, params: self.params }
     }
 }
 
 /// A compiled law: operations in single-assignment form and the registers it returns.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug)]
 pub struct Program {
     ops: Vec<Op>,
+    /// Where each operation came from, parallel to `ops`.
+    origins: Vec<Option<Origin>>,
     outputs: Vec<Reg>,
     inputs: u32,
     params: u32,
+}
+
+/// Programs are equal when they compute the same thing; where each operation was
+/// written is not part of that.
+impl PartialEq for Program {
+    fn eq(&self, other: &Program) -> bool {
+        self.ops == other.ops
+            && self.outputs == other.outputs
+            && self.inputs == other.inputs
+            && self.params == other.params
+    }
 }
 
 impl Program {
     /// The operations, in order.
     pub fn ops(&self) -> &[Op] {
         &self.ops
+    }
+
+    /// The source range operation `reg` came from, when the compiler said.
+    pub fn origin(&self, reg: Reg) -> Option<Origin> {
+        self.origins.get(reg as usize).copied().flatten()
     }
 
     /// How many values it returns.
@@ -402,7 +464,9 @@ impl Program {
         let mut b = Builder::new(self.inputs, self.params);
         let mut value: Vec<Reg> = Vec::with_capacity(self.ops.len());
         let mut tangents: Vec<Vec<Tangent>> = vec![Vec::with_capacity(self.ops.len()); wrt.len()];
-        for &op in &self.ops {
+        for (index, &op) in self.ops.iter().enumerate() {
+            // Everything this operation's derivative needs comes from the same source.
+            b.at(self.origins[index]);
             let mapped = op.remap(|r| value[r as usize]);
             let reg = b.push(mapped);
             for (tangent, &input) in tangents.iter_mut().zip(wrt) {
@@ -414,6 +478,7 @@ impl Program {
         let mut outputs: Vec<Reg> = self.outputs.iter().map(|&r| value[r as usize]).collect();
         for tangent in &tangents {
             for &r in &self.outputs {
+                b.at(self.origins[r as usize]);
                 outputs.push(tangent[r as usize].materialize(&mut b));
             }
         }
@@ -421,6 +486,7 @@ impl Program {
     }
 
     /// A stable fingerprint of what the program computes, for caches and artifacts.
+    /// Origins are not part of it.
     ///
     /// Two programs with the same operations in the same order have the same hash on
     /// every machine: FNV-1a over the operations' keys, not `std`'s randomized hasher.
@@ -890,6 +956,153 @@ mod tests {
         let a = lennard_jones();
         assert_eq!(a.fingerprint(), lennard_jones().fingerprint());
         assert_ne!(a.fingerprint(), a.derivative(0).fingerprint());
+    }
+
+    const fn origin(start: u32, end: u32) -> Option<Origin> {
+        Some(Origin { start, end })
+    }
+
+    #[test]
+    fn a_repeat_keeps_the_first_origin() {
+        let mut b = Builder::new(1, 0);
+        b.at(origin(0, 1));
+        let x = b.push(Op::Input(0));
+        b.at(origin(4, 11));
+        let first = b.push(Op::Sqrt(x));
+        b.at(origin(20, 27));
+        let second = b.push(Op::Sqrt(x));
+        assert_eq!(first, second);
+        let program = b.finish(vec![first]);
+        assert_eq!(program.origin(0), origin(0, 1));
+        assert_eq!(program.origin(1), origin(4, 11), "the repeat did not replace the first origin");
+    }
+
+    #[test]
+    fn a_folded_constant_has_the_origin_of_its_expression() {
+        let mut b = Builder::new(1, 0);
+        b.at(origin(0, 1));
+        let x = b.push(Op::Input(0));
+        b.at(origin(5, 6));
+        let two = b.constant(2.0);
+        b.at(origin(9, 10));
+        let three = b.constant(3.0);
+        b.at(origin(5, 10));
+        let six = b.push(Op::Mul(two, three));
+        assert_eq!(b.constant_value(six), Some(6.0));
+        b.at(origin(0, 10));
+        let out = b.push(Op::Mul(x, six));
+        let program = b.finish(vec![out]);
+        // Input, the folded 6, the product: 2 and 3 are dead.
+        assert_eq!(program.ops().len(), 3);
+        assert_eq!(program.origin(0), origin(0, 1));
+        assert_eq!(program.origin(1), origin(5, 10), "the folded 6 came from `2 * 3`");
+        assert_eq!(program.origin(2), origin(0, 10));
+    }
+
+    #[test]
+    fn origins_survive_dropping_dead_operations() {
+        let mut b = Builder::new(2, 0);
+        b.at(origin(0, 1));
+        let dead = b.push(Op::Input(0));
+        b.at(origin(2, 3));
+        let x = b.push(Op::Input(1));
+        let _ = dead;
+        b.at(origin(4, 9));
+        let out = b.push(Op::Neg(x));
+        let program = b.finish(vec![out]);
+        assert_eq!(program.ops(), [Op::Input(1), Op::Neg(0)]);
+        assert_eq!(program.origin(0), origin(2, 3));
+        assert_eq!(program.origin(1), origin(4, 9));
+        assert_eq!(program.origin(2), None, "past the end is no origin");
+    }
+
+    #[test]
+    fn an_operation_pushed_without_an_origin_has_none() {
+        let mut b = Builder::new(1, 0);
+        let x = b.push(Op::Input(0));
+        b.at(origin(3, 4));
+        let n = b.push(Op::Neg(x));
+        b.at(None);
+        let m = b.push(Op::Abs(n));
+        let program = b.finish(vec![m]);
+        assert_eq!(program.origin(0), None);
+        assert_eq!(program.origin(1), origin(3, 4));
+        assert_eq!(program.origin(2), None);
+    }
+
+    #[test]
+    fn a_derivative_inherits_the_origins_of_what_it_differentiates() {
+        // `x * x` and `ln(x)`, with each written at its own place.
+        let mut b = Builder::new(1, 0);
+        b.at(origin(0, 1));
+        let x = b.push(Op::Input(0));
+        b.at(origin(0, 5));
+        let square = b.push(Op::Mul(x, x));
+        b.at(origin(8, 13));
+        let ln = b.push(Op::Ln(square));
+        let program = b.finish(vec![ln]);
+        let d = program.derivative(0);
+        // d(x·x) = x + x, then d ln = (x + x) / (x·x): every operation of the derivative
+        // is at its primal's origin, and none is left without one.
+        let at = |kind: fn(&Op) -> bool| -> Vec<Option<Origin>> {
+            d.ops().iter().enumerate().filter(|(_, op)| kind(op)).map(|(i, _)| d.origin(i as Reg)).collect()
+        };
+        assert_eq!(at(|op| matches!(op, Op::Input(_))), [origin(0, 1)]);
+        assert_eq!(at(|op| matches!(op, Op::Mul(..))), [origin(0, 5)]);
+        assert_eq!(at(|op| matches!(op, Op::Add(..))), [origin(0, 5)], "the tangent of the product");
+        assert_eq!(at(|op| matches!(op, Op::Ln(..))), [origin(8, 13)]);
+        assert_eq!(at(|op| matches!(op, Op::Div(..))), [origin(8, 13)], "the tangent of the log");
+        for index in 0..d.ops().len() {
+            assert!(d.origin(index as Reg).is_some(), "operation {index} of the derivative has an origin");
+        }
+    }
+
+    #[test]
+    fn a_gradient_output_constant_takes_the_origin_of_its_primal() {
+        // A tangent that is zero is materialized as a constant at the end.
+        let mut b = Builder::new(2, 0);
+        b.at(origin(0, 1));
+        let _ = b.push(Op::Input(0));
+        b.at(origin(2, 3));
+        let y = b.push(Op::Input(1));
+        let g = b.finish(vec![y]).gradient(&[0]);
+        // The input, the value, and the tangent 0 of `y` with respect to input 0.
+        assert_eq!(g.output_count(), 2);
+        let zero = g.ops().iter().position(|op| *op == Op::Const(0.0)).expect("a zero");
+        assert_eq!(g.origin(zero as Reg), origin(2, 3));
+    }
+
+    #[test]
+    fn equality_and_the_fingerprint_ignore_origins() {
+        let build = |shift: u32| {
+            let mut b = Builder::new(1, 2);
+            let at = |start: u32, end: u32, b: &mut Builder| b.at(origin(start + shift, end + shift));
+            at(0, 1, &mut b);
+            let r = b.push(Op::Input(0));
+            at(2, 5, &mut b);
+            let eps = b.push(Op::Param(0));
+            let sigma = b.push(Op::Param(1));
+            at(6, 9, &mut b);
+            let s = b.push(Op::Div(sigma, r));
+            let out = b.push(Op::Mul(eps, s));
+            b.finish(vec![out])
+        };
+        let (here, there) = (build(0), build(100));
+        assert_ne!(here.origin(0), there.origin(0), "the two really do differ in origin");
+        assert_eq!(here, there);
+        assert_eq!(here.fingerprint(), there.fingerprint());
+        // And a program with no origins at all is the same program.
+        let mut plain = Builder::new(1, 2);
+        let r = plain.push(Op::Input(0));
+        let eps = plain.push(Op::Param(0));
+        let sigma = plain.push(Op::Param(1));
+        let s = plain.push(Op::Div(sigma, r));
+        let out = plain.push(Op::Mul(eps, s));
+        let plain = plain.finish(vec![out]);
+        assert_eq!(here, plain);
+        assert_eq!(here.fingerprint(), plain.fingerprint());
+        // Equality still tells different programs apart.
+        assert_ne!(here, lennard_jones());
     }
 
     #[test]
