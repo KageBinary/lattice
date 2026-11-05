@@ -49,7 +49,9 @@
 //! the operations, so the dispatch on each operation is paid once for all of them. It
 //! computes nothing differently: one macro supplies every operation's expression to both
 //! the scalar and the batched interpreter, so each lane is bit-identical to
-//! [`Program::eval`] on that lane's inputs.
+//! [`Program::eval`] on that lane's inputs. The one exception is a NaN's payload, which
+//! Rust does not pin: where the scalar result is NaN the lane's is NaN too, and the
+//! tests compare no more than that.
 
 use std::collections::HashMap;
 
@@ -60,7 +62,9 @@ pub type Reg = u32;
 pub const MAX_REGISTERS: usize = 512;
 
 /// How many sets of inputs [`Program::eval_batch`] evaluates in one pass: the register
-/// file of a full program is `MAX_REGISTERS × LANES × 8 B = 32 KiB`, which fits L1.
+/// file of a full program is `MAX_REGISTERS × LANES × 8 B = 32 KiB`, the size of a typical
+/// L1 data cache, before the inputs, parameters and outputs. The choice is unmeasured here;
+/// the particle-loop benchmark is what checks it.
 pub const LANES: usize = 8;
 
 /// A byte range in the law's source file, for the operation that came from it.
@@ -493,7 +497,8 @@ impl Program {
     ///
     /// The op loop is outside and the lane loop inside, so one `match` covers `LANES`
     /// values. Each lane runs the expression [`apply`] runs, from the same macro, so
-    /// lane `l` is bit-identical to [`Program::eval`] on lane `l`'s inputs.
+    /// lane `l` is bit-identical to [`Program::eval`] on lane `l`'s inputs, except that a
+    /// NaN's payload is not pinned by Rust: where the scalar result is NaN, so is the lane's.
     ///
     /// # Panics
     ///
@@ -501,6 +506,13 @@ impl Program {
     #[inline]
     pub fn eval_batch(&self, active: usize, inputs: &[f64], params: &[f64], regs: &mut [f64], out: &mut [f64]) {
         assert!((1..=LANES).contains(&active), "active lanes {active} not in 1..={LANES}");
+        assert!(
+            out.len() >= self.outputs.len() * LANES,
+            "out holds {} values, and {} outputs of {LANES} lanes need {}",
+            out.len(),
+            self.outputs.len(),
+            self.outputs.len() * LANES
+        );
         for (index, op) in self.ops.iter().enumerate() {
             let base = index * LANES;
             macro_rules! lanes {
@@ -1359,10 +1371,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not in 1..=8")]
+    #[should_panic(expected = "not in 1..")]
     fn a_batch_has_at_most_lanes_active() {
         let p = lennard_jones();
         p.eval_batch(LANES + 1, &[1.0; LANES], &[1.0, 1.0], &mut [0.0; 16 * LANES], &mut [0.0; LANES]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out holds")]
+    fn a_batch_does_not_truncate_a_short_output() {
+        let p = lennard_jones();
+        let inputs = vec![1.0; p.input_count() * LANES];
+        let mut regs = vec![0.0; p.ops().len() * LANES];
+        let mut out = vec![0.0; p.output_count() * LANES - 1];
+        p.eval_batch(LANES, &inputs, &[1.0, 1.0], &mut regs, &mut out);
     }
 
     #[test]
