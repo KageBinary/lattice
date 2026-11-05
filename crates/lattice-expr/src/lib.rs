@@ -42,6 +42,16 @@
 //! [`Program::eval`] runs on a register array the caller owns. Laws are small, and
 //! [`MAX_REGISTERS`] bounds them so a stack array always fits: a pair loop evaluates a
 //! law once per pair, and spec NFR-001 allows no allocation there.
+//!
+//! # A batch is the same arithmetic, [`LANES`] at a time
+//!
+//! [`Program::eval_batch`] runs [`LANES`] independent sets of inputs through one pass of
+//! the operations, so the dispatch on each operation is paid once for all of them. It
+//! computes nothing differently: one macro supplies every operation's expression to both
+//! the scalar and the batched interpreter, so each lane is bit-identical to
+//! [`Program::eval`] on that lane's inputs. The one exception is a NaN's payload, which
+//! Rust does not pin: where the scalar result is NaN the lane's is NaN too, and the
+//! tests compare no more than that.
 
 use std::collections::HashMap;
 
@@ -50,6 +60,12 @@ pub type Reg = u32;
 
 /// The most operations a program may have, so its registers fit a stack array.
 pub const MAX_REGISTERS: usize = 512;
+
+/// How many sets of inputs [`Program::eval_batch`] evaluates in one pass: the register
+/// file of a full program is `MAX_REGISTERS × LANES × 8 B = 32 KiB`, the size of a typical
+/// L1 data cache, before the inputs, parameters and outputs. The choice is unmeasured here;
+/// the particle-loop benchmark is what checks it.
+pub const LANES: usize = 8;
 
 /// A byte range in the law's source file, for the operation that came from it.
 ///
@@ -213,50 +229,78 @@ impl Op {
     }
 }
 
+/// What every operation computes, written once.
+///
+/// The scalar interpreter ([`apply`]) and the batched one ([`Program::eval_batch`]) both
+/// take their arms from here, so an operation cannot be added to one and not the other
+/// (spec M6.1d R1), and a lane computes the exact expression the scalar does: the same
+/// function on the same operands, so the same bits.
+///
+/// `$wrap` names a macro that receives `$g $input $param => <expression>` for each arm.
+/// `$g(r)` reads register `r`, `$input(n)` input `n`, `$param(n)` parameter `n`; the
+/// caller's macro decides what those read (one value, or one lane of a batch) and what
+/// to do with the expression's value. The names come from the caller so that its
+/// bindings and the expression's uses are the same identifiers.
+macro_rules! op_match {
+    ($op:expr, $wrap:ident, $g:ident, $input:ident, $param:ident) => {{
+        use Op::*;
+        match $op {
+            Const(v) => $wrap! { $g $input $param => v },
+            Input(n) => $wrap! { $g $input $param => $input(n) },
+            Param(n) => $wrap! { $g $input $param => $param(n) },
+            Neg(x) => $wrap! { $g $input $param => -$g(x) },
+            Not(x) => $wrap! { $g $input $param => truth($g(x) == 0.0) },
+            Sqrt(x) => $wrap! { $g $input $param => $g(x).sqrt() },
+            Abs(x) => $wrap! { $g $input $param => $g(x).abs() },
+            Exp(x) => $wrap! { $g $input $param => $g(x).exp() },
+            Ln(x) => $wrap! { $g $input $param => $g(x).ln() },
+            Sin(x) => $wrap! { $g $input $param => $g(x).sin() },
+            Cos(x) => $wrap! { $g $input $param => $g(x).cos() },
+            Tan(x) => $wrap! { $g $input $param => $g(x).tan() },
+            Erfc(x) => $wrap! { $g $input $param => erfc($g(x)) },
+            Powi(x, n) => $wrap! { $g $input $param => $g(x).powi(n) },
+            Add(a, b) => $wrap! { $g $input $param => $g(a) + $g(b) },
+            Sub(a, b) => $wrap! { $g $input $param => $g(a) - $g(b) },
+            Mul(a, b) => $wrap! { $g $input $param => $g(a) * $g(b) },
+            Div(a, b) => $wrap! { $g $input $param => $g(a) / $g(b) },
+            Min(a, b) => $wrap! { $g $input $param => $g(a).min($g(b)) },
+            Max(a, b) => $wrap! { $g $input $param => $g(a).max($g(b)) },
+            Atan2(y, x) => $wrap! { $g $input $param => $g(y).atan2($g(x)) },
+            Pow(a, b) => $wrap! { $g $input $param => $g(a).powf($g(b)) },
+            Lt(a, b) => $wrap! { $g $input $param => truth($g(a) < $g(b)) },
+            Le(a, b) => $wrap! { $g $input $param => truth($g(a) <= $g(b)) },
+            Eq(a, b) => $wrap! { $g $input $param => truth($g(a) == $g(b)) },
+            Ne(a, b) => $wrap! { $g $input $param => truth($g(a) != $g(b)) },
+            And(a, b) => $wrap! { $g $input $param => truth($g(a) != 0.0 && $g(b) != 0.0) },
+            Or(a, b) => $wrap! { $g $input $param => truth($g(a) != 0.0 || $g(b) != 0.0) },
+            Select(c, a, b) => $wrap! { $g $input $param => if $g(c) != 0.0 { $g(a) } else { $g(b) } },
+        }
+    }};
+}
+
+/// A truth value as the interpreter holds it.
+#[inline]
+fn truth(b: bool) -> f64 {
+    if b {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 /// Apply one operation to register values: the single definition of what each
 /// operation computes, shared by the interpreter and constant folding.
 #[inline]
 fn apply(op: Op, regs: &[f64], inputs: &[f64], params: &[f64]) -> f64 {
-    use Op::*;
     let g = |x: Reg| regs[x as usize];
-    let truth = |b: bool| if b { 1.0 } else { 0.0 };
-    match op {
-        Const(v) => v,
-        Input(n) => inputs[n as usize],
-        Param(n) => params[n as usize],
-        Neg(x) => -g(x),
-        Not(x) => truth(g(x) == 0.0),
-        Sqrt(x) => g(x).sqrt(),
-        Abs(x) => g(x).abs(),
-        Exp(x) => g(x).exp(),
-        Ln(x) => g(x).ln(),
-        Sin(x) => g(x).sin(),
-        Cos(x) => g(x).cos(),
-        Tan(x) => g(x).tan(),
-        Erfc(x) => erfc(g(x)),
-        Powi(x, n) => g(x).powi(n),
-        Add(a, b) => g(a) + g(b),
-        Sub(a, b) => g(a) - g(b),
-        Mul(a, b) => g(a) * g(b),
-        Div(a, b) => g(a) / g(b),
-        Min(a, b) => g(a).min(g(b)),
-        Max(a, b) => g(a).max(g(b)),
-        Atan2(y, x) => g(y).atan2(g(x)),
-        Pow(a, b) => g(a).powf(g(b)),
-        Lt(a, b) => truth(g(a) < g(b)),
-        Le(a, b) => truth(g(a) <= g(b)),
-        Eq(a, b) => truth(g(a) == g(b)),
-        Ne(a, b) => truth(g(a) != g(b)),
-        And(a, b) => truth(g(a) != 0.0 && g(b) != 0.0),
-        Or(a, b) => truth(g(a) != 0.0 || g(b) != 0.0),
-        Select(c, a, b) => {
-            if g(c) != 0.0 {
-                g(a)
-            } else {
-                g(b)
-            }
-        }
+    let input = |n: u32| inputs[n as usize];
+    let param = |n: u32| params[n as usize];
+    macro_rules! value {
+        ($g:ident $input:ident $param:ident => $e:expr) => {
+            $e
+        };
     }
+    op_match!(op, value, g, input, param)
 }
 
 /// Builds a [`Program`], removing repeated operations and folding constants.
@@ -440,6 +484,56 @@ impl Program {
         }
         for (slot, &reg) in out.iter_mut().zip(&self.outputs) {
             *slot = regs[reg as usize];
+        }
+    }
+
+    /// Evaluate [`LANES`] independent sets of inputs in one pass.
+    ///
+    /// `inputs[k * LANES + l]` is input `k` of lane `l`, and `out[o * LANES + l]` is output
+    /// `o` of lane `l`. Every lane shares `params`. `regs` is scratch of at least
+    /// `ops.len() * LANES`. Lanes from `active` up are computed but their outputs are
+    /// meaningless: each reads the last active lane's inputs, so that padding cannot
+    /// raise anything the real lanes would not, and the caller discards them.
+    ///
+    /// The op loop is outside and the lane loop inside, so one `match` covers `LANES`
+    /// values. Each lane runs the expression [`apply`] runs, from the same macro, so
+    /// lane `l` is bit-identical to [`Program::eval`] on lane `l`'s inputs, except that a
+    /// NaN's payload is not pinned by Rust: where the scalar result is NaN, so is the lane's.
+    ///
+    /// # Panics
+    ///
+    /// If `active` is not in `1..=LANES`, or a slice is shorter than the program needs.
+    #[inline]
+    pub fn eval_batch(&self, active: usize, inputs: &[f64], params: &[f64], regs: &mut [f64], out: &mut [f64]) {
+        assert!((1..=LANES).contains(&active), "active lanes {active} not in 1..={LANES}");
+        assert!(
+            out.len() >= self.outputs.len() * LANES,
+            "out holds {} values, and {} outputs of {LANES} lanes need {}",
+            out.len(),
+            self.outputs.len(),
+            self.outputs.len() * LANES
+        );
+        for (index, op) in self.ops.iter().enumerate() {
+            let base = index * LANES;
+            macro_rules! lanes {
+                ($g:ident $input:ident $param:ident => $e:expr) => {
+                    for lane in 0..LANES {
+                        // An arm reads some of these and not others.
+                        #[allow(unused_variables)]
+                        let $g = |x: Reg| regs[x as usize * LANES + lane];
+                        #[allow(unused_variables)]
+                        let $input = |n: u32| inputs[n as usize * LANES + lane.min(active - 1)];
+                        #[allow(unused_variables)]
+                        let $param = |n: u32| params[n as usize];
+                        let value: f64 = $e;
+                        regs[base + lane] = value;
+                    }
+                };
+            }
+            op_match!(*op, lanes, g, input, param);
+        }
+        for (slot, &reg) in out.chunks_exact_mut(LANES).zip(&self.outputs) {
+            slot.copy_from_slice(&regs[reg as usize * LANES..][..LANES]);
         }
     }
 
@@ -1103,6 +1197,194 @@ mod tests {
         assert_eq!(here.fingerprint(), plain.fingerprint());
         // Equality still tells different programs apart.
         assert_ne!(here, lennard_jones());
+    }
+
+    /// A seeded generator (SplitMix64): the test needs no dependency and must replay.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        /// A number in `0..n`.
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        /// A value for an input: usually plain, often one that stresses an operation.
+        fn value(&mut self) -> f64 {
+            const SPECIAL: [f64; 22] = [
+                0.0,
+                -0.0,
+                1.0,
+                -1.0,
+                0.5,
+                2.0,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NAN,
+                f64::MIN_POSITIVE,
+                -f64::MIN_POSITIVE,
+                f64::MIN_POSITIVE / 2.0,
+                5e-324,
+                -5e-324,
+                f64::MAX,
+                -f64::MAX,
+                f64::MAX / 2.0,
+                1.0e154,
+                -1.0e154,
+                1.0e308,
+                f64::EPSILON,
+                core::f64::consts::PI,
+            ];
+            match self.below(4) {
+                0 | 1 => SPECIAL[self.below(SPECIAL.len())],
+                2 => (self.next() >> 11) as f64 / (1u64 << 53) as f64 * 20.0 - 10.0,
+                _ => f64::from_bits(self.next()),
+            }
+        }
+    }
+
+    /// A random program that stays mostly live, built through the [`Builder`] so it is
+    /// one the compiler could have produced.
+    fn random_program(rng: &mut Rng) -> Program {
+        let inputs = 1 + rng.below(4) as u32;
+        let params = rng.below(4) as u32;
+        let mut b = Builder::new(inputs, params);
+        let mut regs: Vec<Reg> = (0..inputs).map(|n| b.push(Op::Input(n))).collect();
+        regs.extend((0..params).map(|n| b.push(Op::Param(n))));
+        let target = 1 + rng.below(200);
+        while b.ops.len() < target {
+            // Mostly recent results, so the chain stays live and deep.
+            let pick = |rng: &mut Rng| {
+                if rng.below(2) == 0 {
+                    regs[regs.len() - 1 - rng.below(regs.len().min(3))]
+                } else {
+                    regs[rng.below(regs.len())]
+                }
+            };
+            let (x, y, z) = (pick(rng), pick(rng), pick(rng));
+            let op = match rng.below(29) {
+                0 => Op::Const(rng.value()),
+                1 => Op::Input(rng.below(inputs as usize) as u32),
+                2 if params > 0 => Op::Param(rng.below(params as usize) as u32),
+                3 => Op::Neg(x),
+                4 => Op::Not(x),
+                5 => Op::Sqrt(x),
+                6 => Op::Abs(x),
+                7 => Op::Exp(x),
+                8 => Op::Ln(x),
+                9 => Op::Sin(x),
+                10 => Op::Cos(x),
+                11 => Op::Tan(x),
+                12 => Op::Erfc(x),
+                13 => Op::Powi(x, [-3, -2, -1, 0, 1, 2, 3, 6, 12, i32::MAX, i32::MIN][rng.below(11)]),
+                14 => Op::Add(x, y),
+                15 => Op::Sub(x, y),
+                16 => Op::Mul(x, y),
+                17 => Op::Div(x, y),
+                18 => Op::Min(x, y),
+                19 => Op::Max(x, y),
+                20 => Op::Atan2(x, y),
+                21 => Op::Pow(x, y),
+                22 => Op::Lt(x, y),
+                23 => Op::Le(x, y),
+                24 => Op::Eq(x, y),
+                25 => Op::Ne(x, y),
+                26 => Op::And(x, y),
+                27 => Op::Or(x, y),
+                28 => Op::Select(x, y, z),
+                _ => continue,
+            };
+            regs.push(b.push(op));
+        }
+        let mut outputs = vec![*regs.last().expect("a program has registers")];
+        for _ in 0..rng.below(4) {
+            outputs.push(regs[rng.below(regs.len())]);
+        }
+        b.finish(outputs)
+    }
+
+    /// Two results are the same when they have the same bits, or are both NaN, whose
+    /// payload Rust does not pin.
+    fn same(a: f64, b: f64) -> bool {
+        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+    }
+
+    /// Spec §7: `eval_batch` is `eval`, lane by lane, bit for bit, on 10,000 random
+    /// programs of up to 200 operations, every operation among them, inputs that include
+    /// ±0, ±∞, NaN, subnormals and values near overflow, and every `active`.
+    #[test]
+    fn eval_batch_is_eval_lane_by_lane() {
+        let mut rng = Rng(0x1a77_1ce0_0d06_f00d);
+        let mut seen = [false; 29];
+        let mut longest = 0;
+        for case in 0..10_000 {
+            let program = random_program(&mut rng);
+            longest = longest.max(program.ops().len());
+            for op in program.ops() {
+                seen[usize::from(op.key().0)] = true;
+            }
+            let (n_in, n_param, n_out) = (program.input_count(), program.param_count(), program.output_count());
+            let params: Vec<f64> = (0..n_param).map(|_| rng.value()).collect();
+            let lane_inputs: Vec<Vec<f64>> = (0..LANES).map(|_| (0..n_in).map(|_| rng.value()).collect()).collect();
+            let expected: Vec<Vec<f64>> = lane_inputs.iter().map(|inputs| program.eval_to_vec(inputs, &params)).collect();
+            let mut regs = vec![f64::NAN; program.ops().len() * LANES];
+            let mut out = vec![0.0; n_out * LANES];
+            for active in 1..=LANES {
+                // Lanes at and past `active` hold arbitrary values that must not matter.
+                let mut inputs = vec![0.0; n_in * LANES];
+                for (lane, values) in lane_inputs.iter().enumerate() {
+                    for (k, &v) in values.iter().enumerate() {
+                        inputs[k * LANES + lane] = if lane < active { v } else { rng.value() };
+                    }
+                }
+                program.eval_batch(active, &inputs, &params, &mut regs, &mut out);
+                for lane in 0..active {
+                    for o in 0..n_out {
+                        let (batch, scalar) = (out[o * LANES + lane], expected[lane][o]);
+                        assert!(
+                            same(batch, scalar),
+                            "program {case}, active {active}, lane {lane}, output {o}: {batch:e} ({:#x}) against {scalar:e} ({:#x})\n{:?}",
+                            batch.to_bits(),
+                            scalar.to_bits(),
+                            program.ops(),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "the corpus missed an operation: {seen:?}");
+        assert!(longest > 100, "the corpus has no long program (longest {longest})");
+    }
+
+    #[test]
+    #[should_panic(expected = "active lanes 0")]
+    fn a_batch_needs_an_active_lane() {
+        let p = lennard_jones();
+        p.eval_batch(0, &[1.0; LANES], &[1.0, 1.0], &mut [0.0; 16 * LANES], &mut [0.0; LANES]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not in 1..")]
+    fn a_batch_has_at_most_lanes_active() {
+        let p = lennard_jones();
+        p.eval_batch(LANES + 1, &[1.0; LANES], &[1.0, 1.0], &mut [0.0; 16 * LANES], &mut [0.0; LANES]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out holds")]
+    fn a_batch_does_not_truncate_a_short_output() {
+        let p = lennard_jones();
+        let inputs = vec![1.0; p.input_count() * LANES];
+        let mut regs = vec![0.0; p.ops().len() * LANES];
+        let mut out = vec![0.0; p.output_count() * LANES - 1];
+        p.eval_batch(LANES, &inputs, &[1.0, 1.0], &mut regs, &mut out);
     }
 
     #[test]

@@ -34,7 +34,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test --workspace --all-features # 1269 tests including doctests across 20 crates
+$ cargo test --workspace --all-features # 1282 tests including doctests across 20 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
