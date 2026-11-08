@@ -458,17 +458,38 @@ fn cmd_inspect(args: &Args) -> Result<ExitCode, String> {
         Some("cases") => inspect::cases(),
         Some("benchmarks") => inspect::benchmarks(),
         Some("demos") => inspect::demos(),
+        Some("expr") => {
+            let path = args
+                .positional
+                .get(1)
+                .ok_or("`inspect expr` needs a model file: `lattice inspect expr model.lattice [law]`")?;
+            if args.positional.len() > 3 {
+                return Err("`inspect expr` takes a file and at most one law name".to_string());
+            }
+            let file = project::read(path)?;
+            match inspect::expr(&file, args.positional.get(2).map(String::as_str)) {
+                Ok(text) => text,
+                Err(inspect::ExprFailure::DoesNotCompile(rendered)) => {
+                    print!("{rendered}");
+                    println!("`{path}` did not compile.");
+                    return Ok(ExitCode::from(CHECK_FAILED));
+                }
+                Err(inspect::ExprFailure::UnknownLaw(message)) => return Err(message),
+            }
+        }
         None => "usage: lattice inspect <subject>\n\n\
              subjects:\n  \
              contracts    every solver's equations, assumptions, and known limitations\n  \
              units        resolve a unit expression, or list the registry\n  \
              cases        the validation cases and what each establishes\n  \
              benchmarks   the benchmarks and their correctness conditions\n  \
-             demos        the demonstration scenes\n"
+             demos        the demonstration scenes\n  \
+             expr <file> [law]\n               \
+             a file's compiled laws, operation by operation, beside their source\n"
             .to_string(),
         Some(other) => {
             return Err(format!(
-                "cannot inspect `{other}`; expected contracts, units, cases, benchmarks, or demos"
+                "cannot inspect `{other}`; expected contracts, units, cases, benchmarks, demos, or expr"
             ));
         }
     };
@@ -516,7 +537,8 @@ COMMANDS
     --json <path>            write the run artifact
     --quiet                  suppress the visualization
 
-  inspect <subject>        show contracts, units, cases, benchmarks, or demos
+  inspect <subject>        show contracts, units, cases, benchmarks, demos, or
+                           `expr <file> [law]`: a file's compiled laws beside their source
 
   help, --help, -h         this message
   --version, -V            version and build configuration
@@ -533,6 +555,7 @@ EXAMPLES
   lattice demo oscillator
   lattice demo heat-gaussian --steps 800 --json runs/heat.json
   lattice inspect contracts
+  lattice inspect expr examples/damped_spring.lattice
   lattice inspect units \"9.31e-9 meter^2 / second\"
 
 EXIT CODES
@@ -637,6 +660,27 @@ mod tests {
         // With no subject, the command lists them.
         assert_eq!(run(&parse("inspect")).unwrap(), ExitCode::SUCCESS);
         assert!(run(&parse("inspect nonsense")).is_err());
+    }
+
+    #[test]
+    fn inspect_expr_exit_codes() {
+        let spring = format!("{}/../../examples/damped_spring.lattice", env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(run(&parse(&format!("inspect expr {spring}"))).unwrap(), ExitCode::SUCCESS);
+        assert_eq!(run(&parse(&format!("inspect expr {spring} spring"))).unwrap(), ExitCode::SUCCESS);
+        // An unknown law is a mistake in the command line, and lists the laws there are.
+        let error = run(&parse(&format!("inspect expr {spring} nope"))).unwrap_err();
+        assert!(error.contains("spring"), "{error}");
+        // No file, and a file that is not there.
+        assert!(run(&parse("inspect expr")).is_err());
+        assert!(run(&parse("inspect expr no-such-file.lattice")).is_err());
+
+        // A file that does not compile prints its diagnostics and fails the check.
+        let dir = std::env::temp_dir().join("lattice-cli-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("inspect-expr-bad.lattice");
+        std::fs::write(&bad, "project bad { particles atoms { count: 4; mass: 1 second; } }").unwrap();
+        let code = run(&parse(&format!("inspect expr {}", bad.display()))).unwrap();
+        assert_eq!(code, ExitCode::from(CHECK_FAILED));
     }
 
     #[test]

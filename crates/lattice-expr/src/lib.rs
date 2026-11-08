@@ -510,6 +510,11 @@ impl Program {
         self.origins.get(reg as usize).copied().flatten()
     }
 
+    /// The registers it returns, in order.
+    pub fn outputs(&self) -> &[Reg] {
+        &self.outputs
+    }
+
     /// How many values it returns.
     pub fn output_count(&self) -> usize {
         self.outputs.len()

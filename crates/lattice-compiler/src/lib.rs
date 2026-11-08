@@ -68,7 +68,7 @@ pub mod molecular;
 pub mod quantum;
 pub mod rigid;
 
-pub use compile::{compile, Compiled};
+pub use compile::{compile, Compiled, LawUse};
 pub use eval::Evaluator;
 
 use lattice_syntax::{Diagnostics, SourceFile};

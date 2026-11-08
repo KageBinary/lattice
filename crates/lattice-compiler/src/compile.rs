@@ -108,6 +108,21 @@ pub struct Compiled {
     /// The coupling edges between them, and the ledger that will account for what
     /// they move (spec §14).
     pub coupler: Coupler,
+    /// The user-defined laws that type-checked, for `lattice inspect expr`.
+    pub laws: Vec<TypedLaw>,
+    /// Where each law was bound to a particle set, and to what values.
+    pub law_uses: Vec<LawUse>,
+}
+
+/// A user law at a use site: `force: spring(stiffness=40 newton/meter, …)`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct LawUse {
+    /// The law's name.
+    pub law: String,
+    /// The particle set that uses it.
+    pub particles: String,
+    /// The SI values of its `param`s in slot order: a scalar takes one, a vector two.
+    pub params: Vec<f64>,
 }
 
 impl core::fmt::Debug for Compiled {
@@ -245,6 +260,8 @@ struct Compiler<'a> {
     law_names: Vec<String>,
     /// The laws some particle set used, so an unused one can be pointed out.
     used_laws: std::collections::BTreeSet<String>,
+    /// Each successful binding of a law to a particle set.
+    law_uses: Vec<LawUse>,
     notes: Vec<String>,
 }
 
@@ -310,6 +327,7 @@ impl<'a> Compiler<'a> {
             laws: Vec::new(),
             law_names: Vec::new(),
             used_laws: std::collections::BTreeSet::new(),
+            law_uses: Vec::new(),
             notes: Vec::new(),
         }
     }
@@ -472,7 +490,13 @@ impl<'a> Compiler<'a> {
         };
 
         let coupler = self.lower_couples(project);
-        Compiled { model, domains, coupler }
+        Compiled {
+            model,
+            domains,
+            coupler,
+            laws: core::mem::take(&mut self.laws),
+            law_uses: core::mem::take(&mut self.law_uses),
+        }
     }
 
     // --- project settings ---------------------------------------------------
@@ -1015,6 +1039,11 @@ impl<'a> Compiler<'a> {
                 // has nothing to bind.
                 let Some(law) = self.laws.iter().find(|law| law.name == name) else { continue };
                 if let Some(user) = crate::user_force::bind(law, &setting.value, &evaluator, &sample, &mut self.diagnostics) {
+                    self.law_uses.push(LawUse {
+                        law: name.to_string(),
+                        particles: decl.name.text.clone(),
+                        params: user.params.clone(),
+                    });
                     forces.push(ForceSpec::User(Box::new(user)));
                 }
                 continue;
