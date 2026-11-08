@@ -263,8 +263,8 @@ macro_rules! op_match {
             Sub(a, b) => $wrap! { $g $input $param => $g(a) - $g(b) },
             Mul(a, b) => $wrap! { $g $input $param => $g(a) * $g(b) },
             Div(a, b) => $wrap! { $g $input $param => $g(a) / $g(b) },
-            Min(a, b) => $wrap! { $g $input $param => $g(a).min($g(b)) },
-            Max(a, b) => $wrap! { $g $input $param => $g(a).max($g(b)) },
+            Min(a, b) => $wrap! { $g $input $param => min($g(a), $g(b)) },
+            Max(a, b) => $wrap! { $g $input $param => max($g(a), $g(b)) },
             Atan2(y, x) => $wrap! { $g $input $param => $g(y).atan2($g(x)) },
             Pow(a, b) => $wrap! { $g $input $param => $g(a).powf($g(b)) },
             Lt(a, b) => $wrap! { $g $input $param => truth($g(a) < $g(b)) },
@@ -276,6 +276,39 @@ macro_rules! op_match {
             Select(c, a, b) => $wrap! { $g $input $param => if $g(c) != 0.0 { $g(a) } else { $g(b) } },
         }
     }};
+}
+
+/// The smaller of two values, with `-0.0` below `+0.0`.
+///
+/// `f64::min` may return either zero when the two compare equal, and the scalar and batched
+/// interpreters are separate code, so the choice could differ between them. Here equal
+/// operands are picked by sign, which pins the bits. Anything else is `f64::min`, so a NaN
+/// operand is handled as it always was.
+#[inline]
+fn min(a: f64, b: f64) -> f64 {
+    if a == b {
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else {
+        a.min(b)
+    }
+}
+
+/// The larger of two values, with `+0.0` above `-0.0`: [`min`]'s counterpart.
+#[inline]
+fn max(a: f64, b: f64) -> f64 {
+    if a == b {
+        if a.is_sign_negative() {
+            b
+        } else {
+            a
+        }
+    } else {
+        a.max(b)
+    }
 }
 
 /// A truth value as the interpreter holds it.
@@ -1043,6 +1076,37 @@ mod tests {
         let program = b.finish(vec![out]);
         assert_eq!(program.eval_to_vec(&[0.25], &[])[0], 0.5);
         assert_eq!(program.eval_to_vec(&[3.0], &[])[0], 3.0);
+    }
+
+    /// `f64::min` and `max` may return either zero for `±0.0`; the interpreters may not.
+    #[test]
+    fn min_and_max_of_the_two_zeros_are_pinned_in_both_interpreters() {
+        let mut b = Builder::new(2, 0);
+        let (x, y) = (b.push(Op::Input(0)), b.push(Op::Input(1)));
+        let lo = b.push(Op::Min(x, y));
+        let hi = b.push(Op::Max(x, y));
+        let program = b.finish(vec![lo, hi]);
+        for (a, c) in [(0.0f64, -0.0f64), (-0.0, 0.0), (0.0, 0.0), (-0.0, -0.0)] {
+            let want_lo = if a.is_sign_negative() || c.is_sign_negative() { -0.0f64 } else { 0.0 };
+            let want_hi = if a.is_sign_negative() && c.is_sign_negative() { -0.0f64 } else { 0.0 };
+            let scalar = program.eval_to_vec(&[a, c], &[]);
+            assert_eq!(scalar[0].to_bits(), want_lo.to_bits(), "min({a:?}, {c:?})");
+            assert_eq!(scalar[1].to_bits(), want_hi.to_bits(), "max({a:?}, {c:?})");
+            let mut inputs = [0.0; 2 * LANES];
+            for lane in 0..LANES {
+                inputs[lane] = a;
+                inputs[LANES + lane] = c;
+            }
+            let (mut regs, mut out) = ([0.0; 4 * LANES], [0.0; 2 * LANES]);
+            program.eval_batch(LANES, &inputs, &[], &mut regs, &mut out);
+            for lane in 0..LANES {
+                assert_eq!(out[lane].to_bits(), want_lo.to_bits(), "batched min({a:?}, {c:?})");
+                assert_eq!(out[LANES + lane].to_bits(), want_hi.to_bits(), "batched max({a:?}, {c:?})");
+            }
+        }
+        // Unequal operands and NaN are as `f64::min` and `max` have them.
+        assert_eq!(program.eval_to_vec(&[1.0, 2.0], &[]), [1.0, 2.0]);
+        assert_eq!(program.eval_to_vec(&[f64::NAN, 2.0], &[]), [2.0, 2.0]);
     }
 
     #[test]
