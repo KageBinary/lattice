@@ -1035,16 +1035,21 @@ state step N−1 left, so for a rate law "at step N" means during step N.
 
 **Benchmark.** `lattice bench particles-lj-expr` (release, one thread, idle machine at
 about 1% load, no game running, all correctness checks passing including a bit-equal final
-total energy between the paths). The scalar and batched runs each follow one discarded
-warm-up run. Each figure is a median over repeated runs (the batched-over-scalar ratio
-of each run is in parentheses); 16,384 atoms is `--scale 4`:
+total energy between the paths). Each run of the benchmark does one discarded batched
+warm-up, then the timed scalar run, then the timed batched run. Run counts: 3 runs per
+path at 1,024 atoms, 5 runs per path at 16,384 atoms (`--scale 4`), and 3 runs of the
+built-in `particles-lj` at each size. Steps/s are medians over those runs.
 
-| atoms | scalar steps/s | batched steps/s | batched over scalar | built-in `particles-lj` steps/s | batched against built-in |
+| atoms | scalar steps/s | batched steps/s | batched over scalar (median of paired per-run ratios) | built-in `particles-lj` steps/s | batched against built-in (ratio of medians) |
 |---|---|---|---|---|---|
 | 1,024 | 1305.7 | 1515.6 | **1.16×** (1.17, 1.14, 1.16) | 4933.1 | 3.25× slower |
 | 16,384 | 77.2 | 84.2 | **1.03×** (1.03, 1.09, 1.10, 1.03, 1.03) | 339.1 | 4.03× slower |
 
-The scalar path against the built-in, from the same medians, is 3.78× and 4.39× slower,
+The speedup column is the median of the paired per-run ratios. The ratio of the median
+rates is 1.16× at 1,024 atoms (the same) and 1.09× at 16,384 (84.2 / 77.2), so the
+16,384 figure depends on which summary is used; both are above 1. The comparisons with
+the built-in are ratios of medians. The scalar path against the built-in, computed the
+same way from the same medians, is 3.78× and 4.39× slower,
 so the batch closed that gap from 3.8× to 3.25× at 1,024 atoms and from 4.4× to 4.03× at
 16,384. The spec's acceptance (batched faster than scalar at both sizes) is met, narrowly
 at 16,384, where an earlier, noisier set of three gave 1.01, 1.04 and 0.95. There was no

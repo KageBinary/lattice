@@ -767,10 +767,11 @@ run it a batch of eight pairs (or particles) at a time: one dispatch per operati
 all eight. The batch changes no bit of a non-NaN result and no order of accumulation, so
 a law written in a built-in's operation order still reproduces it exactly.
 `lattice bench particles-lj-expr` (Lennard-Jones as a natural-form `potential`) takes
-3.25× the built-in's step time with 1,024 atoms and 4.03× with 16,384 (median of three,
-idle machine, one thread), under the same correctness checks. That is 1.16× and 1.03×
-faster than the same law evaluated one pair at a time, which the benchmark also runs
-and prints. The gain is small, and nearly within noise at 16,384 atoms, which suggests
+3.25× the built-in's step time with 1,024 atoms and 4.03× with 16,384 (ratios of medians
+of three runs of each, idle machine, one thread), under the same correctness checks.
+That is 1.16× and 1.03× faster than the same law evaluated one pair at a time, which the
+benchmark also runs and prints (medians of the paired per-run ratios, over three runs at
+1,024 atoms and five at 16,384; the ratio of the median rates at 16,384 is 1.09×). The gain is small, and nearly within noise at 16,384 atoms, which suggests
 that most of the cost lies outside the dispatch the batch removes. That was not profiled;
 the roadmap's M6.1d section has the table and what is and is not known.
 
@@ -883,7 +884,7 @@ What the explanation does not do:
   the compiler. It then prints nothing: nothing false is said, but nothing is
   explained.
 - **A parameter that arrives non-finite is named by position**, `parameter 0`, not by
-  its name in the law. Inputs are named from their layout (`dx`, `a.px`).
+  its name in the law. Inputs are named from their layout (`d.x`, `a.position.x`).
 
 | Code | When |
 |---|---|

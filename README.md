@@ -86,8 +86,10 @@ part, and the quantum module has no GPU path. See
 User-defined laws (spec §8.3) are in progress. A `force` or `potential` on particles, and
 a reaction's `rate:` written as a law, are checked, compiled and run on the CPU through an
 interpreter. The particle loops run it eight pairs at a time, and for a pair potential it
-is 3.25× slower than the hand-written built-in at 1,024 atoms and 4.03× slower at 16,384;
-the batching is only 1.16× and 1.03× faster than evaluating one pair at a time. Rate laws
+is 3.25× slower than the hand-written built-in at 1,024 atoms and 4.03× slower at 16,384
+(ratios of medians of three runs of each); the batching is only 1.16× and 1.03× faster
+than evaluating one pair at a time (medians of paired per-run ratios, over three runs at
+1,024 atoms and five at 16,384; the ratio of median rates at 16,384 is 1.09×). Rate laws
 have not been benchmarked. When a law makes a run go non-finite, `lattice run` names the
 law and puts a caret under the sub-expression that failed (`E0950`), and
 `lattice inspect expr` prints what a law compiled to. Observers, GPU lowering and the
