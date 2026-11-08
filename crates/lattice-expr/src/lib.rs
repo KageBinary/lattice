@@ -39,9 +39,10 @@
 //!
 //! # A non-finite value can be traced to the operation that made it
 //!
-//! [`Program::trace`] re-runs a program on one set of inputs and stops at the first
-//! operation that turned finite operands into an infinity or a NaN, returning the
-//! operation, its [`Origin`] and the operands it read. The domains call it, after a run
+//! [`Program::trace`] re-runs a program on one set of inputs and follows a non-finite
+//! output back, through the values that carried it, to the operation that turned finite
+//! operands into an infinity or a NaN, returning the operation, its [`Origin`] and the
+//! operands it read. A non-finite value a `Select` discarded is not blamed. The domains call it, after a run
 //! has halted, on the inputs that produced the failure.
 //!
 //! # No allocation while evaluating
@@ -594,14 +595,17 @@ impl Program {
         }
     }
 
-    /// Evaluate on one set of inputs and report the first operation that made a value
-    /// non-finite out of values that were all finite.
+    /// Evaluate on one set of inputs and find the operation that made an output
+    /// non-finite.
     ///
-    /// An operation whose operands were already non-finite only propagated what it was
-    /// given, and is skipped. So a division by zero is reported where it happened and the
-    /// NaNs it spreads are not; and an input that arrives non-finite is reported as
-    /// itself, an `Op::Input` with no operands, with no operation blamed for it. `None`
-    /// means every value the program computed was finite.
+    /// Every value is computed first. The trace then starts at the first output that is
+    /// not finite and walks back along the values that carried the badness to it: at an
+    /// operation, to its first non-finite operand; at a `Select`, to its condition if that
+    /// is non-finite and otherwise to the arm it took, so a non-finite value on the arm it
+    /// discarded is not blamed. It stops at the operation whose operands were all finite,
+    /// which is the one that made the value. An input that arrives non-finite is reported
+    /// as itself, an `Op::Input` with no operands, with no operation blamed for it.
+    /// `None` means every output is finite.
     ///
     /// It allocates and keeps every operand: it is for explaining a failure after the
     /// fact, never for a loop.
@@ -611,17 +615,28 @@ impl Program {
     /// As [`Program::eval`] does, if the inputs or parameters are fewer than it reads.
     pub fn trace(&self, inputs: &[f64], params: &[f64]) -> Option<NonFiniteAt> {
         let mut regs: Vec<f64> = Vec::with_capacity(self.ops.len());
-        for (index, &op) in self.ops.iter().enumerate() {
-            // `apply` reads only registers before `index`, which `regs` holds.
+        for &op in &self.ops {
+            // `apply` reads only registers before this one, which `regs` holds.
             let value = apply(op, &regs, inputs, params);
-            let operands: Vec<f64> = op.operands().map(|r| regs[r as usize]).collect();
             regs.push(value);
-            if !value.is_finite() && operands.iter().all(|v| v.is_finite()) {
-                let reg = index as Reg;
-                return Some(NonFiniteAt { reg, op, origin: self.origin(reg), operands, value });
+        }
+        let bad = |r: Reg| !regs[r as usize].is_finite();
+        let mut reg = self.outputs.iter().copied().find(|&r| bad(r))?;
+        loop {
+            let op = self.ops[reg as usize];
+            let earlier = match op {
+                Op::Select(c, a, b) if !bad(c) => Some(if regs[c as usize] != 0.0 { a } else { b }),
+                _ => op.operands().find(|&r| bad(r)),
+            };
+            match earlier {
+                Some(r) if bad(r) => reg = r,
+                _ => {
+                    let operands = op.operands().map(|r| regs[r as usize]).collect();
+                    let value = regs[reg as usize];
+                    return Some(NonFiniteAt { reg, op, origin: self.origin(reg), operands, value });
+                }
             }
         }
-        None
     }
 
     /// Evaluate, allocating: for compile-time sampling and tests, never a hot loop.
@@ -1560,8 +1575,20 @@ mod tests {
 
     #[test]
     fn a_non_finite_input_is_blamed_as_an_input_and_no_operation_is() {
-        let program = pole_at_one();
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        // `1 / (r - 1)` turns an infinite `r` into a finite zero, so only NaN reaches its
+        // output; `r - 1` carries an infinity through.
+        let mut b = Builder::new(1, 0);
+        b.at(origin(10, 11));
+        let r = b.push(Op::Input(0));
+        let one = b.constant(1.0);
+        let gap = b.push(Op::Sub(r, one));
+        let shifted = b.finish(vec![gap]);
+        for (program, bad) in [
+            (pole_at_one(), f64::NAN),
+            (shifted.clone(), f64::NAN),
+            (shifted.clone(), f64::INFINITY),
+            (shifted, f64::NEG_INFINITY),
+        ] {
             let at = program.trace(&[bad], &[]).unwrap();
             assert_eq!((at.reg, at.op), (0, Op::Input(0)), "the input, not the subtraction after it");
             assert!(at.operands.is_empty());
@@ -1580,23 +1607,48 @@ mod tests {
         assert_eq!(at.op, Op::Param(0));
     }
 
-    /// A trace reports the first non-finite value the program made, whether or not the
-    /// outputs kept it: a caller that wants only faults that reached an output checks the
-    /// outputs first, as the domains do.
+    /// `(if x == 0 { 0 } else { 1/x }) + ln(y)` at `x = 0`, `y = −1`: the guarded division
+    /// is infinite but discarded, and the NaN is the log's. The trace blames the log.
     #[test]
-    fn a_trace_reports_a_non_finite_value_a_select_went_on_to_discard() {
-        let mut b = Builder::new(1, 0);
-        let x = b.push(Op::Input(0));
+    fn a_trace_blames_the_log_and_not_the_division_a_select_discarded() {
+        let mut b = Builder::new(2, 0);
+        let (x, y) = (b.push(Op::Input(0)), b.push(Op::Input(1)));
         let zero = b.constant(0.0);
         let one = b.constant(1.0);
+        b.at(origin(10, 13));
+        let pole = b.push(Op::Div(one, x));
+        let is_zero = b.push(Op::Eq(x, zero));
+        let guarded = b.push(Op::Select(is_zero, zero, pole));
+        b.at(origin(30, 35));
+        let ln = b.push(Op::Ln(y));
+        let sum = b.push(Op::Add(guarded, ln));
+        let program = b.finish(vec![sum]);
+
+        let at = program.trace(&[0.0, -1.0], &[]).unwrap();
+        assert_eq!((at.op, at.origin, at.operands.as_slice()), (Op::Ln(1), origin(30, 35), &[-1.0][..]));
+
+        // With the log fine the output is finite, and so is the whole trace, although the
+        // division at x = 0 is infinite in a register.
+        assert_eq!(program.eval_to_vec(&[0.0, 2.0], &[])[0], 2f64.ln());
+        assert_eq!(program.trace(&[0.0, 2.0], &[]), None);
+        // A guard that discards the division leaves a finite output: nothing to trace.
+        let mut b = Builder::new(1, 0);
+        let x = b.push(Op::Input(0));
+        let (zero, one) = (b.constant(0.0), b.constant(1.0));
         let pole = b.push(Op::Div(one, x));
         let nonzero = b.push(Op::Ne(x, zero));
-        let guarded = b.push(Op::Select(nonzero, pole, zero));
-        let program = b.finish(vec![guarded]);
-        let at = program.trace(&[0.0], &[]).unwrap();
+        let taken = b.push(Op::Select(nonzero, pole, zero));
+        let p = b.finish(vec![taken]);
+        assert_eq!(p.trace(&[0.0], &[]), None);
+        // A select whose chosen arm is the bad one passes the blame to that arm's op.
+        let mut b = Builder::new(1, 0);
+        let x = b.push(Op::Input(0));
+        let (zero, one) = (b.constant(0.0), b.constant(1.0));
+        let pole = b.push(Op::Div(one, x));
+        let is_zero = b.push(Op::Eq(x, zero));
+        let chosen = b.push(Op::Select(is_zero, pole, zero));
+        let at = b.finish(vec![chosen]).trace(&[0.0], &[]).unwrap();
         assert!(matches!(at.op, Op::Div(..)));
-        assert_eq!(program.eval_to_vec(&[0.0], &[])[0], 0.0, "although the answer is finite");
-        assert_eq!(program.trace(&[4.0], &[]), None);
     }
 
     #[test]

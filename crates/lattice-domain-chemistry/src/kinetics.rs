@@ -219,11 +219,17 @@ impl Plan {
         }
     }
 
-    fn reaction_rate(&self, index: usize, concentrations: &[f64], temperature: f64) -> f64 {
+    /// The rate of reaction `index`. `integrated` is true when the result enters the
+    /// integration: the rates at the start of a sub-step and at the stages of a
+    /// Runge-Kutta step, which are what the concentrations are updated from. It is false
+    /// for a finite-difference probe of the Jacobian, whose result only sizes the next
+    /// sub-step. Only an integrated evaluation is recorded when watching, so a fault's
+    /// operands are the ones the state was built from and not a probe's.
+    fn reaction_rate(&self, index: usize, concentrations: &[f64], temperature: f64, integrated: bool) -> f64 {
         let Some(reaction) = self.network.reactions().get(index) else { return 0.0 };
         if let Some(law) = &reaction.expression {
             let rate = law.rate(concentrations, temperature);
-            if self.watching && !rate.is_finite() {
+            if integrated && self.watching && !rate.is_finite() {
                 let mut fault = self.fault.borrow_mut();
                 if fault.is_none() {
                     *fault = law
@@ -250,12 +256,12 @@ impl Plan {
     /// concentrations for no extra rate evaluations at all. Computing it separately
     /// would either cost a second pass or settle for a trapezoid, and the energy is
     /// what the coupling ledger balances.
-    fn derivative(&self, concentrations: &[f64], temperature: f64, out: &mut [f64]) -> f64 {
+    fn derivative(&self, concentrations: &[f64], temperature: f64, out: &mut [f64], integrated: bool) -> f64 {
         out.fill(0.0);
         let species = self.network.len();
         let mut heat = 0.0;
         for index in 0..self.network.reactions().len() {
-            let rate = self.reaction_rate(index, concentrations, temperature);
+            let rate = self.reaction_rate(index, concentrations, temperature, integrated);
             if rate == 0.0 {
                 continue;
             }
@@ -437,7 +443,9 @@ impl Kinetics {
 
     /// Start or stop explaining non-finite rates: while watching, a rate law that
     /// evaluates to an infinity or a NaN records the first operation that made it so, for
-    /// [`Kinetics::take_fault`]. Off by default; the explanation allocates, so it is for
+    /// [`Kinetics::take_fault`]. Only evaluations the integration is built from count (a
+    /// sub-step's start and the stages of a Runge-Kutta step), not the finite-difference
+    /// probes that estimate its Jacobian. Off by default; the explanation allocates, so it is for
     /// replaying a run that has already failed.
     pub fn watch(&mut self, on: bool) {
         self.plan.watching = on;
@@ -452,12 +460,12 @@ impl Kinetics {
 
     /// The rate of reaction `index`, mol/(m²·s).
     pub fn reaction_rate(&self, index: usize, concentrations: &[f64], temperature: f64) -> f64 {
-        self.plan.reaction_rate(index, concentrations, temperature)
+        self.plan.reaction_rate(index, concentrations, temperature, true)
     }
 
     /// `dc/dt` for every species, mol/(m²·s).
     pub fn derivative(&self, concentrations: &[f64], temperature: f64, out: &mut [f64]) {
-        self.plan.derivative(concentrations, temperature, out);
+        self.plan.derivative(concentrations, temperature, out, true);
     }
 
     /// `dc/dt` and the heat released at the same state, in one pass.
@@ -467,7 +475,7 @@ impl Kinetics {
         temperature: f64,
         out: &mut [f64],
     ) -> f64 {
-        self.plan.derivative(concentrations, temperature, out)
+        self.plan.derivative(concentrations, temperature, out, true)
     }
 
     /// Heat released by the network, W/m². Positive warms the surroundings.
@@ -481,7 +489,7 @@ impl Kinetics {
         (0..self.plan.network.reactions().len())
             .map(|index| {
                 let enthalpy = self.plan.network.reactions()[index].enthalpy;
-                -enthalpy * self.plan.reaction_rate(index, concentrations, temperature)
+                -enthalpy * self.plan.reaction_rate(index, concentrations, temperature, true)
             })
             .sum()
     }
@@ -592,7 +600,7 @@ impl Kinetics {
         let scratch = &mut self.scratch;
         scratch.probe.copy_from_slice(concentrations);
         scratch.rows.fill(0.0);
-        self.plan.derivative(concentrations, temperature, &mut scratch.base);
+        self.plan.derivative(concentrations, temperature, &mut scratch.base, true);
 
         // Row sums of |∂f_i/∂c_j|, accumulated column by column.
         for (column, &centre) in concentrations.iter().enumerate() {
@@ -601,7 +609,7 @@ impl Kinetics {
             // by zero.
             let delta = centre.abs().max(1e-12) * 1e-7;
             scratch.probe[column] = centre + delta;
-            self.plan.derivative(&scratch.probe, temperature, &mut scratch.perturbed);
+            self.plan.derivative(&scratch.probe, temperature, &mut scratch.perturbed, false);
             scratch.probe[column] = centre;
 
             for row in 0..species {
@@ -615,7 +623,7 @@ impl Kinetics {
     /// One forward-Euler step. Returns the energy released, J/m².
     fn euler(&mut self, concentrations: &mut [f64], temperature: f64, dt: f64) -> f64 {
         let scratch = &mut self.scratch;
-        let heat = self.plan.derivative(concentrations, temperature, &mut scratch.k1);
+        let heat = self.plan.derivative(concentrations, temperature, &mut scratch.k1, true);
         for (value, slope) in concentrations.iter_mut().zip(&scratch.k1) {
             *value += dt * slope;
         }
@@ -631,16 +639,16 @@ impl Kinetics {
         let half = 0.5 * dt;
         let scratch = &mut self.scratch;
 
-        let q1 = self.plan.derivative(concentrations, temperature, &mut scratch.k1);
+        let q1 = self.plan.derivative(concentrations, temperature, &mut scratch.k1, true);
 
         step_into(&mut scratch.work, concentrations, &scratch.k1, half);
-        let q2 = self.plan.derivative(&scratch.work, temperature, &mut scratch.k2);
+        let q2 = self.plan.derivative(&scratch.work, temperature, &mut scratch.k2, true);
 
         step_into(&mut scratch.work, concentrations, &scratch.k2, half);
-        let q3 = self.plan.derivative(&scratch.work, temperature, &mut scratch.k3);
+        let q3 = self.plan.derivative(&scratch.work, temperature, &mut scratch.k3, true);
 
         step_into(&mut scratch.work, concentrations, &scratch.k3, dt);
-        let q4 = self.plan.derivative(&scratch.work, temperature, &mut scratch.k4);
+        let q4 = self.plan.derivative(&scratch.work, temperature, &mut scratch.k4, true);
 
         for (index, value) in concentrations.iter_mut().enumerate() {
             *value += dt / 6.0
@@ -1155,6 +1163,40 @@ mod tests {
         assert_eq!(law.inverse_time(&settled, 300.0), 3.0, "the larger of |dR/dA| = 3 and |dR/dB| = 1");
         // And a vector of the wrong length rates as zero rather than indexing past it.
         assert_eq!(law.rate(&[1.0], 300.0), 0.0);
+    }
+
+    /// Watching records the rate law where the integration is built from it, and not at
+    /// the Jacobian's probes. `1 / (A − p)` has its pole exactly where the Jacobian's
+    /// finite-difference probe for `A = 1` lands, `1 + 1e-7`; the real state is nowhere
+    /// near it, so an advance must record nothing, although the probe does divide by zero.
+    #[test]
+    fn a_probe_that_hits_a_pole_is_not_recorded_as_a_fault() {
+        use lattice_expr::{Builder, Op};
+        let pole = 1.0 + 1.0f64.max(1e-12) * 1e-7;
+        let law = || {
+            let mut b = Builder::new(3, 1);
+            let a = b.push(Op::Input(0));
+            let at = b.constant(pole);
+            let gap = b.push(Op::Sub(a, at));
+            let one = b.constant(1.0);
+            let rate = b.push(Op::Div(one, gap));
+            crate::rate::RateExpression::new(b.finish(vec![rate]), "1 / (c(A) - p)")
+        };
+        let sides = || (vec![Term::new(0, 1.0)], vec![Term::new(2, 1.0)]);
+        let (r, p) = sides();
+        let mut kinetics = Kinetics::new(pair_network(Reaction::with_expression("r", r, p, law())));
+        kinetics.watch(true);
+
+        // The probe really does reach the pole: the rate there is infinite.
+        let at_pole = [pole, 0.0, 0.0];
+        assert_eq!(kinetics.reaction_rate(0, &at_pole, 300.0), f64::INFINITY);
+        // ... and an evaluation the integration uses is recorded, so watching works at all.
+        let fault = kinetics.take_fault().expect("the state itself is on the pole");
+        assert_eq!(fault.at.operands, [1.0, 0.0]);
+
+        let mut state = [1.0, 0.0, 0.0];
+        kinetics.advance(&mut state, 300.0, 1e-15);
+        assert_eq!(kinetics.take_fault(), None, "the probe at the pole is not the trajectory");
     }
 
     /// A law compiled for another species list is a compiler bug, refused loudly.
