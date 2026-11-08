@@ -334,7 +334,7 @@ fn bench_particles_lj_expr(scale: usize, executor: &Executor) -> BenchOutcome {
         batched.throughput.steps
     ));
     batched.notes.push(format!(
-        "batched / scalar: {:.2}x faster (one run each after a discarded warm-up; a recorded figure is the median of three)",
+        "batched / scalar: {:.2}x faster (one run each after a discarded warm-up; a recorded figure is the median of at least three runs)",
         seconds(&scalar) / seconds(&batched).max(1e-12)
     ));
     batched.checks.push(Check::new("scalar-path run failed its own conditions", f64::from(u8::from(!scalar.valid())), 0.0));

@@ -53,7 +53,7 @@ does reach them, so run the whole workspace before committing.
 ### The GPU backend
 
 Off by default. §19.1's GPU cross-backend rows are *absent* from `lattice validate` without
-the feature — 63 cases rather than 74 — rather than reported as skipped-and-passing.
+the feature — 77 cases rather than 88 — rather than reported as skipped-and-passing.
 
 ```console
 $ cargo run -p lattice-wgpu --example probe    # what this machine's adapter offers
