@@ -597,6 +597,46 @@ impl Simulation {
         }
     }
 
+    /// Replay up to `steps` steps of `dt` with every domain watching its user laws, and
+    /// return the first law that produced a non-finite value (NFR-007).
+    ///
+    /// For a run that [`Simulation::run`] halted as [`StopReason::NonFinite`] at step `N`:
+    /// build the same model again, with the same timestep, and replay `N` steps. Runs are
+    /// bit-reproducible, so the replay reaches the same states, and nothing is retained
+    /// during an ordinary step to make this possible. It stops at the first fault, so the
+    /// clock afterwards says which step it was (step 0 is the initial state, before any
+    /// step). `None` means the steps all passed without a user law making a non-finite
+    /// value: the NaN came from something that is not one.
+    ///
+    /// Replaying costs about one more run, and the watching re-evaluates each user law
+    /// at every step, so it is for the failure path alone. A model with no user law in
+    /// any domain is not replayed at all: there is nothing to explain.
+    pub fn trace_non_finite(&mut self, dt: f64, steps: u64) -> Option<lattice_ir::LawFault> {
+        let mut any_laws = false;
+        for domain in &mut self.domains {
+            any_laws |= domain.trace_laws(true);
+        }
+        if !any_laws {
+            for domain in &mut self.domains {
+                domain.trace_laws(false);
+            }
+            return None;
+        }
+        let first = |domains: &[Box<dyn Domain>]| domains.iter().find_map(|domain| domain.law_fault());
+        let mut found = first(&self.domains);
+        for _ in 0..steps {
+            if found.is_some() {
+                break;
+            }
+            self.step(dt);
+            found = first(&self.domains);
+        }
+        for domain in &mut self.domains {
+            domain.trace_laws(false);
+        }
+        found
+    }
+
     /// Degrees of freedom advanced per step, for the throughput report.
     fn element_count(&self) -> u64 {
         self.model
@@ -649,6 +689,10 @@ mod tests {
         limit: f64,
         preferred: f64,
         poison_at: Option<u64>,
+        /// Whether a replay has asked it to watch its laws.
+        watching: bool,
+        /// Whether it has any user law to watch.
+        has_laws: bool,
     }
 
     impl Counter {
@@ -659,6 +703,8 @@ mod tests {
                 limit: f64::INFINITY,
                 preferred: 0.1,
                 poison_at: None,
+                watching: false,
+                has_laws: true,
             }
         }
     }
@@ -691,6 +737,27 @@ mod tests {
                 _ => self.steps as f64,
             };
             out.record_invariant(format!("{}.count", self.name), Invariant::Energy, value);
+        }
+        fn trace_laws(&mut self, on: bool) -> bool {
+            self.watching = on;
+            self.has_laws
+        }
+        fn law_fault(&self) -> Option<lattice_ir::LawFault> {
+            // Its "law" goes non-finite on the step it poisons itself, when watched.
+            let poisoned = self.poison_at.is_some_and(|at| self.steps >= at);
+            (self.watching && poisoned).then(|| lattice_ir::LawFault {
+                domain: self.name.clone(),
+                law: "count".to_string(),
+                site: lattice_ir::FaultSite::Particle(self.steps as usize),
+                at: lattice_expr::NonFiniteAt {
+                    reg: 0,
+                    op: lattice_expr::Op::Const(f64::NAN),
+                    origin: None,
+                    operands: Vec::new(),
+                    value: f64::NAN,
+                },
+                input: None,
+            })
         }
     }
 
@@ -735,6 +802,43 @@ mod tests {
         assert!(outcome.is_success());
         assert_eq!(outcome.clock.step, 10);
         assert!((outcome.clock.time - 1.0).abs() < 1e-9);
+    }
+
+    /// A halted run is replayed on a fresh simulation: it stops at the first step a
+    /// domain reports a fault, leaves the clock there, and switches the watching off.
+    #[test]
+    fn a_replay_stops_at_the_first_fault_and_stops_watching() {
+        let poisoned = |at| {
+            let mut counter = Counter::new("a");
+            counter.poison_at = Some(at);
+            simulation(vec![Box::new(counter)])
+        };
+        let mut first = poisoned(4);
+        let outcome = first.run(&RunConfig::new().with_max_steps(50).with_timestep(0.1));
+        let StopReason::NonFinite { step, .. } = outcome.stop else { panic!("{:?}", outcome.stop) };
+        assert_eq!(step, 4);
+
+        let mut replay = poisoned(4);
+        let fault = replay.trace_non_finite(0.1, step).expect("the poisoned domain reports");
+        assert_eq!((fault.domain.as_str(), fault.law.as_str()), ("a", "count"));
+        assert_eq!(replay.clock().step, 4, "the replay stopped where the fault was");
+        assert!(replay.domains()[0].law_fault().is_none(), "and stopped watching");
+
+        // A replay too short to reach the fault finds none.
+        let mut short = poisoned(4);
+        assert!(short.trace_non_finite(0.1, 2).is_none());
+        assert_eq!(short.clock().step, 2);
+    }
+
+    /// With no user law anywhere there is nothing to explain, so nothing is replayed.
+    #[test]
+    fn a_model_with_no_user_laws_is_not_replayed() {
+        let mut counter = Counter::new("a");
+        counter.poison_at = Some(1);
+        counter.has_laws = false;
+        let mut replay = simulation(vec![Box::new(counter)]);
+        assert!(replay.trace_non_finite(0.1, 50).is_none());
+        assert_eq!(replay.clock().step, 0, "not a single step");
     }
 
     #[test]

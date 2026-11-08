@@ -19,6 +19,7 @@
 //! | [`arena`] | Preallocated per-step scratch space | NFR-001 |
 //! | [`contract`] | The [`Domain`] trait and the [`SolverContract`] every solver publishes | §7.3, NFR-003 |
 //! | [`diagnostics`] | Conservation drift, coupling ledger, solver residuals | §14.3, §10.4 |
+//! | [`fault`] | Where a user law first produced a non-finite value | NFR-007 |
 //! | [`rng`] | Reproducible seeded randomness | P6, FR-011 |
 //!
 //! # What does not live here
@@ -92,6 +93,7 @@ pub mod bodies;
 pub mod contract;
 pub mod curve;
 pub mod diagnostics;
+pub mod fault;
 pub mod graph;
 pub mod grid;
 pub mod ids;
@@ -116,6 +118,7 @@ pub use diagnostics::{
     ConservationLedger, DriftMonitor, Invariant, Observation, ObservationKind, Observations,
     Reconciliation, ResidualHistory, SolveOutcome, Transfer,
 };
+pub use fault::{FaultSite, LawFault};
 pub use graph::{GraphError, Operation, OperationGraph, OperationKind};
 pub use grid::{
     Boundary, BoundaryError, BoundarySet, Grid2d, ScalarField, Side, VectorField,

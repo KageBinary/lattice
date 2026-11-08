@@ -11,5 +11,8 @@ lattice-ir.workspace = true
 lattice-coupling.workspace = true
 lattice-observe.workspace = true
 
+[dev-dependencies]
+lattice-expr.workspace = true
+
 [lints]
 workspace = true

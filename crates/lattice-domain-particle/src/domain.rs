@@ -3,7 +3,7 @@
 //! can schedule.
 
 use lattice_ir::{
-    Domain, FidelityProfile, Invariant, Observations, ParticleSpec, ParticleStore, Precision,
+    Domain, FidelityProfile, Invariant, LawFault, Observations, ParticleSpec, ParticleStore, Precision,
     SolverContract, StableStep, StepContext,
 };
 
@@ -211,6 +211,11 @@ pub struct ParticleDomain {
     rdf: Option<RdfAccumulator>,
     /// Slot pairs the bonded laws bind, gathered at initialization for drawing.
     bonded: Vec<[u32; 2]>,
+    /// True while a replay is asking each force evaluation to explain a non-finite
+    /// value; see [`Domain::trace_laws`].
+    tracing: bool,
+    /// The first fault a traced evaluation found.
+    fault: Option<LawFault>,
 }
 
 impl ParticleDomain {
@@ -237,6 +242,8 @@ impl ParticleDomain {
             rdf_request: None,
             rdf: None,
             bonded: Vec::new(),
+            tracing: false,
+            fault: None,
         }
     }
 
@@ -421,12 +428,17 @@ impl ParticleDomain {
 
     /// Recompute forces for the current configuration.
     fn refresh_forces(&mut self) {
-        let Self { store, forces, neighbors, bounds, shift_x, shift_y, .. } = self;
-        Self::evaluate_forces(store, forces, neighbors.as_mut(), bounds.as_ref(), shift_x, shift_y);
+        let Self { store, forces, neighbors, bounds, shift_x, shift_y, tracing, fault, .. } = self;
+        let watch = tracing.then_some(fault);
+        Self::evaluate_forces(store, forces, neighbors.as_mut(), bounds.as_ref(), shift_x, shift_y, watch);
     }
 
     /// Wrap, re-bin, and accumulate every law — the closure every integrator step
     /// calls after moving the particles.
+    ///
+    /// With `watch`, each law is then asked to explain a non-finite value at this
+    /// configuration, and the first explanation is kept. That is the replay's hook; an
+    /// ordinary step passes `None` and pays nothing.
     fn evaluate_forces(
         store: &mut ParticleStore,
         forces: &[Box<dyn ForceLaw>],
@@ -434,6 +446,7 @@ impl ParticleDomain {
         bounds: Option<&BoundaryBox>,
         shift_x: &mut [f64],
         shift_y: &mut [f64],
+        watch: Option<&mut Option<LawFault>>,
     ) {
         // Positions have just changed: wrap or reflect before binning, so the
         // neighbour list and the minimum-image convention agree on where particles are.
@@ -450,6 +463,11 @@ impl ParticleDomain {
         let mut view = store.force_accumulation();
         for law in forces {
             law.accumulate(&mut view, &ctx);
+        }
+        if let Some(slot) = watch
+            && slot.is_none()
+        {
+            *slot = forces.iter().find_map(|law| law.explain_non_finite(store, &ctx));
         }
     }
 
@@ -923,7 +941,10 @@ impl Domain for ParticleDomain {
             self.initialized,
             "ParticleDomain::advance requires initialize() to have established the force invariant"
         );
-        let Self { store, forces, neighbors, bounds, integrator, thermostat, bath, shift_x, shift_y, .. } = self;
+        let Self {
+            store, forces, neighbors, bounds, integrator, thermostat, bath, shift_x, shift_y, tracing, fault, ..
+        } = self;
+        let tracing = *tracing;
         let scheme = *integrator;
         // The integrator's per-particle updates are split across threads; the force
         // laws are not. A pair law applies Newton's third law by scattering into *both*
@@ -933,7 +954,8 @@ impl Domain for ParticleDomain {
         // do. See `lattice_cpu`, and `docs/execution.md` for what a GPU backend will
         // have to decide instead.
         let mut eval = |s: &mut ParticleStore| {
-            Self::evaluate_forces(s, forces, neighbors.as_mut(), bounds.as_ref(), shift_x, shift_y);
+            let watch = tracing.then_some(&mut *fault);
+            Self::evaluate_forces(s, forces, neighbors.as_mut(), bounds.as_ref(), shift_x, shift_y, watch);
         };
         let coupling = *thermostat;
         match (coupling, bath) {
@@ -952,6 +974,25 @@ impl Domain for ParticleDomain {
         {
             rdf.sample(&self.store);
         }
+    }
+
+    fn trace_laws(&mut self, on: bool) -> bool {
+        self.tracing = on;
+        // The forces of the current configuration were evaluated before this was asked
+        // (the compiler initializes the domain), so they are explained now: a law that is
+        // already non-finite at the start would otherwise never be seen.
+        let ctx = self.force_context();
+        let initial = if on && self.initialized {
+            self.forces.iter().find_map(|law| law.explain_non_finite(&self.store, &ctx))
+        } else {
+            None
+        };
+        self.fault = initial;
+        self.forces.iter().any(|law| law.is_user_law())
+    }
+
+    fn law_fault(&self) -> Option<LawFault> {
+        self.fault.clone().map(|fault| LawFault { domain: self.name.clone(), ..fault })
     }
 
     fn observe(&self, out: &mut Observations) {

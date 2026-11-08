@@ -23,6 +23,7 @@ gpu = ["lattice-validation/gpu", "dep:lattice-compute", "dep:lattice-wgpu"]
 lattice-compute = { workspace = true, optional = true }
 lattice-wgpu = { workspace = true, optional = true }
 lattice-ir.workspace = true
+lattice-expr.workspace = true
 lattice-units.workspace = true
 lattice-syntax.workspace = true
 lattice-compiler.workspace = true

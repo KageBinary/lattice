@@ -30,8 +30,22 @@
 //! error at every step, and it is the same argument the heat module makes for using a
 //! von Neumann limit rather than a step controller.
 
+use std::cell::RefCell;
+
+use lattice_expr::NonFiniteAt;
+
 use crate::network::ReactionNetwork;
 use crate::rate::mass_action_rate;
+
+/// A rate law that evaluated to a non-finite rate while a [`Kinetics`] was watching for it
+/// (see [`Kinetics::watch`]).
+#[derive(Clone, PartialEq, Debug)]
+pub struct RateFault {
+    /// The reaction whose `rate:` it is.
+    pub reaction: String,
+    /// The first operation of the law to make a value non-finite, and what it read.
+    pub at: NonFiniteAt,
+}
 
 /// Most sub-steps one [`Kinetics::advance`] call will take.
 ///
@@ -162,6 +176,11 @@ struct Plan {
     reactant_starts: Vec<usize>,
     products: Vec<(usize, f64)>,
     product_starts: Vec<usize>,
+    /// True while a replay is explaining non-finite rates; see [`Kinetics::watch`].
+    watching: bool,
+    /// The first fault seen since it was last taken. Interior, because a rate is read
+    /// through `&self`.
+    fault: RefCell<Option<RateFault>>,
 }
 
 impl Plan {
@@ -188,13 +207,31 @@ impl Plan {
             products.extend(reaction.products.iter().map(|t| (t.species, t.coefficient)));
             product_starts.push(products.len());
         }
-        Plan { network, stoichiometry, reactants, reactant_starts, products, product_starts }
+        Plan {
+            network,
+            stoichiometry,
+            reactants,
+            reactant_starts,
+            products,
+            product_starts,
+            watching: false,
+            fault: RefCell::new(None),
+        }
     }
 
     fn reaction_rate(&self, index: usize, concentrations: &[f64], temperature: f64) -> f64 {
         let Some(reaction) = self.network.reactions().get(index) else { return 0.0 };
         if let Some(law) = &reaction.expression {
-            return law.rate(concentrations, temperature);
+            let rate = law.rate(concentrations, temperature);
+            if self.watching && !rate.is_finite() {
+                let mut fault = self.fault.borrow_mut();
+                if fault.is_none() {
+                    *fault = law
+                        .explain_non_finite(concentrations, temperature)
+                        .map(|at| RateFault { reaction: reaction.name.clone(), at });
+                }
+            }
+            return rate;
         }
         mass_action_rate(
             &reaction.rate,
@@ -396,6 +433,21 @@ impl Kinetics {
     /// True when there is nothing to integrate.
     pub fn is_empty(&self) -> bool {
         self.plan.network.reactions().is_empty()
+    }
+
+    /// Start or stop explaining non-finite rates: while watching, a rate law that
+    /// evaluates to an infinity or a NaN records the first operation that made it so, for
+    /// [`Kinetics::take_fault`]. Off by default; the explanation allocates, so it is for
+    /// replaying a run that has already failed.
+    pub fn watch(&mut self, on: bool) {
+        self.plan.watching = on;
+        *self.plan.fault.borrow_mut() = None;
+    }
+
+    /// The first non-finite rate-law evaluation since the last call (or since
+    /// [`Kinetics::watch`]), and forget it.
+    pub fn take_fault(&self) -> Option<RateFault> {
+        self.plan.fault.borrow_mut().take()
     }
 
     /// The rate of reaction `index`, mol/(m²·s).

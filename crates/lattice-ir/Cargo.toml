@@ -8,6 +8,7 @@ description = "Simulation IR: typed IDs, structure-of-arrays storage, grids, are
 
 [dependencies]
 lattice-cpu.workspace = true
+lattice-expr.workspace = true
 lattice-units.workspace = true
 
 [lints]

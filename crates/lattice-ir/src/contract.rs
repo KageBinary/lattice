@@ -508,6 +508,27 @@ pub trait Domain: Send + DomainType {
     fn port_grid(&self) -> Option<crate::grid::Grid2d> {
         None
     }
+
+    /// Start or stop watching the user laws this domain evaluates for a non-finite
+    /// value (NFR-007).
+    ///
+    /// Off by default and off in every ordinary run: it re-evaluates each law in a way
+    /// that allocates. The runtime turns it on only to replay a run that has already
+    /// halted as non-finite, so that [`Domain::law_fault`] can say which law, where, and
+    /// which sub-expression produced the first bad value.
+    ///
+    /// Returns whether the domain has any user law to watch. A domain with none has
+    /// nothing to explain, and a replay of a run in which no domain has any would only
+    /// repeat it.
+    fn trace_laws(&mut self, _on: bool) -> bool {
+        false
+    }
+
+    /// The first non-finite value a user law produced since [`Domain::trace_laws`] was
+    /// turned on, if any did.
+    fn law_fault(&self) -> Option<crate::fault::LawFault> {
+        None
+    }
 }
 
 /// Typed backend adapters can inspect concrete solver configuration at setup.

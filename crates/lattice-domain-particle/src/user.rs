@@ -33,8 +33,8 @@
 //! not pin a NaN's payload, so a NaN may differ in its bits (not in being NaN). The
 //! scalar path stays as the reference and for the benchmark's comparison.
 
-use lattice_expr::{Program, LANES, MAX_REGISTERS};
-use lattice_ir::{ForceAccumulation, ParticleStore, StableStep};
+use lattice_expr::{NonFiniteAt, Op, Program, LANES, MAX_REGISTERS};
+use lattice_ir::{FaultSite, ForceAccumulation, LawFault, ParticleStore, StableStep};
 
 use crate::forces::{pair_mode_limit, ForceContext, ForceLaw, Truncation};
 
@@ -75,6 +75,32 @@ pub mod layout {
     pub const CHARGE: u32 = 5;
     /// Members per particle.
     pub const FIELDS: u32 = 6;
+
+    /// What input `n` is called in a message: `d.x`, `r`, `a.position.x`, `b.mass`. The
+    /// two particles of a pair law are `a` and `b`; a law on one particle has `a` alone.
+    pub fn input_name(pair: bool, n: u32) -> String {
+        let member = |offset: u32| match offset {
+            PX => "position.x",
+            PY => "position.y",
+            VX => "velocity.x",
+            VY => "velocity.y",
+            MASS => "mass",
+            _ => "charge",
+        };
+        if !pair {
+            return format!("a.{}", member(n % FIELDS));
+        }
+        match n {
+            DX => "d.x".to_string(),
+            DY => "d.y".to_string(),
+            R => "r".to_string(),
+            _ => {
+                let particle = if n < PAIR_B { "a" } else { "b" };
+                let base = if n < PAIR_B { PAIR_A } else { PAIR_B };
+                format!("{particle}.{}", member(n - base))
+            }
+        }
+    }
 }
 
 /// What a user law computes, which decides what the engine does with its outputs.
@@ -296,6 +322,81 @@ impl UserLaw {
         }
         let out = self.program.eval_to_vec(&inputs, &self.params);
         (out[0], out[1])
+    }
+
+    /// The first operation of the program to make a non-finite value out of finite ones,
+    /// when the program's outputs at `inputs` are not all finite.
+    fn non_finite_at(&self, inputs: &[f64]) -> Option<NonFiniteAt> {
+        let mut regs = [0.0; MAX_REGISTERS];
+        let mut out = [0.0; 3];
+        self.program.eval(inputs, &self.params, &mut regs, &mut out);
+        if out[..self.kind.outputs()].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        self.program.trace(inputs, &self.params)
+    }
+
+    /// A fault at `site`, naming the input when that is what arrived non-finite.
+    fn fault(&self, site: FaultSite, at: NonFiniteAt) -> LawFault {
+        let input = match at.op {
+            Op::Input(n) => Some(layout::input_name(self.kind.is_pair(), n)),
+            Op::Param(n) => Some(format!("parameter {n}")),
+            _ => None,
+        };
+        LawFault { domain: String::new(), law: self.name.clone(), site, at, input }
+    }
+
+    /// The first pair or particle, in visit order, whose evaluation is not finite.
+    fn first_fault(&self, store: &ParticleStore, ctx: &ForceContext<'_>) -> Option<LawFault> {
+        let (pos, vel) = ((store.pos_x(), store.pos_y()), (store.vel_x(), store.vel_y()));
+        let (mass, charge) = (store.mass(), store.charge());
+        if !self.kind.is_pair() {
+            let mut inputs = [0.0; layout::BODY_INPUTS as usize];
+            for k in 0..pos.0.len() {
+                inputs[layout::PX as usize] = pos.0[k];
+                inputs[layout::PY as usize] = pos.1[k];
+                inputs[layout::VX as usize] = vel.0[k];
+                inputs[layout::VY as usize] = vel.1[k];
+                inputs[layout::MASS as usize] = mass[k];
+                inputs[layout::CHARGE as usize] = charge[k];
+                if let Some(at) = self.non_finite_at(&inputs) {
+                    return Some(self.fault(FaultSite::Particle(k), at));
+                }
+            }
+            return None;
+        }
+        let list = ctx.neighbors?;
+        let cutoff = self.cutoff.unwrap_or(0.0);
+        let cutoff2 = cutoff * cutoff;
+        let per_pair = self.member_dependent && self.truncation.is_some();
+        let mut inputs = [0.0; layout::PAIR_INPUTS as usize];
+        let mut found: Option<(usize, usize, NonFiniteAt)> = None;
+        list.for_each_pair(pos.0, pos.1, |i, j, dx, dy, r2| {
+            if found.is_some() || r2 >= cutoff2 {
+                return;
+            }
+            let r = r2.sqrt();
+            inputs[layout::DX as usize] = dx;
+            inputs[layout::DY as usize] = dy;
+            inputs[layout::R as usize] = r;
+            for (base, k) in [(layout::PAIR_A, i), (layout::PAIR_B, j)] {
+                let base = base as usize;
+                inputs[base + layout::PX as usize] = pos.0[k];
+                inputs[base + layout::PY as usize] = pos.1[k];
+                inputs[base + layout::VX as usize] = vel.0[k];
+                inputs[base + layout::VY as usize] = vel.1[k];
+                inputs[base + layout::MASS as usize] = mass[k];
+                inputs[base + layout::CHARGE as usize] = charge[k];
+            }
+            let mut at = self.non_finite_at(&inputs);
+            if at.is_none() && per_pair && self.kind != UserLawKind::PairForce {
+                // The energy and slope at the cutoff that this pair's truncation uses.
+                inputs[layout::R as usize] = cutoff;
+                at = self.non_finite_at(&inputs);
+            }
+            found = at.map(|at| (i, j, at));
+        });
+        found.map(|(i, j, at)| self.fault(FaultSite::Pair(i, j), at))
     }
 
     /// The truncated energy and the slope the force uses, at separation `r`, given the
@@ -667,6 +768,14 @@ impl ForceLaw for UserLaw {
         total
     }
 
+    fn is_user_law(&self) -> bool {
+        true
+    }
+
+    fn explain_non_finite(&self, store: &ParticleStore, ctx: &ForceContext<'_>) -> Option<LawFault> {
+        self.first_fault(store, ctx)
+    }
+
     fn stability_limit(&self, store: &ParticleStore) -> Option<StableStep> {
         pair_mode_limit(store, self.stiffness?)
     }
@@ -698,6 +807,140 @@ mod tests {
         let (u, du) = law.pair_potential(1.5);
         assert!((u - 0.375).abs() < 1e-15 && (du - 1.5).abs() < 1e-15, "{u}, {du}");
         assert!(law.is_conservative());
+    }
+
+    fn origin(start: u32, end: u32) -> Option<lattice_expr::Origin> {
+        Some(lattice_expr::Origin { start, end })
+    }
+
+    /// `U(r) = 1 / (r − 1)`, each operation at the byte range it would have in the source.
+    fn pole_potential() -> UserLaw {
+        let mut b = Builder::new(layout::PAIR_INPUTS, 0);
+        b.at(origin(20, 21));
+        let r = b.push(Op::Input(layout::R));
+        b.at(origin(24, 25));
+        let one = b.constant(1.0);
+        b.at(origin(20, 25));
+        let gap = b.push(Op::Sub(r, one));
+        b.at(origin(10, 26));
+        let u = b.push(Op::Div(one, gap));
+        let program = b.finish(vec![u]).derivative(layout::R);
+        UserLaw::new("pole", UserLawKind::PairPotential, program, vec![], Some(3.0), None)
+    }
+
+    fn store_of(positions: &[[f64; 2]]) -> ParticleStore {
+        let mut store = ParticleStore::with_capacity(positions.len());
+        for &p in positions {
+            store.spawn(lattice_ir::ParticleSpec::at(p).with_mass(1.0)).unwrap();
+        }
+        store
+    }
+
+    fn list_for(store: &ParticleStore) -> crate::verlet::NeighborList {
+        let mut list = crate::verlet::NeighborList::new(
+            [-10.0, -10.0],
+            [20.0, 20.0],
+            [false; 2],
+            3.0,
+            None,
+            store.len(),
+            crate::verlet::Exclusions::none(),
+        );
+        list.update(store);
+        list
+    }
+
+    #[test]
+    fn a_pair_law_is_traced_to_the_pair_and_the_operation() {
+        let law = pole_potential();
+        // 0 and 2 are 2 apart; 1 and 2 are exactly 1 apart.
+        let store = store_of(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]);
+        let list = list_for(&store);
+        let ctx = ForceContext { neighbors: Some(&list), image: list.image() };
+        let fault = law.explain_non_finite(&store, &ctx).expect("a pole at r = 1");
+        assert_eq!(fault.law, "pole");
+        assert!(matches!(fault.site, FaultSite::Pair(..)), "{fault:?}");
+        let FaultSite::Pair(a, b) = fault.site else { unreachable!() };
+        assert_eq!((a as i32 - b as i32).abs(), 1, "an adjacent pair, not 0 and 2");
+        assert_eq!(fault.at.op, Op::Div(1, 2));
+        assert_eq!(fault.at.origin, origin(10, 26));
+        assert_eq!(fault.at.operands, [1.0, 0.0]);
+        assert!(!fault.is_input());
+
+        // Move the pair off the pole and nothing is reported.
+        let healthy = store_of(&[[0.0, 0.0], [1.5, 0.0]]);
+        let list = list_for(&healthy);
+        let ctx = ForceContext { neighbors: Some(&list), image: list.image() };
+        assert!(law.explain_non_finite(&healthy, &ctx).is_none());
+    }
+
+    #[test]
+    fn a_body_law_is_traced_to_the_particle_and_a_bad_input_blames_the_input() {
+        // F = (ln(x), 0).
+        let mut b = Builder::new(layout::BODY_INPUTS, 0);
+        b.at(origin(40, 45));
+        let x = b.push(Op::Input(layout::PX));
+        b.at(origin(37, 46));
+        let ln = b.push(Op::Ln(x));
+        let zero = b.constant(0.0);
+        let law = UserLaw::new("pull", UserLawKind::BodyForce, b.finish(vec![ln, zero]), vec![], None, None);
+
+        let mut store = ParticleStore::with_capacity(2);
+        let first = store.spawn(lattice_ir::ParticleSpec::at([1.0, 0.0]).with_mass(1.0)).unwrap();
+        store.spawn(lattice_ir::ParticleSpec::at([-2.0, 0.0]).with_mass(1.0)).unwrap();
+        let ctx = ForceContext::open();
+        let fault = law.explain_non_finite(&store, &ctx).unwrap();
+        assert_eq!(fault.site, FaultSite::Particle(1));
+        assert_eq!((fault.at.op, fault.at.origin), (Op::Ln(0), origin(37, 46)));
+        assert_eq!(fault.at.operands, [-2.0]);
+        assert!(!fault.is_input());
+
+        // A position that is NaN already: the input is to blame, and no operation.
+        assert!(store.set_position(first, [f64::NAN, 0.0]));
+        let fault = law.explain_non_finite(&store, &ctx).unwrap();
+        assert_eq!(fault.site, FaultSite::Particle(0));
+        assert_eq!(fault.at.op, Op::Input(layout::PX));
+        assert_eq!(fault.at.origin, origin(40, 45));
+        assert!(fault.at.operands.is_empty());
+        assert_eq!(fault.input.as_deref(), Some("a.position.x"));
+    }
+
+    /// A domain whose initial state is already NaN: asked to watch its laws, it explains
+    /// the initial forces, blames the input, and reports the domain's own name. A domain
+    /// that is told to stop watching forgets.
+    #[test]
+    fn a_domain_with_a_nan_initial_state_blames_the_input_when_asked_to_watch() {
+        use lattice_ir::Domain;
+        let mut b = Builder::new(layout::BODY_INPUTS, 0);
+        b.at(origin(40, 50));
+        let x = b.push(Op::Input(layout::PX));
+        let zero = b.constant(0.0);
+        let law = UserLaw::new("pull", UserLawKind::BodyForce, b.finish(vec![x, zero]), vec![], None, None);
+        let mut domain = crate::ParticleDomain::new("bead", 2).with_force(law);
+        domain.spawn(lattice_ir::ParticleSpec::at([1.0, 0.0]).with_mass(1.0)).unwrap();
+        domain.spawn(lattice_ir::ParticleSpec::at([f64::NAN, 0.0]).with_mass(1.0)).unwrap();
+        domain.initialize();
+        assert!(domain.law_fault().is_none(), "not watching");
+
+        assert!(domain.trace_laws(true), "it has a user law");
+        let fault = domain.law_fault().expect("the second particle's position is NaN");
+        assert_eq!(fault.domain, "bead");
+        assert_eq!(fault.site, FaultSite::Particle(1));
+        assert_eq!((fault.at.op, fault.at.origin), (Op::Input(layout::PX), origin(40, 50)));
+        assert_eq!(fault.input.as_deref(), Some("a.position.x"));
+        assert!(fault.at.operands.is_empty(), "no operation is blamed");
+
+        domain.trace_laws(false);
+        assert!(domain.law_fault().is_none());
+    }
+
+    #[test]
+    fn layout_names_every_input() {
+        assert_eq!(layout::input_name(true, layout::R), "r");
+        assert_eq!(layout::input_name(true, layout::DY), "d.y");
+        assert_eq!(layout::input_name(true, layout::PAIR_A + layout::VX), "a.velocity.x");
+        assert_eq!(layout::input_name(true, layout::PAIR_B + layout::CHARGE), "b.charge");
+        assert_eq!(layout::input_name(false, layout::MASS), "a.mass");
     }
 
     #[test]
