@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use lattice_domain_grid2d::{gaussian, Diffusivity, HeatDomain, TimeScheme};
 use lattice_domain_particle::{
-    BoundaryBox, Integrator, LennardJones, ParticleDomain, ParticleSpec, UniformAcceleration,
+    BoundaryBox, Evaluation, Integrator, LennardJones, ParticleDomain, ParticleSpec, UniformAcceleration,
 };
 use lattice_domain_quantum2d::{Hamiltonian, Kinetic, Potential, QuantumDomain, Shape, Wavefunction};
 use lattice_ir::{Arena, BoundarySet, Domain, Executor, Grid2d, Pcg32, StepContext};
@@ -55,6 +55,9 @@ pub struct BenchOutcome {
     pub memory: MemoryReport,
     /// The correctness conditions §15.6 attaches to this target.
     pub checks: Vec<Check>,
+    /// Further measurements the benchmark made beside its own, such as the same scene on
+    /// another code path. Printed under the checks.
+    pub notes: Vec<String>,
 }
 
 impl BenchOutcome {
@@ -162,7 +165,8 @@ pub fn all() -> &'static [Benchmark] {
             name: "particles-lj-expr",
             description: "particles-lj's fluid with Lennard-Jones written as a user-defined \
                           potential (spec §8.3), its force the compiler's derivative — the \
-                          interpreter's cost against the hand-written loop",
+                          interpreter's cost against the hand-written loop, run once \
+                          scalar and once batched",
             correctness: "the same energy and momentum drift bounds as particles-lj, and no \
                           particle silently dropped",
             run: bench_particles_lj_expr,
@@ -265,6 +269,7 @@ fn bench_particles_gravity(scale: usize, executor: &Executor) -> BenchOutcome {
         },
         profile,
         memory,
+        notes: Vec::new(),
         checks: vec![
             Check::new("max deviation from the analytic trajectory (m)", worst, 1e-9),
             Check::new(
@@ -292,13 +297,53 @@ const LJ_POTENTIAL: &str = "potential lj(a: particle, b: particle) -> joule {
 /// `particles-lj`'s scene with the force a user-defined potential (spec §8.3): what
 /// the interpreter costs against the hand-written loop, under the same correctness
 /// conditions.
+///
+/// The scene runs once untimed to warm up, then with the law evaluated one pair at a
+/// time, then a batch at a time (spec M6.1d §4.3). The batched run is the outcome; the
+/// scalar run is printed beside it, and the two must end at the same bits of total
+/// energy (this scene has no NaN, where the bits are not pinned).
 fn bench_particles_lj_expr(scale: usize, executor: &Executor) -> BenchOutcome {
     let law = lattice_compiler::user_force::law_from_source(
         LJ_POTENTIAL,
         "lj(epsilon=1 joule, sigma=1 meter, cutoff=2.5 meter)",
     )
     .expect("the benchmark's law compiles");
-    bench_lj_with(scale, executor, move || law.clone())
+    // A discarded warm-up run first: whichever timed run came first would otherwise pay
+    // for the cold caches and clocks, and a cold scalar run inflates the batched/scalar
+    // ratio. After it both timed runs start warm.
+    let warm_law = law.clone().with_evaluation(Evaluation::Batched);
+    let _ = run_lj_with(scale, executor, move || warm_law.clone());
+    let scalar_law = law.clone().with_evaluation(Evaluation::Scalar);
+    let (scalar, scalar_energy) = run_lj_with(scale, executor, move || scalar_law.clone());
+    let batched_law = law.with_evaluation(Evaluation::Batched);
+    let (mut batched, batched_energy) = run_lj_with(scale, executor, move || batched_law.clone());
+
+    let seconds = |outcome: &BenchOutcome| outcome.throughput.wall_clock.as_secs_f64();
+    let rate = |outcome: &BenchOutcome| outcome.throughput.steps_per_second();
+    batched.notes.push(format!(
+        "scalar path: {:.3} s, {:.2} steps/s over {} steps",
+        seconds(&scalar),
+        rate(&scalar),
+        scalar.throughput.steps
+    ));
+    batched.notes.push(format!(
+        "batched path ({} lanes): {:.3} s, {:.2} steps/s over {} steps",
+        lattice_domain_particle::LANES,
+        seconds(&batched),
+        rate(&batched),
+        batched.throughput.steps
+    ));
+    batched.notes.push(format!(
+        "batched / scalar: {:.2}x faster (one run each after a discarded warm-up; a recorded figure is the median of three)",
+        seconds(&scalar) / seconds(&batched).max(1e-12)
+    ));
+    batched.checks.push(Check::new("scalar-path run failed its own conditions", f64::from(u8::from(!scalar.valid())), 0.0));
+    batched.checks.push(Check::new(
+        "final total energy, batched against scalar (J)",
+        (batched_energy - scalar_energy).abs(),
+        0.0,
+    ));
+    batched
 }
 
 /// A Lennard-Jones fluid in a periodic box with the given law: the scene both LJ
@@ -308,6 +353,15 @@ fn bench_lj_with<L: lattice_domain_particle::ForceLaw + 'static>(
     executor: &Executor,
     law: impl Fn() -> L,
 ) -> BenchOutcome {
+    run_lj_with(scale, executor, law).0
+}
+
+/// [`bench_lj_with`], and the total energy the run ended at.
+fn run_lj_with<L: lattice_domain_particle::ForceLaw + 'static>(
+    scale: usize,
+    executor: &Executor,
+    law: impl Fn() -> L,
+) -> (BenchOutcome, f64) {
     let side = 32 * scale;
     let count = side * side;
     let spacing = 1.4;
@@ -361,7 +415,8 @@ fn bench_lj_with<L: lattice_domain_particle::ForceLaw + 'static>(
     let compute = compute_start.elapsed();
     profile.record(phase::COMPUTE, compute);
 
-    let energy_drift = ((domain.total_energy() - e0) / e0.abs()).abs();
+    let final_energy = domain.total_energy();
+    let energy_drift = ((final_energy - e0) / e0.abs()).abs();
     let p = domain.momentum();
     let momentum_drift =
         ((p[0] - p0[0]).powi(2) + (p[1] - p0[1]).powi(2)).sqrt() / momentum_scale.max(1e-30);
@@ -369,7 +424,7 @@ fn bench_lj_with<L: lattice_domain_particle::ForceLaw + 'static>(
     let mut memory = MemoryReport::new();
     memory.record("particles + cell list", domain.memory_bytes());
 
-    BenchOutcome {
+    let outcome = BenchOutcome {
         throughput: Throughput {
             steps: steps as u64,
             simulated_seconds: dt * steps as f64,
@@ -378,6 +433,7 @@ fn bench_lj_with<L: lattice_domain_particle::ForceLaw + 'static>(
         },
         profile,
         memory,
+        notes: Vec::new(),
         checks: vec![
             Check::new("relative energy drift", energy_drift, 5e-3),
             Check::new("relative momentum drift", momentum_drift, 1e-10),
@@ -388,7 +444,8 @@ fn bench_lj_with<L: lattice_domain_particle::ForceLaw + 'static>(
                 0.0,
             ),
         ],
-    }
+    };
+    (outcome, final_energy)
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +531,7 @@ fn run_heat(
         },
         profile,
         memory,
+        notes: Vec::new(),
         checks,
     }
 }
@@ -539,6 +597,7 @@ fn bench_quantum_split_step(scale: usize, executor: &Executor) -> BenchOutcome {
         },
         profile,
         memory,
+        notes: Vec::new(),
         checks: vec![
             Check::new("probability norm drift", drift, 1e-10),
             Check::new("cells holding a non-finite amplitude", non_finite, 0.0),
@@ -578,6 +637,9 @@ pub fn report(
             check.limit
         ));
     }
+    for note in &outcome.notes {
+        out.push_str(&format!("  {note}\n"));
+    }
     if !outcome.valid() {
         out.push_str(
             "\n  RESULT INVALID: a correctness condition failed, so this throughput \
@@ -604,6 +666,10 @@ pub fn to_json(
                 .set("passed", check.passed()),
         );
     }
+    let mut notes = Json::array();
+    for note in &outcome.notes {
+        notes.push(note.clone());
+    }
     Json::object()
         .set("name", info.name)
         .set("description", info.description)
@@ -617,6 +683,7 @@ pub fn to_json(
         .set("phases", outcome.profile.to_json())
         .set("memory_bytes", outcome.memory.to_json())
         .set("checks", checks)
+        .set("notes", notes)
 }
 
 /// What splitting the work bought, measured rather than assumed.

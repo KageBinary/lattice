@@ -22,8 +22,18 @@
 //! arithmetic is exactly what the built-in laws do when they subtract a force from `i`
 //! and add it to `j`. A law written in a built-in's operation order therefore
 //! reproduces that built-in to the last bit, which is what the validation suite checks.
+//!
+//! # Evaluated a batch at a time
+//!
+//! The loops gather up to [`LANES`] pairs (or particles), evaluate them in one
+//! [`Program::eval_batch`] pass, and then visit them in the order they were gathered.
+//! Each lane is bit-identical to the scalar evaluation, and the visit sequence is the
+//! scalar one, so forces, energy and virial accumulate to the same bits whichever
+//! [`Evaluation`] a law uses. That holds for every non-NaN result: `eval_batch` does
+//! not pin a NaN's payload, so a NaN may differ in its bits (not in being NaN). The
+//! scalar path stays as the reference and for the benchmark's comparison.
 
-use lattice_expr::{Program, MAX_REGISTERS};
+use lattice_expr::{Program, LANES, MAX_REGISTERS};
 use lattice_ir::{ForceAccumulation, ParticleStore, StableStep};
 
 use crate::forces::{pair_mode_limit, ForceContext, ForceLaw, Truncation};
@@ -105,6 +115,19 @@ impl UserLawKind {
     }
 }
 
+/// How the force loops run a law's program.
+///
+/// Both give the same bits for every non-NaN result (a NaN's payload is not pinned);
+/// they differ in speed alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Evaluation {
+    /// One pair or particle at a time, through [`Program::eval`].
+    Scalar,
+    /// [`LANES`] at a time, through [`Program::eval_batch`].
+    #[default]
+    Batched,
+}
+
 /// A compiled user law with its parameters bound.
 #[derive(Clone, PartialEq, Debug)]
 pub struct UserLaw {
@@ -123,6 +146,31 @@ pub struct UserLaw {
     /// True when the law reads a mass or a charge, so `U(r_c)` and `U′(r_c)` differ from
     /// pair to pair and are evaluated for each pair rather than once.
     member_dependent: bool,
+    /// Whether the loops evaluate one at a time or a batch at a time.
+    evaluation: Evaluation,
+}
+
+/// Up to [`LANES`] pairs gathered for one pass of the program, with their scratch. A
+/// stack value: the step allocates nothing (NFR-001).
+struct PairBatch {
+    len: usize,
+    ij: [(usize, usize); LANES],
+    d: [(f64, f64); LANES],
+    r: [f64; LANES],
+    /// `inputs[k * LANES + lane]`, as [`Program::eval_batch`] reads them.
+    inputs: [f64; layout::PAIR_INPUTS as usize * LANES],
+    regs: [f64; MAX_REGISTERS * LANES],
+    out: [f64; 2 * LANES],
+    at_cutoff: [f64; 2 * LANES],
+}
+
+/// Up to [`LANES`] particles gathered for one pass of the program.
+struct BodyBatch {
+    len: usize,
+    index: [usize; LANES],
+    inputs: [f64; layout::BODY_INPUTS as usize * LANES],
+    regs: [f64; MAX_REGISTERS * LANES],
+    out: [f64; 3 * LANES],
 }
 
 impl UserLaw {
@@ -162,6 +210,7 @@ impl UserLaw {
             slope_at_cutoff: 0.0,
             stiffness: None,
             member_dependent: false,
+            evaluation: Evaluation::default(),
         };
         if let (UserLawKind::PairPotential, Some(rc)) = (kind, cutoff) {
             let at = law.pair_potential(rc);
@@ -184,6 +233,23 @@ impl UserLaw {
     pub fn with_member_dependence(mut self, member_dependent: bool) -> UserLaw {
         self.member_dependent = member_dependent;
         self
+    }
+
+    /// True when the law reads a mass or a charge (see [`Self::with_member_dependence`]).
+    pub fn is_member_dependent(&self) -> bool {
+        self.member_dependent
+    }
+
+    /// Choose how the force loops run the program. The default is
+    /// [`Evaluation::Batched`]; the answer is the same either way.
+    pub fn with_evaluation(mut self, evaluation: Evaluation) -> UserLaw {
+        self.evaluation = evaluation;
+        self
+    }
+
+    /// How the force loops run the program.
+    pub fn evaluation(&self) -> Evaluation {
+        self.evaluation
     }
 
     /// What it computes.
@@ -249,8 +315,129 @@ impl UserLaw {
     /// Visit every pair inside the cutoff with the force on `a`, `(i, j, dx, dy, fx, fy)`,
     /// and its energy. The one place a pair law is evaluated, so the force loop, the
     /// energy and the virial cannot disagree about what the law is.
+    ///
+    /// The visits come in the neighbour list's order whichever [`Evaluation`] is in use.
     #[allow(clippy::too_many_arguments)]
     fn for_each_pair_force(
+        &self,
+        list: &crate::verlet::NeighborList,
+        pos: (&[f64], &[f64]),
+        vel: (&[f64], &[f64]),
+        mass: &[f64],
+        charge: &[f64],
+        visit: impl FnMut(usize, usize, f64, f64, f64, f64, f64),
+    ) {
+        match self.evaluation {
+            Evaluation::Scalar => self.pair_forces_scalar(list, pos, vel, mass, charge, visit),
+            Evaluation::Batched => self.pair_forces_batched(list, pos, vel, mass, charge, visit),
+        }
+    }
+
+    /// [`Self::for_each_pair_force`] a batch at a time: gather [`LANES`] pairs, evaluate
+    /// them in one pass, and visit them in the order they were gathered.
+    #[allow(clippy::too_many_arguments)]
+    fn pair_forces_batched(
+        &self,
+        list: &crate::verlet::NeighborList,
+        pos: (&[f64], &[f64]),
+        vel: (&[f64], &[f64]),
+        mass: &[f64],
+        charge: &[f64],
+        mut visit: impl FnMut(usize, usize, f64, f64, f64, f64, f64),
+    ) {
+        let cutoff = self.cutoff.unwrap_or(0.0);
+        let cutoff2 = cutoff * cutoff;
+        let per_pair = self.member_dependent && self.truncation.is_some();
+        let mut batch = PairBatch {
+            len: 0,
+            ij: [(0, 0); LANES],
+            d: [(0.0, 0.0); LANES],
+            r: [0.0; LANES],
+            inputs: [0.0; layout::PAIR_INPUTS as usize * LANES],
+            regs: [0.0; MAX_REGISTERS * LANES],
+            out: [0.0; 2 * LANES],
+            at_cutoff: [0.0; 2 * LANES],
+        };
+        list.for_each_pair(pos.0, pos.1, |i, j, dx, dy, r2| {
+            if r2 >= cutoff2 {
+                return;
+            }
+            let r = r2.sqrt();
+            let lane = batch.len;
+            batch.ij[lane] = (i, j);
+            batch.d[lane] = (dx, dy);
+            batch.r[lane] = r;
+            let mut put = |input: u32, value: f64| batch.inputs[input as usize * LANES + lane] = value;
+            put(layout::DX, dx);
+            put(layout::DY, dy);
+            put(layout::R, r);
+            for (base, k) in [(layout::PAIR_A, i), (layout::PAIR_B, j)] {
+                put(base + layout::PX, pos.0[k]);
+                put(base + layout::PY, pos.1[k]);
+                put(base + layout::VX, vel.0[k]);
+                put(base + layout::VY, vel.1[k]);
+                put(base + layout::MASS, mass[k]);
+                put(base + layout::CHARGE, charge[k]);
+            }
+            batch.len += 1;
+            if batch.len == LANES {
+                self.flush_pairs(&mut batch, cutoff, per_pair, &mut visit);
+            }
+        });
+        self.flush_pairs(&mut batch, cutoff, per_pair, &mut visit);
+    }
+
+    /// Evaluate the gathered pairs and visit each in gather order, then empty the batch.
+    fn flush_pairs(
+        &self,
+        batch: &mut PairBatch,
+        cutoff: f64,
+        per_pair: bool,
+        visit: &mut impl FnMut(usize, usize, f64, f64, f64, f64, f64),
+    ) {
+        let n = batch.len;
+        if n == 0 {
+            return;
+        }
+        self.program.eval_batch(n, &batch.inputs, &self.params, &mut batch.regs, &mut batch.out);
+        let potential = self.kind != UserLawKind::PairForce;
+        if potential && per_pair {
+            // A potential that reads a member has its own U(r_c) for each pair: evaluate
+            // the batch again with `r` set to the cutoff, as the scalar path does pair
+            // by pair. A potential reads positions only through r, so only r changes.
+            let row = layout::R as usize * LANES;
+            let mut saved = [0.0; LANES];
+            saved.copy_from_slice(&batch.inputs[row..row + LANES]);
+            batch.inputs[row..row + LANES].fill(cutoff);
+            self.program.eval_batch(n, &batch.inputs, &self.params, &mut batch.regs, &mut batch.at_cutoff);
+            batch.inputs[row..row + LANES].copy_from_slice(&saved);
+        }
+        for lane in 0..n {
+            let (i, j) = batch.ij[lane];
+            let (dx, dy) = batch.d[lane];
+            let (first, second) = (batch.out[lane], batch.out[LANES + lane]);
+            if !potential {
+                visit(i, j, dx, dy, first, second, 0.0);
+                continue;
+            }
+            let shift = if per_pair {
+                (batch.at_cutoff[lane], batch.at_cutoff[LANES + lane])
+            } else {
+                (self.energy_at_cutoff, self.slope_at_cutoff)
+            };
+            // F_a = −∂U/∂x_a = U′(r) d/r, since ∂r/∂x_a = −d/r.
+            let r = batch.r[lane];
+            let (u, du) = self.truncated(first, second, r, shift);
+            let coefficient = du / r;
+            visit(i, j, dx, dy, coefficient * dx, coefficient * dy, u);
+        }
+        batch.len = 0;
+    }
+
+    /// [`Self::for_each_pair_force`] one pair at a time: the reference the batched path
+    /// is held against.
+    #[allow(clippy::too_many_arguments)]
+    fn pair_forces_scalar(
         &self,
         list: &crate::verlet::NeighborList,
         pos: (&[f64], &[f64]),
@@ -309,6 +496,73 @@ impl UserLaw {
 
     /// Visit every particle with the force on it and its energy.
     fn for_each_body_force(
+        &self,
+        pos: (&[f64], &[f64]),
+        vel: (&[f64], &[f64]),
+        mass: &[f64],
+        charge: &[f64],
+        visit: impl FnMut(usize, f64, f64, f64),
+    ) {
+        match self.evaluation {
+            Evaluation::Scalar => self.body_forces_scalar(pos, vel, mass, charge, visit),
+            Evaluation::Batched => self.body_forces_batched(pos, vel, mass, charge, visit),
+        }
+    }
+
+    /// [`Self::for_each_body_force`] a batch of particles at a time, visited in index order.
+    fn body_forces_batched(
+        &self,
+        pos: (&[f64], &[f64]),
+        vel: (&[f64], &[f64]),
+        mass: &[f64],
+        charge: &[f64],
+        mut visit: impl FnMut(usize, f64, f64, f64),
+    ) {
+        let mut batch = BodyBatch {
+            len: 0,
+            index: [0; LANES],
+            inputs: [0.0; layout::BODY_INPUTS as usize * LANES],
+            regs: [0.0; MAX_REGISTERS * LANES],
+            out: [0.0; 3 * LANES],
+        };
+        for k in 0..pos.0.len() {
+            let lane = batch.len;
+            batch.index[lane] = k;
+            let mut put = |input: u32, value: f64| batch.inputs[input as usize * LANES + lane] = value;
+            put(layout::PX, pos.0[k]);
+            put(layout::PY, pos.1[k]);
+            put(layout::VX, vel.0[k]);
+            put(layout::VY, vel.1[k]);
+            put(layout::MASS, mass[k]);
+            put(layout::CHARGE, charge[k]);
+            batch.len += 1;
+            if batch.len == LANES {
+                self.flush_bodies(&mut batch, &mut visit);
+            }
+        }
+        self.flush_bodies(&mut batch, &mut visit);
+    }
+
+    /// Evaluate the gathered particles and visit each in index order, then empty the batch.
+    fn flush_bodies(&self, batch: &mut BodyBatch, visit: &mut impl FnMut(usize, f64, f64, f64)) {
+        let n = batch.len;
+        if n == 0 {
+            return;
+        }
+        self.program.eval_batch(n, &batch.inputs, &self.params, &mut batch.regs, &mut batch.out);
+        for lane in 0..n {
+            let k = batch.index[lane];
+            let (a, b, c) = (batch.out[lane], batch.out[LANES + lane], batch.out[2 * LANES + lane]);
+            match self.kind {
+                UserLawKind::BodyForce => visit(k, a, b, 0.0),
+                _ => visit(k, -b, -c, a),
+            }
+        }
+        batch.len = 0;
+    }
+
+    /// [`Self::for_each_body_force`] one particle at a time: the batched path's reference.
+    fn body_forces_scalar(
         &self,
         pos: (&[f64], &[f64]),
         vel: (&[f64], &[f64]),

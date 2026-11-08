@@ -206,6 +206,7 @@ fn bench_heat_explicit(scale: usize, device: &GpuDevice) -> Result<BenchOutcome,
         },
         profile,
         memory,
+        notes: Vec::new(),
         checks: vec![
             Check::new(
                 "relative integral drift on a closed domain",
@@ -303,6 +304,7 @@ fn bench_heat_implicit(scale: usize, device: &GpuDevice) -> Result<BenchOutcome,
         },
         profile,
         memory,
+        notes: Vec::new(),
         checks: vec![
             // The integral drift bound is the explicit one plus what the solves are entitled
             // to: each stops at a relative residual, and ||A^-1|| <= 1 carries that straight
