@@ -298,17 +298,21 @@ const LJ_POTENTIAL: &str = "potential lj(a: particle, b: particle) -> joule {
 /// the interpreter costs against the hand-written loop, under the same correctness
 /// conditions.
 ///
-/// The scene runs twice, first with the law evaluated one pair at a time and then a
-/// batch at a time (spec M6.1d §4.3). The batched run is the outcome; the scalar run is
-/// printed beside it, and the two must end at the same bits of total energy.
+/// The scene runs once untimed to warm up, then with the law evaluated one pair at a
+/// time, then a batch at a time (spec M6.1d §4.3). The batched run is the outcome; the
+/// scalar run is printed beside it, and the two must end at the same bits of total
+/// energy (this scene has no NaN, where the bits are not pinned).
 fn bench_particles_lj_expr(scale: usize, executor: &Executor) -> BenchOutcome {
     let law = lattice_compiler::user_force::law_from_source(
         LJ_POTENTIAL,
         "lj(epsilon=1 joule, sigma=1 meter, cutoff=2.5 meter)",
     )
     .expect("the benchmark's law compiles");
-    // The scalar run goes first, so the batched run is the one with the warm cache. That
-    // biases the ratio down, the direction a performance claim should be biased.
+    // A discarded warm-up run first: whichever timed run came first would otherwise pay
+    // for the cold caches and clocks, and a cold scalar run inflates the batched/scalar
+    // ratio. After it both timed runs start warm.
+    let warm_law = law.clone().with_evaluation(Evaluation::Batched);
+    let _ = run_lj_with(scale, executor, move || warm_law.clone());
     let scalar_law = law.clone().with_evaluation(Evaluation::Scalar);
     let (scalar, scalar_energy) = run_lj_with(scale, executor, move || scalar_law.clone());
     let batched_law = law.with_evaluation(Evaluation::Batched);
@@ -329,7 +333,10 @@ fn bench_particles_lj_expr(scale: usize, executor: &Executor) -> BenchOutcome {
         rate(&batched),
         batched.throughput.steps
     ));
-    batched.notes.push(format!("batched / scalar: {:.2}x faster", seconds(&scalar) / seconds(&batched).max(1e-12)));
+    batched.notes.push(format!(
+        "batched / scalar: {:.2}x faster (one run each after a discarded warm-up; a recorded figure is the median of three)",
+        seconds(&scalar) / seconds(&batched).max(1e-12)
+    ));
     batched.checks.push(Check::new("scalar-path run failed its own conditions", f64::from(u8::from(!scalar.valid())), 0.0));
     batched.checks.push(Check::new(
         "final total energy, batched against scalar (J)",

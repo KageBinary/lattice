@@ -29,8 +29,9 @@
 //! [`Program::eval_batch`] pass, and then visit them in the order they were gathered.
 //! Each lane is bit-identical to the scalar evaluation, and the visit sequence is the
 //! scalar one, so forces, energy and virial accumulate to the same bits whichever
-//! [`Evaluation`] a law uses. The scalar path stays as the reference and for the
-//! benchmark's comparison.
+//! [`Evaluation`] a law uses. That holds for every non-NaN result: `eval_batch` does
+//! not pin a NaN's payload, so a NaN may differ in its bits (not in being NaN). The
+//! scalar path stays as the reference and for the benchmark's comparison.
 
 use lattice_expr::{Program, LANES, MAX_REGISTERS};
 use lattice_ir::{ForceAccumulation, ParticleStore, StableStep};
@@ -116,7 +117,8 @@ impl UserLawKind {
 
 /// How the force loops run a law's program.
 ///
-/// Both give the same bits; they differ in speed alone.
+/// Both give the same bits for every non-NaN result (a NaN's payload is not pinned);
+/// they differ in speed alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Evaluation {
     /// One pair or particle at a time, through [`Program::eval`].

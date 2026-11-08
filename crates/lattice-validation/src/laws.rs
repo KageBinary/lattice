@@ -25,7 +25,7 @@ pub(crate) static CASES: &[Case] = &[
         name: "batched_laws_match_scalar_laws_bitwise",
         domain: "laws",
         level: Level::CrossScheme,
-        claim: "a charged, truncated pair potential on a particle count that is not a multiple of the batch width gives a bit-identical trajectory on the batched and the scalar path",
+        claim: "a charged, truncated pair potential on a particle count that is not a multiple of the batch width gives a bit-identical trajectory on the batched and the scalar path (for non-NaN results, which the batch does not pin)",
         run: batched_matches_scalar,
     },
     Case {
@@ -163,7 +163,8 @@ const CHARGED_CORE: &str = "potential charged_core(a: particle, b: particle) -> 
 /// 101 is not a multiple of the batch width (101 = 12 × 8 + 5), so the body loop ends on a
 /// partial batch, and the pair loop ends on one unless the pair count happens to be a
 /// multiple (the case prints it). The truncation is member-dependent, which sends the pair loop through its second batch at
-/// the cutoff. Positions, velocities and the total energy must agree to the last bit.
+/// the cutoff. Positions, velocities and the total energy must agree to the last bit
+/// (the run stays finite; the batched path does not pin a NaN's payload).
 fn batched_matches_scalar() -> Outcome {
     use lattice_domain_particle::Evaluation;
 
