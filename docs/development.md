@@ -34,7 +34,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test --workspace --all-features # 1283 tests including doctests across 20 crates
+$ cargo test --workspace --all-features # 1312 tests including doctests across 20 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
@@ -93,6 +93,25 @@ it on `examples/lj_gas.lattice` and `examples/diffusing_pulse.lattice`, and look
 **Always benchmark a release build.** `lattice bench` prints a loud warning when
 `debug_assertions` is on, because a timing from an unoptimized build is off by an order
 of magnitude and is the easiest way to publish a misleading number.
+
+## Working on user laws
+
+`lattice inspect expr <file> [law]` prints a law's compiled operations beside the source
+each came from, and its fingerprint: look there first when a law's numbers surprise you,
+and when a change to `lattice-expr` or `lower_law.rs` should not have changed a program.
+The listing of `examples/damped_spring.lattice` is pinned by a test in
+`crates/lattice-cli/src/inspect.rs`. It lists `force` and `potential` laws only (a
+reaction's `rate:` law has no name), and language.md describes it.
+
+`Program::eval` and `Program::eval_batch` must stay bit-identical for every non-NaN
+result, and both get their arms from the `op_match!` macro in `lattice-expr`, so a new
+operation goes there once. The bit-identity property test generates every operation,
+and `lattice bench particles-lj-expr` prints the scalar and the batched path side by
+side and marks its result invalid if their final energies differ.
+
+When a run halts as non-finite and a user law is responsible, `lattice run` replays it
+and explains the law (`E0950`); that replay is `Simulation::trace_non_finite`, and a
+domain with user laws opts in through `Domain::trace_laws` and `Domain::law_fault`.
 
 ## Adding a parallel kernel
 

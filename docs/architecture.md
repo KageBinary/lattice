@@ -67,6 +67,14 @@ hold no storage layout decisions; `lattice-runtime` does not depend on the compi
 it takes a `CompiledModel` and a `Vec<Box<dyn Domain>>`, and the CLI wires the two
 together.
 
+`lattice-expr`, the compiled form of a user law (M6.1b), is a leaf that uses only the
+standard library, and the diagram above does not draw it. Several crates depend on it,
+and as of M6.1d one of them is `lattice-ir`: a `LawFault`, which the `Domain` contract
+returns to say where in a law a run first went non-finite, carries an
+`lattice_expr::NonFiniteAt` with the `Origin` of the operation that failed. The edge
+points downward like every other, and `lattice-expr` knows nothing of `lattice-syntax`:
+an `Origin` is a byte range, and the CLI turns it into a caret.
+
 `lattice-cpu` is at the bottom beside `lattice-units` because it knows nothing about
 simulation: it splits slices and runs closures. It is *below* `lattice-ir` rather than
 beside the domains because `StepContext` carries an `Executor` — a solver is handed the
@@ -515,10 +523,11 @@ order, while its CPU pair-scatter reference remains unchanged.
 - **User-defined laws run on the CPU only, for particles and reactions.** Spec §8.3's
   expression language compiles `force` and `potential` laws to a program in the
   `lattice-expr` crate, run by an interpreter in the particle domain's force loop (M6.1b),
-  and a reaction's `rate:` written as a law to a program the chemistry kinetics evaluates
-  in place of mass action (M6.1c). GPU lowering (M6.3) is not built, and the builtin
-  vocabulary elsewhere is still a closed set: an unrecognized function is an error that
-  *lists what is available*.
+  eight pairs at a time since M6.1d, and a reaction's `rate:` written as a law to a
+  program the chemistry kinetics evaluates in place of mass action (M6.1c), one cell at
+  a time because cells take different adaptive sub-steps. GPU lowering (M6.3) is not
+  built, and the builtin vocabulary elsewhere is still a closed set: an unrecognized
+  function is an error that *lists what is available*.
 - **No general GPU model scheduler.** The released GPU solvers provide composable
   command encoding, but arbitrary coupled models still execute on the CPU.
 
