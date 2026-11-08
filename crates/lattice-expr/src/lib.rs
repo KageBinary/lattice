@@ -42,7 +42,8 @@
 //! [`Program::trace`] re-runs a program on one set of inputs and follows a non-finite
 //! output back, through the values that carried it, to the operation that turned finite
 //! operands into an infinity or a NaN, returning the operation, its [`Origin`] and the
-//! operands it read. A non-finite value a `Select` discarded is not blamed. The domains call it, after a run
+//! operands it read. When two independent faults meet, the one computed first is reported. A
+//! non-finite value a `Select` discarded is not blamed. The domains call it, after a run
 //! has halted, on the inputs that produced the failure.
 //!
 //! # No allocation while evaluating
@@ -596,24 +597,38 @@ impl Program {
     }
 
     /// Evaluate on one set of inputs and find the operation that made an output
-    /// non-finite.
+    /// non-finite: [`Program::trace_outputs`] over every output.
+    pub fn trace(&self, inputs: &[f64], params: &[f64]) -> Option<NonFiniteAt> {
+        self.trace_outputs(inputs, params, 0..self.outputs.len())
+    }
+
+    /// Evaluate on one set of inputs and find the operation that made one of the outputs
+    /// in `outputs` (indices into the program's outputs) non-finite.
     ///
-    /// Every value is computed first. The trace then starts at the first output that is
-    /// not finite and walks back along the values that carried the badness to it: at an
-    /// operation, to its first non-finite operand; at a `Select`, to its condition if that
-    /// is non-finite and otherwise to the arm it took, so a non-finite value on the arm it
-    /// discarded is not blamed. It stops at the operation whose operands were all finite,
-    /// which is the one that made the value. An input that arrives non-finite is reported
-    /// as itself, an `Op::Input` with no operands, with no operation blamed for it.
-    /// `None` means every output is finite.
+    /// Every value is computed first. The trace then takes the *cone* of each non-finite
+    /// output: the operations whose values carried the badness to it. At an operation
+    /// that is every non-finite operand; at a `Select`, its condition if that is
+    /// non-finite and the arm it took, so a non-finite value on the arm it discarded is
+    /// not in the cone. The culprits are the operations in the cone whose operands were
+    /// all finite, and the one with the lowest register is reported: when two
+    /// independent faults meet at an operation, the one the program computed first. An
+    /// input that arrives non-finite is a culprit too, reported as itself, an `Op::Input`
+    /// with no operands, with no operation blamed for it. `None` means none of
+    /// `outputs` is non-finite.
     ///
     /// It allocates and keeps every operand: it is for explaining a failure after the
     /// fact, never for a loop.
     ///
     /// # Panics
     ///
-    /// As [`Program::eval`] does, if the inputs or parameters are fewer than it reads.
-    pub fn trace(&self, inputs: &[f64], params: &[f64]) -> Option<NonFiniteAt> {
+    /// As [`Program::eval`] does, if the inputs or parameters are fewer than it reads;
+    /// and if `outputs` reaches past the program's outputs.
+    pub fn trace_outputs(
+        &self,
+        inputs: &[f64],
+        params: &[f64],
+        outputs: core::ops::Range<usize>,
+    ) -> Option<NonFiniteAt> {
         let mut regs: Vec<f64> = Vec::with_capacity(self.ops.len());
         for &op in &self.ops {
             // `apply` reads only registers before this one, which `regs` holds.
@@ -621,22 +636,35 @@ impl Program {
             regs.push(value);
         }
         let bad = |r: Reg| !regs[r as usize].is_finite();
-        let mut reg = self.outputs.iter().copied().find(|&r| bad(r))?;
-        loop {
+        let mut pending: Vec<Reg> = self.outputs[outputs].iter().copied().filter(|&r| bad(r)).collect();
+        let mut seen = vec![false; self.ops.len()];
+        let mut culprit: Option<Reg> = None;
+        while let Some(reg) = pending.pop() {
+            if std::mem::replace(&mut seen[reg as usize], true) {
+                continue;
+            }
             let op = self.ops[reg as usize];
-            let earlier = match op {
-                Op::Select(c, a, b) if !bad(c) => Some(if regs[c as usize] != 0.0 { a } else { b }),
-                _ => op.operands().find(|&r| bad(r)),
-            };
-            match earlier {
-                Some(r) if bad(r) => reg = r,
-                _ => {
-                    let operands = op.operands().map(|r| regs[r as usize]).collect();
-                    let value = regs[reg as usize];
-                    return Some(NonFiniteAt { reg, op, origin: self.origin(reg), operands, value });
+            let before = pending.len();
+            match op {
+                Op::Select(c, a, b) => {
+                    if bad(c) {
+                        pending.push(c);
+                    }
+                    let taken = if regs[c as usize] != 0.0 { a } else { b };
+                    if bad(taken) {
+                        pending.push(taken);
+                    }
                 }
+                _ => pending.extend(op.operands().filter(|&r| bad(r))),
+            }
+            if pending.len() == before {
+                culprit = Some(culprit.map_or(reg, |lowest| lowest.min(reg)));
             }
         }
+        let reg = culprit?;
+        let op = self.ops[reg as usize];
+        let operands = op.operands().map(|r| regs[r as usize]).collect();
+        Some(NonFiniteAt { reg, op, origin: self.origin(reg), operands, value: regs[reg as usize] })
     }
 
     /// Evaluate, allocating: for compile-time sampling and tests, never a hot loop.
@@ -1649,6 +1677,40 @@ mod tests {
         let chosen = b.push(Op::Select(is_zero, pole, zero));
         let at = b.finish(vec![chosen]).trace(&[0.0], &[]).unwrap();
         assert!(matches!(at.op, Op::Div(..)));
+    }
+
+    /// `let t = ln(y); 1/x + t` at `x = 0`, `y = -1`: two independent faults meet at the
+    /// sum. The log is the first computed, so it is the one reported, although the
+    /// division is the sum's first operand.
+    #[test]
+    fn when_two_faults_meet_the_first_computed_is_blamed() {
+        let mut b = Builder::new(2, 0);
+        let (x, y) = (b.push(Op::Input(0)), b.push(Op::Input(1)));
+        b.at(origin(5, 10));
+        let t = b.push(Op::Ln(y));
+        let one = b.constant(1.0);
+        b.at(origin(20, 23));
+        let pole = b.push(Op::Div(one, x));
+        let sum = b.push(Op::Add(pole, t));
+        let program = b.finish(vec![sum]);
+        let at = program.trace(&[0.0, -1.0], &[]).unwrap();
+        assert_eq!((at.op, at.origin), (Op::Ln(1), origin(5, 10)));
+        // Either fault alone is reported as itself.
+        assert!(matches!(program.trace(&[0.0, 2.0], &[]).unwrap().op, Op::Div(..)));
+        assert!(matches!(program.trace(&[1.0, -1.0], &[]).unwrap().op, Op::Ln(_)));
+    }
+
+    /// The trace starts from the outputs the caller checked, not any output of the program.
+    #[test]
+    fn a_trace_looks_only_at_the_outputs_asked_for() {
+        let mut b = Builder::new(2, 0);
+        let (x, y) = (b.push(Op::Input(0)), b.push(Op::Input(1)));
+        let ln = b.push(Op::Ln(y));
+        let neg = b.push(Op::Neg(x));
+        let program = b.finish(vec![neg, ln]);
+        assert_eq!(program.trace_outputs(&[1.0, -1.0], &[], 0..1), None, "the first output is fine");
+        assert!(matches!(program.trace_outputs(&[1.0, -1.0], &[], 0..2).unwrap().op, Op::Ln(_)));
+        assert!(matches!(program.trace(&[1.0, -1.0], &[]).unwrap().op, Op::Ln(_)));
     }
 
     #[test]

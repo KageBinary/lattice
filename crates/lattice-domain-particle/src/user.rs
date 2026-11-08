@@ -333,7 +333,7 @@ impl UserLaw {
         if out[..self.kind.outputs()].iter().all(|v| v.is_finite()) {
             return None;
         }
-        self.program.trace(inputs, &self.params)
+        self.program.trace_outputs(inputs, &self.params, 0..self.kind.outputs())
     }
 
     /// A fault at `site`, naming the input when that is what arrived non-finite.
