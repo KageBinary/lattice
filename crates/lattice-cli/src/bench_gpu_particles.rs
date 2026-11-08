@@ -161,6 +161,7 @@ fn run(scale: usize, device: &GpuDevice, lj: bool) -> Result<BenchOutcome, Devic
         },
         profile,
         memory,
+        notes: Vec::new(),
         checks,
     })
 }

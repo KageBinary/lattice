@@ -91,7 +91,8 @@ pub use forces::{
 pub use image::MinimumImage;
 pub use integrator::{Integrator, LangevinBath, PARTICLE_GRAIN};
 pub use neighbors::CellList;
-pub use user::{UserLaw, UserLawKind};
+pub use lattice_expr::LANES;
+pub use user::{Evaluation, UserLaw, UserLawKind};
 pub use thermostat::{ornstein_uhlenbeck_coefficients, rescale_velocities, Thermostat, BOLTZMANN};
 pub use verlet::{Exclusions, NeighborList, VerletList};
 

@@ -22,6 +22,13 @@ pub(crate) static CASES: &[Case] = &[
         run: user_force_bitwise,
     },
     Case {
+        name: "batched_laws_match_scalar_laws_bitwise",
+        domain: "laws",
+        level: Level::CrossScheme,
+        claim: "a charged, truncated pair potential on a particle count that is not a multiple of the batch width gives a bit-identical trajectory on the batched and the scalar path",
+        run: batched_matches_scalar,
+    },
+    Case {
         name: "user_lj_potential_matches_the_builtin_force",
         domain: "laws",
         level: Level::CrossScheme,
@@ -138,6 +145,87 @@ fn user_force_bitwise() -> Outcome {
         .note(format!("100 argon atoms at T* = 0.6, {steps} velocity Verlet steps of {dt:e} s"))
         .note(format!("{moved} of 100 atoms moved from their lattice sites, so the comparison is of a live fluid"))
         .note("the law reads `minimum_image(b.position - a.position)`, the neighbour list's own separation, and its arithmetic in the built-in's order")
+}
+
+/// A charged core: Coulomb-like with a hard `s¹²` wall. It reads both charges, so with
+/// the default energy-shift truncation its `U(r_c)` differs from pair to pair and the
+/// loop evaluates it a second time at the cutoff for each pair.
+const CHARGED_CORE: &str = "potential charged_core(a: particle, b: particle) -> joule {
+    param k: newton * meter^2 / coulomb^2;
+    param epsilon: joule;
+    param sigma: meter;
+    let s = sigma / distance(a, b);
+    return k * a.charge * b.charge / distance(a, b) + 4 * epsilon * s^12;
+}";
+
+/// The same 101 charged particles, run on the scalar path and on the batched path.
+///
+/// 101 is not a multiple of the batch width (101 = 12 × 8 + 5), so the body loop ends on a
+/// partial batch, and the pair loop ends on one unless the pair count happens to be a
+/// multiple (the case prints it). The truncation is member-dependent, which sends the pair loop through its second batch at
+/// the cutoff. Positions, velocities and the total energy must agree to the last bit.
+fn batched_matches_scalar() -> Outcome {
+    use lattice_domain_particle::Evaluation;
+
+    let count = 101;
+    let side = 11;
+    let spacing = 1.12;
+    let size = side as f64 * spacing;
+    let law = user_law(CHARGED_CORE, "charged_core(k=0.3 newton*meter^2/coulomb^2, epsilon=1 joule, sigma=1 meter, cutoff=2.5 meter)");
+    assert!(law.is_member_dependent() && law.truncation().is_some(), "the case needs a member-dependent truncated law");
+    let build = |evaluation: Evaluation| {
+        let mut rng = Pcg32::seed_from_u64(101);
+        let mut domain = ParticleDomain::new("charged", count)
+            .with_integrator(Integrator::VelocityVerlet)
+            .with_bounds(BoundaryBox::periodic([0.0, 0.0], [size, size]))
+            .with_force(law.clone().with_evaluation(evaluation))
+            // A law on one particle as well, so the body loop's partial batch is exercised.
+            .with_force(user_trap_at(size / 2.0));
+        for index in 0..count {
+            let (i, j) = (index % side, index / side);
+            let charge = [1.0, -0.5, 0.75, -1.25, 0.25][index % 5];
+            domain
+                .spawn(
+                    ParticleSpec::at([(i as f64 + 0.5) * spacing, (j as f64 + 0.5) * spacing])
+                        .with_velocity([rng.normal() * 0.3, rng.normal() * 0.3])
+                        .with_mass(1.0)
+                        .with_charge(charge),
+                )
+                .expect("sized for these particles");
+        }
+        domain.initialize();
+        domain
+    };
+    let mut scalar = build(Evaluation::Scalar);
+    let mut batched = build(Evaluation::Batched);
+    let pairs = scalar.neighbors().map_or(0, |list| list.pair_count(scalar.store().pos_x(), scalar.store().pos_y()));
+    let steps = 300;
+    let mut arena = Arena::with_capacity(0);
+    let mut ctx = StepContext::new(&mut arena);
+    for _ in 0..steps {
+        scalar.advance(1e-3, &mut ctx);
+        batched.advance(1e-3, &mut ctx);
+    }
+    let (a, b) = (state_bits(&scalar), state_bits(&batched));
+    let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count()
+        + usize::from(scalar.total_energy().to_bits() != batched.total_energy().to_bits());
+    Outcome::at_most("positions, velocities and total energies differing from the scalar path's", "values", differing as f64, 0.0)
+        .note(format!("{count} particles ({count} mod {} = {}), {pairs} pairs inside the cutoff at the start, {steps} velocity Verlet steps", lattice_domain_particle::LANES, count % lattice_domain_particle::LANES))
+        .note("charges cycle through +1, -0.5, +0.75, -1.25, +0.25 C, so U(r_c) differs pair to pair and is evaluated in a second batch at the cutoff")
+        .note("a harmonic trap on each particle runs the body loop beside the pair loop")
+}
+
+/// [`user_trap`] centred at `(c, c)`.
+fn user_trap_at(c: f64) -> UserLaw {
+    user_law(
+        "potential trap(a: particle) -> joule {
+            param center: vec2<meter>;
+            param stiffness: newton / meter;
+            let offset = a.position - center;
+            return 0.5 * stiffness * dot(offset, offset);
+        }",
+        &format!("trap(center=[{c:e} meter, {c:e} meter], stiffness=0.5 newton/meter)"),
+    )
 }
 
 /// The radial force `−U′(r)` against the built-in's, across the well and the repulsive
