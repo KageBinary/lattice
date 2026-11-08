@@ -691,7 +691,7 @@ rest build on its parameter surface.
 | M6.1a | the law grammar, `let` constants, and a type and unit checker | ✅ |
 | M6.1b | a std-only `lattice-expr` crate: a scalar interpreter, user `force`/`potential` in the particle domain, derived forces and per-law contracts | ✅ |
 | M6.1c | §8.3's reaction form: `stoichiometry`, `heat_release`, rate laws reading concentrations and temperature | ✅ |
-| M6.1d | a batched interpreter bit-identical to the scalar one, non-finite tracing to source, `lattice inspect expr` | next |
+| M6.1d | a batched interpreter bit-identical to the scalar one, non-finite tracing to source, `lattice inspect expr` | ✅ |
 | M6.2 | `observer` laws and the Rust observer SDK — the exit condition's "and observer" | |
 | M6.3 | WGSL lowering, with a budget derived per expression as M4.2 did per kernel | |
 | M6.4 | batch sweeps over `let` constants and `param` bindings, re-bound without recompiling | |
@@ -822,11 +822,11 @@ Validation, four new cases (`lattice validate --filter laws`) and one extended:
   1, 2, 3 and 8 threads.
 
 `lattice bench particles-lj-expr` times `particles-lj`'s fluid with Lennard-Jones as a
-user potential, under the same correctness checks. It runs 3.7× slower than the
-built-in at 1,024 atoms and 4.8× slower at 16,384 (median of three, idle machine). The
-built-in skips the square root and the derivative pass, and M6.1d's batched interpreter
-is where that gap is meant to close. An exact benchmark name now selects that benchmark
-alone; `particles-lj` used to match `particles-lj-expr` too.
+user potential, under the same correctness checks. At M6.1b it ran several times slower
+than the built-in (M6.1d re-measured the gap, below). The built-in skips the square root
+and the derivative pass, and M6.1d's batched interpreter is where that gap was meant to
+close. An exact benchmark name now selects that benchmark alone; `particles-lj` used to
+match `particles-lj-expr` too.
 
 [`examples/damped_spring.lattice`](../examples/damped_spring.lattice) is §8.3's spring.
 1,258 tests, 47 invalid fixtures, 73 validation cases. The compiler's tests assert each
@@ -943,8 +943,8 @@ Validation, three new cases (`lattice validate --filter laws`):
   printed beside the closed form for equal second-order reactants, `c₀ · 80/81`, but not
   asserted against it, so a wrong law of the right sign would pass this case. The
   Michaelis–Menten case is the one that checks a law's rate against an answer.
-- No rate law has been benchmarked. The interpreter's 3.7–4.8× cost is a pair
-  potential's, measured in M6.1b.
+- No rate law has been benchmarked. The interpreter's cost, measured in M6.1b and again
+  in M6.1d, is a pair potential's.
 
 [`examples/neutralization.lattice`](../examples/neutralization.lattice) is §8.3's
 reaction with its heat coupled to a temperature field. Its coupling ledger records 156 J
@@ -975,6 +975,158 @@ that; the coupled heat case in `lattice validate` is the one that checks a ledge
   reversible law at equilibrium has a net rate of zero and a timescale all the same. The
   law's exact derivative with respect to each concentration it reads gives that
   timescale, and for a first-order reaction it is the same number.
+
+### M6.1d — Laws that are fast and that can be looked at ✅
+
+M6.1b made laws run and M6.1c let a reaction have one. Both cost more than they showed:
+the interpreter dispatched once per operation per pair, a run that went non-finite
+named the observation and not the law, and nothing printed what a law had compiled to.
+Spec: [`specs/m6-1d.md`](../specs/m6-1d.md).
+
+- **Origins.** Every operation of a `lattice-expr` program carries the byte range of the
+  source expression that produced it, set by the lowering as it walks the checked law.
+  A derivative's operations inherit the origin of the primal they differentiate, common
+  subexpression elimination keeps the first origin, and a folded constant keeps the
+  expression it came from. `==` and the fingerprint ignore origins, so the fingerprints
+  of every example law are what they were before.
+- **A batched interpreter.** `Program::eval_batch` evaluates `LANES = 8` independent
+  sets of inputs with one dispatch per operation, the op loop outside and the lane loop
+  inside. The scalar `apply` and the batch arms are generated from one macro, so an
+  operation added to one cannot be missing from the other. The bits are the scalar
+  interpreter's for every non-NaN result (Rust does not pin a NaN's payload, so NaNs are
+  compared as NaNs). A seeded property test generates 10,000 programs of 1–200
+  operations covering every operation, with ±0, ±∞, NaN, subnormals and values near
+  overflow in the inputs, at every active lane count from 1 to 8.
+- **Particle loops on the batch.** `for_each_pair_force` gathers pairs from the
+  neighbour list into batches of eight, evaluates each batch, and visits the lanes in
+  gather order, so forces, energy and virial accumulate in the order the scalar loop
+  used. A member-dependent truncation runs a second batch at the cutoff. The body loop
+  batches over particles the same way. `Evaluation::{Scalar, Batched}` selects the path
+  (batched is the default) so the benchmark can run both.
+- **Non-finite tracing (`E0950`).** `lattice run` of a model with a user law that halts
+  as non-finite replays the run with every law watched, and prints a diagnostic under
+  `HALTED:` with the caret under the sub-expression whose operation first produced the
+  value, the operand values, and the pair, particle or cell. A law that is handed a
+  non-finite input says so and blames no operation. It covers `force`, `potential` and
+  rate laws. See [language.md](language.md#when-a-law-produces-a-nan).
+- **`lattice inspect expr <file> [law]`.** Each law's kind, input layout, parameters, one
+  row per operation with its source, outputs, derivative size, register budget,
+  fingerprint and use-site values. It lists `force` and `potential` laws only: a
+  reaction's `rate:` law is an anonymous inline expression with no name to select, so a
+  file whose only laws are rate laws prints "declares no laws". It needed the compiler
+  to keep the type-checked laws and each use site's bound values (`Compiled.laws`,
+  `law_uses`), which a `Box<dyn Domain>` does not expose.
+- **Signed zero.** `min` and `max` pick between equal operands by sign: `min(+0, -0)` is
+  `-0` and `max(+0, -0)` is `+0`. `f64::min` is allowed to return either, and the two
+  interpreters are separate code. This is in both, and in language.md.
+
+**How tracing reaches the failing state, and where it departs from the spec.** The spec
+decided option (a), replay: rebuild the model, step to N−1, and run step N with a trace
+hook on. The code replays from the start and watches *every* step, stopping at the first
+fault. `StopReason::NonFinite` is detected only at a sampled observation, so the step the
+run halts at is not the step the law went wrong in, and tracing step N alone would find
+the state already NaN and blame nothing, which is the outcome that rejected option (c).
+The substance of the decision holds: replay, nothing retained during a step, and the cost
+paid only by a run that failed. Two things differ from "zero hot-path cost": an ordinary
+step pays one flag test per force or rate evaluation, and the replay costs up to a whole
+extra run, with every law re-evaluated each step it watches. The fault's step can precede
+the halt's, and the message gives the fault's own. A rate law is evaluated during step N from the
+state step N−1 left, so for a rate law "at step N" means during step N.
+
+**Benchmark.** `lattice bench particles-lj-expr` (release, one thread, idle machine at
+about 1% load, no game running, all correctness checks passing including a bit-equal final
+total energy between the paths). Each run of the benchmark does one discarded batched
+warm-up, then the timed scalar run, then the timed batched run. Run counts: 3 runs per
+path at 1,024 atoms, 5 runs per path at 16,384 atoms (`--scale 4`), and 3 runs of the
+built-in `particles-lj` at each size. Steps/s are medians over those runs.
+
+| atoms | scalar steps/s | batched steps/s | batched over scalar (median of paired per-run ratios) | built-in `particles-lj` steps/s | batched against built-in (ratio of medians) |
+|---|---|---|---|---|---|
+| 1,024 | 1305.7 | 1515.6 | **1.16×** (1.17, 1.14, 1.16) | 4933.1 | 3.25× slower |
+| 16,384 | 77.2 | 84.2 | **1.03×** (1.03, 1.09, 1.10, 1.03, 1.03) | 339.1 | 4.03× slower |
+
+The speedup column is the median of the paired per-run ratios. The ratio of the median
+rates is 1.16× at 1,024 atoms (the same) and 1.09× at 16,384 (84.2 / 77.2), so the
+16,384 figure depends on which summary is used; both are above 1. The comparisons with
+the built-in are ratios of medians. The scalar path against the built-in, computed the
+same way from the same medians, is 3.78× and 4.39× slower,
+so the batch closed that gap from 3.8× to 3.25× at 1,024 atoms and from 4.4× to 4.03× at
+16,384. The spec's acceptance (batched faster than scalar at both sizes) is met, narrowly
+at 16,384, where an earlier, noisier set of three gave 1.01, 1.04 and 0.95. There was no
+target ratio and this is what was measured. The built-in still skips the square root and
+the derivative pass.
+
+Validation: a new case in `lattice validate --filter laws`, `batched_laws_match_scalar_laws_bitwise`,
+runs 101 charged particles (101 = 12 × 8 + 5, so the body loop ends on a partial batch)
+under a potential whose truncation depends on both charges, for 300 steps on each path,
+and requires positions, velocities and the total energy to agree to the bit. The
+existing bit-identity cases (Lennard-Jones against the built-in, thread-count identity)
+pass unchanged. 1,312 tests, 50 invalid fixtures (no new ones), 77 validation cases
+(88 with `--features gpu`).
+
+### What M6.1d taught us
+
+- **The batch bought little, and the benchmark said so.** The spec named the risk in
+  advance (R2): if the cost is in the neighbour iteration and not the dispatch, batching
+  barely helps. At 16,384 atoms it is 1.03×, within the run-to-run spread. The bench
+  shows where the cost is not, and does not show where it is: no profile was taken, so
+  whether it is neighbour iteration, the gather into batches, or a lane loop the compiler
+  does not vectorize is not known. Superinstructions (spec §5) remain deferred, and a
+  profile should come before them.
+- **A benchmark that runs one path first measures the other path's warm-up.** The first
+  figures were 1.24× and 1.15×. The scalar run came first and paid for cold caches and
+  clocks, which inflated the ratio. A discarded warm-up run, then both, gave 1.16× and
+  1.03×. The figure printed by one run of each is labelled as such, and a recorded figure
+  is a median.
+- **Rust's `min` and `max` are not bit-deterministic on equal operands.** The std
+  documentation says either zero may be returned when `+0.0` and `-0.0` compare equal.
+  The scalar and the batched interpreters are different code, so their zeros could
+  differ. A reviewer who read the documentation found it, and the sign rule now lives in
+  the operation both interpreters share. "Bit-identical" in the docs now says "for every non-NaN
+  result", because Rust does not pin NaN payloads either.
+- **The replay had to watch every step, and the spec's version could not work.** The
+  decision to trace step N alone did not account for where the halt is detected. A halt at a sampled observation is later than the fault, and a trace of step N
+  sees NaN inputs. The test for it asserts that the fault falls between samples.
+- **"The first non-finite operation" was wrong twice before it was right.** The first
+  version blamed the lowest-numbered register whose result was non-finite, which could be
+  a `Select`'s discarded arm: `if x == 0 { 0 } else { 1 / x }` at `x = 0` is guarded, yet
+  when a later term (`ln(y)`) went NaN the diagnostic put its caret under the `1 / x`.
+  The second walked back from the output
+  through the first non-finite operand, so two independent faults (`ln(y)` and `1 / x`)
+  blamed whichever came first as an operand rather than the earlier one. It now follows
+  only the condition and the taken arm of a `Select`, and among the roots of the output's
+  non-finite cone it blames the lowest register. A related bug: the chemistry kinetics
+  recorded a fault from every evaluation while watching, including the finite-difference
+  Jacobian probes at a perturbed state, so the operands it printed might not be on the
+  trajectory. Only evaluations that enter the integration are recorded.
+- **A listing needs the checked law, and a binary needs the compile result to hold it.**
+  `inspect expr` could not be built from a `Box<dyn Domain>`, so `Compiled` now keeps the
+  type-checked laws and each use site's values. Rate laws have no name to select by.
+
+What the tracing does not explain, found by the reviewers and left, each documented in
+[language.md](language.md#when-a-law-produces-a-nan):
+
+- **Cutoff evaluations are unlabelled.** A fault in the second evaluation a
+  member-dependent truncation makes at the cutoff prints its operands with `r` equal to
+  the cutoff, and says nothing about it being the cutoff's.
+- **`du / r` at `r = 0` is engine arithmetic.** A potential's force divides its slope by
+  `r`. A slope finite at `r = 0` still gives a non-finite force there, no operation of
+  the law produced it, so the replay finds nothing to blame and prints nothing.
+- **A parameter that arrives non-finite is `parameter 0`.** The law's parameters carry no
+  names at run time. `inspect expr` has the names, because the compiler does.
+- **A pole exactly at the cutoff.** The compiler refuses a pair potential that is not
+  finite at its cutoff for the particles it samples (`E0405`), which catches the plain
+  case, but a law whose pole sits at a pairing the sample missed would make the truncation
+  constants non-finite from construction and the replay explain nothing.
+- **The `ForceShift` truncation is not tested on the batched path.** The new bitwise case
+  uses the default energy shift. The batched path reads the cutoff values through the same
+  `truncated()` as the scalar path, and no failure was traced, but no test compares the
+  two under `force_shift`.
+
+Docs and spec clean-up from the same reviews: the replay deviation above is recorded in
+the spec; the rate-law step wording; "pays nothing" became "pays one flag test"; and
+`docs/architecture.md` names the `lattice-ir` → `lattice-expr` dependency, new with
+`LawFault`. The spec's `inspect expr` example said 14 inputs; the program has 15.
 
 ## Outside the milestones: the playground
 

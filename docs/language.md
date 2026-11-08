@@ -762,9 +762,19 @@ A pair law's force is applied equal and opposite: the engine adds the returned f
 written in a built-in's operation order therefore reproduces that built-in to the bit,
 and the validation suite checks this for Lennard-Jones.
 
-**Speed.** A law runs in an interpreter. `lattice bench particles-lj-expr` (Lennard-Jones
-as a natural-form `potential`) runs at 3.7× the built-in's step time with 1,024 atoms
-and 4.8× with 16,384 (median of three, idle machine), under the same correctness checks.
+**Speed.** A law runs in an interpreter, and the particle domain's pair and body loops
+run it a batch of eight pairs (or particles) at a time: one dispatch per operation covers
+all eight. The batch changes no bit of a non-NaN result and no order of accumulation, so
+a law written in a built-in's operation order still reproduces it exactly.
+`lattice bench particles-lj-expr` (Lennard-Jones as a natural-form `potential`) takes
+3.25× the built-in's step time with 1,024 atoms and 4.03× with 16,384 (ratios of medians:
+three runs per path at 1,024 atoms, five per path for the law's scalar and batched runs at
+16,384, and three of the built-in at each size; idle machine, one thread), under the same
+correctness checks. That is 1.16× and 1.03× faster than the same law evaluated one pair at
+a time, which the benchmark also runs and prints (medians of the paired per-run ratios;
+the ratio of the median rates at 16,384 is 1.09×). The gain is small, and nearly within
+noise at 16,384 atoms, which suggests that most of the cost lies outside the dispatch the batch removes. That was not profiled;
+the roadmap's M6.1d section has the table and what is and is not known.
 
 ### The timestep
 
@@ -785,15 +795,57 @@ negative work. Positive work is `W0317`: almost always a sign error, as in spec 
 example. A force across the relative velocity, such as a magnetic one, does no work and
 passes.
 
+### Looking at a compiled law
+
+```console
+$ lattice inspect expr examples/damped_spring.lattice [law]
+```
+
+compiles the file as `lattice check` does and prints each `force` or `potential` law
+(or only the one named) as the interpreter will run it:
+
+```
+law spring: pair force, 15 inputs (d.x d.y r a.position.x … b.charge), 3 params (rest_length stiffness damping)
+  r0   input  d.x           | minimum_image(b.position - a.position)
+  ...
+  r9   mul    r8 r7         | stiffness * extension
+  ...
+  outputs: Fx = r27, Fy = r28     derivative: none    registers 29 / 512
+  fingerprint 0x8cd5c476134692ea
+  used by `beads` (SI values): rest_length = 1, stiffness = 40, damping = 0.2
+```
+
+Each row is a register, its operation and operands, and the source text the operation
+came from, cut to one line. The listing shows the program after common subexpressions
+are shared and constants folded, so a row can be used by several later ones and its
+source is that of the first expression to need it. A pair potential's program also
+holds its exact derivative; the line of outputs gives the register of `U` and of
+`dU/dr`, and says how many of the operations are the energy alone. The fingerprint is
+the program's identity, blind to where in the file it was written. For each use site the
+listing gives the parameter values it was bound to, in SI.
+
+An unknown law name is a command-line error (exit 2) that lists the laws the file
+declares. A file that does not compile prints its diagnostics and exits 1, as
+`lattice check` does.
+
+**Rate laws are not listed.** The listing is by law name, and a reaction's `rate:` law is
+an anonymous expression written inline, so there is nothing to name. `inspect expr` shows
+force and potential laws only; a file whose only laws are rate laws prints
+"declares no laws". A rate law's source span is still traced when it produces a
+non-finite value (below).
+
 ### When a law produces a NaN
 
 A run halts at the first non-finite observation (NFR-007), and the halt names the
 observation, not the law. When a law the model wrote is responsible, `lattice run` goes on
 to say which one, and where in its source. It compiles the model again and replays the
 run, which is bit-reproducible, with every user law watched; nothing is kept during the
-run itself, so a run that does not fail pays nothing. The replay stops at the first step
-in which a law makes a non-finite value out of finite ones, and the explanation is printed
-under the `HALTED:` line:
+run itself, so a run that does not fail pays one flag test per force or rate evaluation
+and nothing else. The replay watches every step, not only the last: the halt is detected
+at a sampled observation, which can be several steps after the law went wrong, and by
+then the state is usually NaN already. It stops at the first step in which a law makes a
+non-finite value out of finite ones, and the explanation is printed under the `HALTED:`
+line:
 
 ```
 error[E0950]: law `pole` produced a non-finite value
@@ -812,7 +864,28 @@ less often than steps. A law that was *handed* a non-finite value, because the s
 reads was already NaN, is reported as that (`was handed a non-finite value`, the caret
 under the member it read) and no operation of it is blamed: look at what computed the
 state. A model with no user law is not replayed. Rate laws are explained the same way,
-per cell.
+per cell, with one difference in the step: a rate is evaluated while a step is being
+taken, from the state the step before left, so for a rate law "at step N" means *during*
+step N, and the cell's concentrations are those at the end of step N−1.
+
+What the explanation does not do:
+- **Operands at the cutoff are not labelled.** A pair potential that reads `mass` or
+  `charge` is evaluated a second time at its cutoff, for each pair, and a fault there
+  prints its operands like any other, with `r` equal to the cutoff; nothing says the
+  evaluation was the cutoff's.
+- **It explains the law, not the engine around it.** The force of a potential is
+  `U′(r)/r` times the separation, and a `U′` that is finite at `r = 0` still gives a
+  non-finite force there. That division is the engine's, not an operation of the law, so
+  nothing is blamed and the run halts without an `E0950`.
+- **A pole exactly at the cutoff is not explained by the replay.** If a pair potential
+  is not finite at its own cutoff, its truncation constants (the energy and slope
+  there) are not finite and every force is bad from the start. The compiler refuses
+  that for the particles it samples (`E0405`), so the replay can meet it
+  only when the sample missed the pairing that has the pole, or for a law built outside
+  the compiler. It then prints nothing: nothing false is said, but nothing is
+  explained.
+- **A parameter that arrives non-finite is named by position**, `parameter 0`, not by
+  its name in the law. Inputs are named from their layout (`d.x`, `a.position.x`).
 
 | Code | When |
 |---|---|
@@ -859,6 +932,13 @@ bare `0` takes the dimension of what it meets, as it does in a setting, so
 `max(x, 0)` and `if r < 0 { … }` mean what they say. A name followed by `(` is a call
 even with a space between, so `4 epsilon (s - 1)` is refused with the fix
 (`epsilon * (s - 1)`) in the message.
+
+**Signed zero in `min` and `max`.** When the two operands are equal, the result is picked
+by sign, not left to the platform: `min(+0, -0)` is `-0` and `max(+0, -0)` is `+0`, in
+either argument order. Rust's `f64::min` and `f64::max` may return either zero when they
+compare equal, and the scalar and batched interpreters are separate code, so without this
+they could disagree by a sign bit. Any other pair is `f64::min` or `f64::max`, so a NaN
+operand is ignored in favour of the other, as it always was.
 
 | Code | When |
 |---|---|

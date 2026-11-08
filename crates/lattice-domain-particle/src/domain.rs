@@ -438,7 +438,7 @@ impl ParticleDomain {
     ///
     /// With `watch`, each law is then asked to explain a non-finite value at this
     /// configuration, and the first explanation is kept. That is the replay's hook; an
-    /// ordinary step passes `None` and pays nothing.
+    /// ordinary step passes `None` and pays one flag test.
     fn evaluate_forces(
         store: &mut ParticleStore,
         forces: &[Box<dyn ForceLaw>],
