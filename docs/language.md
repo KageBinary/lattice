@@ -785,6 +785,39 @@ negative work. Positive work is `W0317`: almost always a sign error, as in spec 
 example. A force across the relative velocity, such as a magnetic one, does no work and
 passes.
 
+### When a law produces a NaN
+
+A run halts at the first non-finite observation (NFR-007), and the halt names the
+observation, not the law. When a law the model wrote is responsible, `lattice run` goes on
+to say which one, and where in its source. It compiles the model again and replays the
+run, which is bit-reproducible, with every user law watched; nothing is kept during the
+run itself, so a run that does not fail pays nothing. The replay stops at the first step
+in which a law makes a non-finite value out of finite ones, and the explanation is printed
+under the `HALTED:` line:
+
+```
+error[E0950]: law `pole` produced a non-finite value
+ --> pole.lattice:6:14
+  |
+6 |       return 1 joule * meter / (distance(a, b) - 1 meter);
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ div gave inf
+  = note: operands: 1, 0 (every one finite; this is the first operation to go wrong)
+  = note: evaluated for pair (0, 1) of `pair`, in the initial state, before any step
+```
+
+The caret is under the sub-expression whose operation failed, the operands are the values it
+read, and the note says which pair, particle or cell evaluated the law and at which step.
+That step can be earlier than the one the run halted at, since observations are sampled
+less often than steps. A law that was *handed* a non-finite value, because the state it
+reads was already NaN, is reported as that (`was handed a non-finite value`, the caret
+under the member it read) and no operation of it is blamed: look at what computed the
+state. A model with no user law is not replayed. Rate laws are explained the same way,
+per cell.
+
+| Code | When |
+|---|---|
+| `E0950` | at run time, not compile time: a user law (a `force`, a `potential` or a reaction's `rate:`) produced, or was handed, a non-finite value |
+
 ### Kinds, and what each promises
 
 What each kind may read is enforced by the checker, and the read restrictions are what
@@ -891,7 +924,8 @@ visualize probability_density;         // the domain picks an encoding
 | `E02xx` | also: unknown keyword value (`E0208`) |
 | `E021x` | geometry and chemistry: unknown builtin (`E0210`), invalid shape or formula (`E0211`), unbalanced reaction (`E0212`) |
 | `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range; in laws, `E0410`–`E0415` (see [User-defined laws](#user-defined-laws)) |
-| `E09xx` | not implemented yet — the message names the milestone |
+| `E0900` | not implemented yet — the message names the milestone |
+| `E0950` | a user law produced a non-finite value: reported by `lattice run` after a run halts, not by the compiler (see [When a law produces a NaN](#when-a-law-produces-a-nan)) |
 | `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), charges that do not suit a Coulomb law (`W0311`–`W0312`), a name that hides a unit (`W0313`), user laws (`W0314`–`W0317`), and rate laws (`W0318`–`W0319`) |
 
 Every rejection carries a source position and either a suggested fix or the rule it

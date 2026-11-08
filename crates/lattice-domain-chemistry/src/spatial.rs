@@ -40,12 +40,14 @@
 //! edge, because it needs an areal heat capacity that is a property of neither domain.
 
 use lattice_domain_grid2d::{Diffusivity, HeatDomain, TimeScheme};
+use lattice_expr::Op;
 use lattice_ir::{
-    Arena, BoundarySet, Domain, FidelityProfile, Grid2d, Invariant, ObservationKind, Observations,
-    Precision, ScalarField, SolverContract, StabilityReason, StableStep, StepContext,
+    Arena, BoundarySet, Domain, FaultSite, FidelityProfile, Grid2d, Invariant, LawFault,
+    ObservationKind, Observations, Precision, ScalarField, SolverContract, StabilityReason,
+    StableStep, StepContext,
 };
 
-use crate::kinetics::{Kinetics, KineticsReport};
+use crate::kinetics::{Kinetics, KineticsReport, RateFault};
 use crate::network::ReactionNetwork;
 
 /// The temperature a mixture reacts at when nothing says otherwise, K: 25 °C.
@@ -74,6 +76,8 @@ pub struct ReactingMixture {
     exhausted_cells: usize,
     /// The stiffest ratio seen anywhere on the grid last step.
     worst_stiffness: f64,
+    /// The first rate law to go non-finite since [`Domain::trace_laws`] was turned on.
+    fault: Option<LawFault>,
 }
 
 impl ReactingMixture {
@@ -113,6 +117,7 @@ impl ReactingMixture {
             last_report: KineticsReport::default(),
             exhausted_cells: 0,
             worst_stiffness: 0.0,
+            fault: None,
         }
     }
 
@@ -232,6 +237,24 @@ impl ReactingMixture {
             .sum()
     }
 
+    /// A rate law's fault as the runtime reports it, for the cell `(i, j)`. A
+    /// concentration that arrived non-finite is named by its species and a temperature
+    /// that did by `temperature`.
+    fn rate_fault(&self, rate: RateFault, i: usize, j: usize) -> LawFault {
+        let input = match rate.at.op {
+            Op::Input(n) => Some(format!("c({})", self.kinetics.network().species()[n as usize].name)),
+            Op::Param(_) => Some("temperature".to_string()),
+            _ => None,
+        };
+        LawFault {
+            domain: self.name.clone(),
+            law: rate.reaction,
+            site: FaultSite::Cell(i, j),
+            at: rate.at,
+            input,
+        }
+    }
+
     /// Run the reaction in every cell for `dt`, accumulating the energy released.
     ///
     /// Both Strang half-steps accumulate into the same buffer, so what comes out covers
@@ -255,6 +278,12 @@ impl ReactingMixture {
                 let temperature = self.temperature_at(i, j);
 
                 let report = self.kinetics.advance(&mut self.cell, temperature, dt);
+                // Taken after every cell, so what is kept names the cell it happened in.
+                if let Some(rate) = self.kinetics.take_fault()
+                    && self.fault.is_none()
+                {
+                    self.fault = Some(self.rate_fault(rate, i, j));
+                }
                 // The *energy* the reaction released over this half-step, J/m². The
                 // integrator accumulated it alongside the concentrations, so it is the
                 // integral of the power rather than a sample of it — which matters
@@ -415,6 +444,16 @@ impl Domain for ReactingMixture {
     fn prepare(&mut self, _ctx: &mut StepContext<'_>) {
         self.exhausted_cells = 0;
         self.worst_stiffness = 0.0;
+    }
+
+    fn trace_laws(&mut self, on: bool) -> bool {
+        self.kinetics.watch(on);
+        self.fault = None;
+        self.kinetics.network().reactions().iter().any(|reaction| reaction.expression.is_some())
+    }
+
+    fn law_fault(&self) -> Option<LawFault> {
+        self.fault.clone()
     }
 
     fn advance(&mut self, dt: f64, ctx: &mut StepContext<'_>) {
@@ -599,6 +638,65 @@ mod tests {
         for _ in 0..steps {
             mixture.step(dt, &mut arena);
         }
+    }
+
+    /// `A -> B` at the rate `1 / c(A)`, written as the compiler lowers it, each operation
+    /// at the byte range it would have in the source.
+    fn runaway_network() -> ReactionNetwork {
+        use lattice_expr::{Builder, Origin};
+        let at = |start, end| Some(Origin { start, end });
+        let mut b = Builder::new(2, 1);
+        b.at(at(30, 34));
+        let raw = b.push(Op::Input(0));
+        let zero = b.constant(0.0);
+        let c = b.push(Op::Max(raw, zero));
+        b.at(at(26, 34));
+        let one = b.constant(1.0);
+        let rate = b.push(Op::Div(one, c));
+        let law = crate::rate::RateExpression::new(b.finish(vec![rate]), "1 / c(A)");
+
+        let mut network = ReactionNetwork::new();
+        network.add_species(Species::new("A").with_formula("C").unwrap());
+        network.add_species(Species::new("B").with_formula("C").unwrap());
+        network.add_reaction(Reaction::with_expression(
+            "runaway",
+            vec![Term::new(0, 1.0)],
+            vec![Term::new(1, 1.0)],
+            law,
+        ));
+        network
+    }
+
+    /// A rate law that divides by an exhausted reactant is explained when asked to be,
+    /// with the cell, the reaction, the operation and what it read; an ordinary run
+    /// records nothing.
+    #[test]
+    fn a_rate_law_that_runs_out_of_its_reactant_is_traced_to_the_cell() {
+        let build = || {
+            let mut mixture = ReactingMixture::new("pot", Grid2d::new(4, 3, [1.0, 1.0]), runaway_network());
+            // Every cell holds A except (2, 1), where it has run out.
+            mixture.concentration_mut(0).unwrap().fill_interior(1.0);
+            mixture.concentration_mut(0).unwrap().set(2, 1, 0.0);
+            mixture
+        };
+
+        let mut quiet = build();
+        quiet.react(0.01, true);
+        assert!(quiet.law_fault().is_none(), "nothing is recorded unless asked");
+
+        let mut traced = build();
+        traced.trace_laws(true);
+        traced.react(0.01, true);
+        let fault = traced.law_fault().expect("1 / 0 in one cell");
+        assert_eq!((fault.domain.as_str(), fault.law.as_str()), ("pot", "runaway"));
+        assert_eq!(fault.site, FaultSite::Cell(2, 1));
+        assert!(matches!(fault.at.op, Op::Div(..)));
+        assert_eq!(fault.at.origin, Some(lattice_expr::Origin { start: 26, end: 34 }));
+        assert_eq!(fault.at.operands, [1.0, 0.0]);
+        assert!(!fault.is_input());
+
+        traced.trace_laws(false);
+        assert!(traced.law_fault().is_none(), "turning it off forgets");
     }
 
     /// The claim M3's exit condition rests on: a balanced network on a closed grid

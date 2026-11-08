@@ -28,7 +28,7 @@
 //! [`RateExpression`]: compiled by the model compiler, evaluated here, and free to be
 //! Michaelis–Menten, inhibited, or anything else a local formula can say.
 
-use lattice_expr::{Op, Program, MAX_REGISTERS};
+use lattice_expr::{NonFiniteAt, Op, Program, MAX_REGISTERS};
 
 /// The molar gas constant, J/(mol·K).
 ///
@@ -265,6 +265,17 @@ impl RateExpression {
     pub fn rate(&self, concentrations: &[f64], temperature: f64) -> f64 {
         let mut out = [0.0];
         if self.evaluate(&self.program, concentrations, temperature, &mut out) { out[0] } else { 0.0 }
+    }
+
+    /// The first operation of the law to make a value non-finite at these concentrations
+    /// and this temperature: where in the model's source the rate went bad (spec M6.1d
+    /// §4.4). `None` when every value is finite, or the concentration vector is the wrong
+    /// length. Allocates; for explaining a failure, never for integrating.
+    pub fn explain_non_finite(&self, concentrations: &[f64], temperature: f64) -> Option<NonFiniteAt> {
+        if concentrations.len() != self.program.input_count() {
+            return None;
+        }
+        self.program.trace(concentrations, &[temperature])
     }
 
     /// The fastest pseudo-first-order rate in the law, 1/s: the largest `|∂R/∂c_j|`.
@@ -504,6 +515,33 @@ mod tests {
         let program = b.finish(vec![product]);
         assert!(program.fits(), "{} operations", program.ops().len());
         assert!(RateExpression::partials_fit(&program).is_err());
+    }
+
+    /// `1 / c(A)` as `A` runs out: the division is the first non-finite value, at the
+    /// range the compiler gave it, with the operands that went in.
+    #[test]
+    fn a_rate_law_is_traced_to_the_operation_that_went_non_finite() {
+        use lattice_expr::{Builder, Origin};
+        let at = |start, end| Some(Origin { start, end });
+        let mut b = Builder::new(1, 1);
+        b.at(at(8, 12));
+        let raw = b.push(Op::Input(0));
+        let zero = b.constant(0.0);
+        let c = b.push(Op::Max(raw, zero));
+        b.at(at(2, 12));
+        let one = b.constant(1.0);
+        let rate = b.push(Op::Div(one, c));
+        let law = RateExpression::new(b.finish(vec![rate]), "1 / c(A)");
+
+        assert_eq!(law.explain_non_finite(&[0.5], 300.0), None);
+        let found = law.explain_non_finite(&[0.0], 300.0).expect("1/0");
+        assert_eq!(found.origin, at(2, 12));
+        assert_eq!(found.operands, [1.0, 0.0]);
+        assert!(matches!(found.op, Op::Div(..)));
+        // Below zero the floor makes it the same division by zero.
+        assert_eq!(law.explain_non_finite(&[-1e-9], 300.0), Some(found));
+        // A vector of the wrong length is the rate of zero it always was.
+        assert_eq!(law.explain_non_finite(&[0.0, 1.0], 300.0), None);
     }
 
     #[test]

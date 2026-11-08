@@ -1644,6 +1644,7 @@ dependencies = [
  "lattice-domain-grid2d",
  "lattice-domain-particle",
  "lattice-domain-quantum2d",
+ "lattice-expr",
  "lattice-ir",
  "lattice-observe",
  "lattice-runtime",
@@ -1740,6 +1741,7 @@ name = "lattice-ir"
 version = "0.1.0"
 dependencies = [
  "lattice-cpu",
+ "lattice-expr",
  "lattice-units",
 ]
 
@@ -1767,6 +1769,7 @@ name = "lattice-runtime"
 version = "0.1.0"
 dependencies = [
  "lattice-coupling",
+ "lattice-expr",
  "lattice-ir",
  "lattice-observe",
 ]

@@ -19,10 +19,11 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use lattice_compiler::compile_source;
-use lattice_ir::{Executor, RenderChannel};
+use lattice_expr::Op;
+use lattice_ir::{Executor, LawFault, RenderChannel};
 use lattice_observe::phase;
 use lattice_runtime::{RunConfig, Simulation};
-use lattice_syntax::SourceFile;
+use lattice_syntax::{Diagnostic, SourceFile, Span};
 
 use crate::args::Args;
 use crate::render;
@@ -134,6 +135,12 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
         }
         println!();
         println!("{}", outcome.stop.describe());
+        if let lattice_runtime::StopReason::NonFinite { step, .. } = outcome.stop
+            && let Some(fault) = explain_halt(&file, executor_from(args)?, outcome.timestep, step)
+        {
+            println!();
+            print!("{}", fault.render(&file));
+        }
         println!();
         print!("{}", coupling_report(&simulation));
         print!("{}", outcome.artifact.summary());
@@ -149,6 +156,88 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
     }
 
     Ok(exit_code(&outcome.stop))
+}
+
+/// Replay a run that halted as non-finite and, if a law the model wrote is responsible,
+/// say which operation of it and where (diagnostic `E0950`, spec M6.1d §4.4).
+///
+/// Runs are bit-reproducible, so the failure is reached again by compiling the model
+/// afresh and stepping it `step` times at `timestep` with every domain watching its user
+/// laws. Nothing is kept during an ordinary run to make this possible, which is why it
+/// costs one extra run, and only when a run has already failed. `None` means no user law
+/// is to blame: the model has none, or the first non-finite value came from elsewhere.
+pub fn explain_halt(
+    file: &SourceFile,
+    executor: Executor,
+    timestep: f64,
+    step: u64,
+) -> Option<Diagnostic> {
+    let (compiled, diagnostics) = compile_source(file);
+    if diagnostics.has_errors() {
+        return None;
+    }
+    let compiled = compiled?;
+    let mut replay =
+        Simulation::coupled(compiled.model, compiled.domains, compiled.coupler).with_executor(executor);
+    let fault = replay.trace_non_finite(timestep, step)?;
+    let clock = replay.clock();
+    Some(fault_diagnostic(&fault, clock.step, clock.time))
+}
+
+/// A number as a message shows it: plain when it reads easily, else in exponent form.
+fn show(value: f64) -> String {
+    if value == 0.0 || !value.is_finite() || (1e-3..1e6).contains(&value.abs()) {
+        format!("{value}")
+    } else {
+        format!("{value:e}")
+    }
+}
+
+/// The name of an operation as a message says it: `div`, `ln`, `powi`.
+fn op_name(op: Op) -> String {
+    let debug = format!("{op:?}");
+    debug.split('(').next().unwrap_or(&debug).to_lowercase()
+}
+
+/// `E0950`: the first non-finite value a user law produced, as a diagnostic whose caret
+/// is under the sub-expression that produced it.
+fn fault_diagnostic(fault: &LawFault, step: u64, time: f64) -> Diagnostic {
+    let at = &fault.at;
+    let (message, label) = match &fault.input {
+        Some(input) => (
+            format!("law `{}` was handed a non-finite value", fault.law),
+            format!("`{input}` was already {}", show(at.value)),
+        ),
+        None => (
+            format!("law `{}` produced a non-finite value", fault.law),
+            format!("{} gave {}", op_name(at.op), show(at.value)),
+        ),
+    };
+    let mut diagnostic = Diagnostic::error(message).with_code("E0950");
+    diagnostic = match at.origin {
+        Some(origin) => diagnostic.at(Span::new(origin.start, origin.end), label),
+        None => diagnostic.note(label),
+    };
+    diagnostic = if fault.is_input() {
+        diagnostic.note(
+            "the law was given this value, so none of its operations produced it: look at what \
+             computed the input",
+        )
+    } else if at.operands.is_empty() {
+        diagnostic.note("it is a constant the compiler folded from this expression")
+    } else {
+        let operands: Vec<String> = at.operands.iter().map(|&v| show(v)).collect();
+        diagnostic.note(format!(
+            "operands: {} (every one finite; this is the first operation to go wrong)",
+            operands.join(", ")
+        ))
+    };
+    let when = if step == 0 {
+        "in the initial state, before any step".to_string()
+    } else {
+        format!("at step {step} (t = {time:e} s)")
+    };
+    diagnostic.note(format!("evaluated for {} of `{}`, {when}", fault.site.describe(), fault.domain))
 }
 
 /// Build the executor `--threads` asks for.
@@ -485,6 +574,212 @@ project endless {
         let mut a = args("run --quiet --steps 5");
         a.positional.push(path);
         assert_eq!(run(&a).unwrap(), ExitCode::SUCCESS);
+    }
+
+    /// Compile and run `source` until it halts, and explain the halt: the step it halted
+    /// at, and the diagnostic the replay produced.
+    fn halted(source: &str) -> (SourceFile, u64, Option<Diagnostic>) {
+        let file = SourceFile::new("fixture.lattice", source);
+        let (compiled, diagnostics) = compile_source(&file);
+        assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+        let compiled = compiled.expect("a model");
+        let config = RunConfig::from_model(&compiled.model);
+        let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+        let outcome = simulation.run(&config);
+        let lattice_runtime::StopReason::NonFinite { step, .. } = outcome.stop else {
+            panic!("expected a halt, got {:?}", outcome.stop)
+        };
+        let diagnostic = explain_halt(&file, Executor::sequential(), outcome.timestep, step);
+        (file, step, diagnostic)
+    }
+
+    /// The source text under the diagnostic's caret.
+    fn underlined<'a>(file: &'a SourceFile, diagnostic: &Diagnostic) -> &'a str {
+        let span = diagnostic.primary_span();
+        &file.text()[span.start as usize..span.end as usize]
+    }
+
+    fn note_with<'a>(diagnostic: &'a Diagnostic, needle: &str) -> &'a str {
+        diagnostic
+            .notes
+            .iter()
+            .find(|note| note.contains(needle))
+            .unwrap_or_else(|| panic!("no note with `{needle}` in {:?}", diagnostic.notes))
+    }
+
+    /// Spec M6.1d §7, the pair potential: `1 / (r − 1)` with the atoms at distance 1.
+    #[test]
+    fn a_pair_potential_dividing_by_zero_is_explained() {
+        let (file, _, diagnostic) = halted(
+            "project pole {
+  dimensions: 2;
+  duration: 1 second;
+  potential pole(a: particle, b: particle) -> joule {
+      return 1 joule * meter / (distance(a, b) - 1 meter);
+  }
+  particles pair {
+    count: 2;
+    region: [4 meter, 4 meter];
+    spacing: 1 meter;
+    mass: 1 kilogram;
+    force: pole(cutoff=2 meter);
+  }
+  solve dynamics(pair) with velocity_verlet(dt=0.01 second);
+  observe pair every 0.05 second;
+}",
+        );
+        let diagnostic = diagnostic.expect("a user law is to blame");
+        assert_eq!(diagnostic.code.as_deref(), Some("E0950"));
+        assert_eq!(diagnostic.message, "law `pole` produced a non-finite value");
+        // The caret is under the whole quotient, the operation that divided by zero.
+        let start = file.text().find("1 joule * meter /").unwrap() as u32;
+        let expression = "1 joule * meter / (distance(a, b) - 1 meter)";
+        assert_eq!(diagnostic.primary_span(), Span::new(start, start + expression.len() as u32));
+        assert_eq!(underlined(&file, &diagnostic), expression);
+        assert_eq!(diagnostic.primary.as_ref().unwrap().message, "div gave inf");
+        assert!(note_with(&diagnostic, "operands").contains("operands: 1, 0 "), "{:?}", diagnostic.notes);
+        assert!(note_with(&diagnostic, "pair (0, 1) of `pair`").contains("initial state"));
+        let rendered = diagnostic.render(&file);
+        assert!(rendered.starts_with("error[E0950]"), "{rendered}");
+    }
+
+    /// The body force: `ln(px)` with the bead crossing to a negative position, found at a
+    /// step before the one the run halted at, since observations are sampled sparsely.
+    #[test]
+    fn a_body_force_taking_the_log_of_a_negative_position_is_explained() {
+        let (file, halt_step, diagnostic) = halted(
+            "project lnx {
+  dimensions: 2;
+  duration: 5 second;
+  force pull(a: particle) -> vec2<newton> {
+      return vec2(1 newton * ln(a.position.x / 1 meter), 0 newton);
+  }
+  particles bead {
+    count: 1;
+    region: [4 meter, 4 meter];
+    spacing: 1 meter;
+    mass: 1 kilogram;
+    force: pull();
+  }
+  solve dynamics(bead) with velocity_verlet(dt=0.01 second);
+  observe bead every 0.05 second;
+}",
+        );
+        let diagnostic = diagnostic.expect("a user law is to blame");
+        assert_eq!(diagnostic.code.as_deref(), Some("E0950"));
+        assert_eq!(underlined(&file, &diagnostic), "ln(a.position.x / 1 meter)");
+        assert_eq!(diagnostic.primary.as_ref().unwrap().message, "ln gave NaN");
+        let operands = note_with(&diagnostic, "operands:");
+        let value: f64 = operands
+            .trim_start_matches("operands: ")
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("one operand");
+        assert!(value < 0.0 && value.is_finite(), "{operands}");
+        let when = note_with(&diagnostic, "particle 0 of `bead`");
+        let step: u64 = when.split("at step ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+        assert!(step <= halt_step, "the fault is at or before the halt: {step} against {halt_step}");
+        assert!(step % 5 != 0 || step == halt_step, "found between samples, not only at one: {step}");
+    }
+
+    /// The rate law: `k2 / c(A)` once `A` has run out.
+    #[test]
+    fn a_rate_law_dividing_by_an_exhausted_reactant_is_explained() {
+        let (file, _, diagnostic) = halted(
+            "project runout {
+  dimensions: 2;
+  fidelity: engineering_2d;
+  duration: 5 second;
+  let vmax = 5 mole / (meter^2 second);
+  let km = 0.1 mole / meter^2;
+  let k2 = 0.001 mole^2 / (meter^4 second);
+  grid dish { size: [2, 2]; extent: [1 meter, 1 meter]; }
+  domain chemistry mix { grid: dish; temperature: 298.15 kelvin; }
+  species A on dish = 1 mole / meter^2 { formula: C; diffusivity: 0 meter^2 / second; boundary: insulated; }
+  species B on dish = 0 mole / meter^2 { formula: C; diffusivity: 0 meter^2 / second; boundary: insulated; }
+  species C on dish = 0 mole / meter^2 { formula: C; diffusivity: 0 meter^2 / second; boundary: insulated; }
+  reaction consume {
+    stoichiometry: A -> B;
+    rate: vmax * c(A) / (km + c(A));
+  }
+  reaction leak {
+    stoichiometry: B -> C;
+    rate: k2 / c(A);
+  }
+  solve reactions(mix) with strang(dt = 0.1 second);
+  observe mix every 0.5 second;
+}",
+        );
+        let diagnostic = diagnostic.expect("a rate law is to blame");
+        assert_eq!(diagnostic.code.as_deref(), Some("E0950"));
+        assert_eq!(diagnostic.message, "law `leak` produced a non-finite value");
+        assert_eq!(underlined(&file, &diagnostic), "k2 / c(A)");
+        assert_eq!(diagnostic.primary.as_ref().unwrap().message, "div gave inf");
+        assert!(note_with(&diagnostic, "operands").contains("operands: 0.001, 0 "), "{:?}", diagnostic.notes);
+        assert!(note_with(&diagnostic, "cell (").contains("of `mix`"));
+    }
+
+    /// A non-finite value that is already in the state a law reads is the state's fault,
+    /// not the law's: the diagnostic blames the input and no operation. Here a built-in
+    /// Lennard-Jones force between atoms 1e-60 m apart overflows, positions go NaN, and the
+    /// tether law, perfectly well-behaved, is handed them.
+    #[test]
+    fn a_law_handed_a_nan_blames_the_input_and_no_operation() {
+        let (file, _, diagnostic) = halted(
+            "project inp {
+  dimensions: 2;
+  duration: 1 second;
+  force tether(a: particle) -> vec2<newton> {
+      param k: newton / meter;
+      return vec2(-1 * k * a.position.x, 0 newton);
+  }
+  particles pair {
+    count: 2;
+    region: [4 meter, 4 meter];
+    spacing: 1e-60 meter;
+    mass: 1 kilogram;
+    force: lennard_jones(epsilon=1 joule, sigma=1 meter, cutoff=2.5 meter);
+    force: tether(k=1 newton / meter);
+  }
+  solve dynamics(pair) with velocity_verlet(dt=0.01 second);
+  observe pair every 0.01 second;
+}",
+        );
+        let diagnostic = diagnostic.expect("the tether was handed a NaN");
+        assert_eq!(diagnostic.code.as_deref(), Some("E0950"));
+        assert_eq!(diagnostic.message, "law `tether` was handed a non-finite value");
+        // The input was pushed where the member `a.position` was read; `.x` selects from it.
+        assert_eq!(underlined(&file, &diagnostic), "a.position");
+        assert_eq!(diagnostic.primary.as_ref().unwrap().message, "`a.position.x` was already NaN");
+        assert!(note_with(&diagnostic, "none of its operations produced it").contains("input"));
+        assert!(
+            diagnostic.notes.iter().all(|note| !note.contains("operands")),
+            "no operation is blamed: {:?}",
+            diagnostic.notes
+        );
+    }
+
+    /// A model with no user law has nothing to explain, and is not replayed.
+    #[test]
+    fn a_halt_with_no_user_law_has_no_explanation() {
+        let (_, _, diagnostic) = halted(
+            "project blowup {
+  dimensions: 2;
+  duration: 1 second;
+  particles pair {
+    count: 2;
+    region: [4 meter, 4 meter];
+    spacing: 1e-60 meter;
+    mass: 1 kilogram;
+    force: lennard_jones(epsilon=1 joule, sigma=1 meter, cutoff=2.5 meter);
+  }
+  solve dynamics(pair) with velocity_verlet(dt=0.01 second);
+  observe pair every 0.01 second;
+}",
+        );
+        assert!(diagnostic.is_none());
     }
 
     #[test]

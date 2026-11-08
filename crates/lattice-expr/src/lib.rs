@@ -37,6 +37,15 @@
 //! ignore them, and two laws that compute the same thing are the same program wherever
 //! they were written.
 //!
+//! # A non-finite value can be traced to the operation that made it
+//!
+//! [`Program::trace`] re-runs a program on one set of inputs and follows a non-finite
+//! output back, through the values that carried it, to the operation that turned finite
+//! operands into an infinity or a NaN, returning the operation, its [`Origin`] and the
+//! operands it read. When two independent faults meet, the one computed first is reported. A
+//! non-finite value a `Select` discarded is not blamed. The domains call it, after a run
+//! has halted, on the inputs that produced the failure.
+//!
 //! # No allocation while evaluating
 //!
 //! [`Program::eval`] runs on a register array the caller owns. Laws are small, and
@@ -77,6 +86,23 @@ pub struct Origin {
     pub start: u32,
     /// One past the last byte.
     pub end: u32,
+}
+
+/// The first operation of a run that made a value non-finite: what [`Program::trace`]
+/// finds.
+#[derive(Clone, PartialEq, Debug)]
+pub struct NonFiniteAt {
+    /// The register the operation wrote.
+    pub reg: Reg,
+    /// The operation.
+    pub op: Op,
+    /// Where in the source it came from, when the compiler said.
+    pub origin: Option<Origin>,
+    /// The values it read, in the order [`Op::operands`] gives the registers. All finite;
+    /// empty for an input, a parameter or a constant.
+    pub operands: Vec<f64>,
+    /// What it wrote: infinite or NaN.
+    pub value: f64,
 }
 
 /// One operation. Each writes the register numbered by its position.
@@ -568,6 +594,77 @@ impl Program {
         for (slot, &reg) in out.chunks_exact_mut(LANES).zip(&self.outputs) {
             slot.copy_from_slice(&regs[reg as usize * LANES..][..LANES]);
         }
+    }
+
+    /// Evaluate on one set of inputs and find the operation that made an output
+    /// non-finite: [`Program::trace_outputs`] over every output.
+    pub fn trace(&self, inputs: &[f64], params: &[f64]) -> Option<NonFiniteAt> {
+        self.trace_outputs(inputs, params, 0..self.outputs.len())
+    }
+
+    /// Evaluate on one set of inputs and find the operation that made one of the outputs
+    /// in `outputs` (indices into the program's outputs) non-finite.
+    ///
+    /// Every value is computed first. The trace then takes the *cone* of each non-finite
+    /// output: the operations whose values carried the badness to it. At an operation
+    /// that is every non-finite operand; at a `Select`, its condition if that is
+    /// non-finite and the arm it took, so a non-finite value on the arm it discarded is
+    /// not in the cone. The culprits are the operations in the cone whose operands were
+    /// all finite, and the one with the lowest register is reported: when two
+    /// independent faults meet at an operation, the one the program computed first. An
+    /// input that arrives non-finite is a culprit too, reported as itself, an `Op::Input`
+    /// with no operands, with no operation blamed for it. `None` means none of
+    /// `outputs` is non-finite.
+    ///
+    /// It allocates and keeps every operand: it is for explaining a failure after the
+    /// fact, never for a loop.
+    ///
+    /// # Panics
+    ///
+    /// As [`Program::eval`] does, if the inputs or parameters are fewer than it reads;
+    /// and if `outputs` reaches past the program's outputs.
+    pub fn trace_outputs(
+        &self,
+        inputs: &[f64],
+        params: &[f64],
+        outputs: core::ops::Range<usize>,
+    ) -> Option<NonFiniteAt> {
+        let mut regs: Vec<f64> = Vec::with_capacity(self.ops.len());
+        for &op in &self.ops {
+            // `apply` reads only registers before this one, which `regs` holds.
+            let value = apply(op, &regs, inputs, params);
+            regs.push(value);
+        }
+        let bad = |r: Reg| !regs[r as usize].is_finite();
+        let mut pending: Vec<Reg> = self.outputs[outputs].iter().copied().filter(|&r| bad(r)).collect();
+        let mut seen = vec![false; self.ops.len()];
+        let mut culprit: Option<Reg> = None;
+        while let Some(reg) = pending.pop() {
+            if std::mem::replace(&mut seen[reg as usize], true) {
+                continue;
+            }
+            let op = self.ops[reg as usize];
+            let before = pending.len();
+            match op {
+                Op::Select(c, a, b) => {
+                    if bad(c) {
+                        pending.push(c);
+                    }
+                    let taken = if regs[c as usize] != 0.0 { a } else { b };
+                    if bad(taken) {
+                        pending.push(taken);
+                    }
+                }
+                _ => pending.extend(op.operands().filter(|&r| bad(r))),
+            }
+            if pending.len() == before {
+                culprit = Some(culprit.map_or(reg, |lowest| lowest.min(reg)));
+            }
+        }
+        let reg = culprit?;
+        let op = self.ops[reg as usize];
+        let operands = op.operands().map(|r| regs[r as usize]).collect();
+        Some(NonFiniteAt { reg, op, origin: self.origin(reg), operands, value: regs[reg as usize] })
     }
 
     /// Evaluate, allocating: for compile-time sampling and tests, never a hot loop.
@@ -1449,6 +1546,171 @@ mod tests {
         let mut regs = vec![0.0; p.ops().len() * LANES];
         let mut out = vec![0.0; p.output_count() * LANES - 1];
         p.eval_batch(LANES, &inputs, &[1.0, 1.0], &mut regs, &mut out);
+    }
+
+    /// `1 / (r - 1)`, each operation at the place it would be written.
+    fn pole_at_one() -> Program {
+        let mut b = Builder::new(1, 0);
+        b.at(origin(10, 11));
+        let r = b.push(Op::Input(0));
+        b.at(origin(14, 15));
+        let one = b.constant(1.0);
+        b.at(origin(10, 15));
+        let gap = b.push(Op::Sub(r, one));
+        b.at(origin(5, 16));
+        let u = b.push(Op::Div(one, gap));
+        b.finish(vec![u])
+    }
+
+    #[test]
+    fn a_trace_finds_the_operation_that_made_the_value_and_what_it_read() {
+        let program = pole_at_one();
+        assert_eq!(program.trace(&[2.0], &[]), None, "finite everywhere");
+        let at = program.trace(&[1.0], &[]).expect("a division by zero");
+        // Input, the constant 1, the difference, the quotient.
+        assert_eq!(at.reg, 3);
+        assert_eq!(at.op, Op::Div(1, 2));
+        assert_eq!(at.origin, origin(5, 16));
+        assert_eq!(at.operands, [1.0, 0.0]);
+        assert_eq!(at.value, f64::INFINITY);
+    }
+
+    #[test]
+    fn a_trace_skips_what_only_propagated_a_non_finite_value() {
+        // `sqrt(1/(r-1))` after `1/(r-1)` is infinite: the sqrt is infinite too, but it
+        // read an infinity, so the division is blamed and not the sqrt.
+        let mut b = Builder::new(1, 0);
+        let r = b.push(Op::Input(0));
+        let one = b.constant(1.0);
+        let gap = b.push(Op::Sub(r, one));
+        let q = b.push(Op::Div(one, gap));
+        let root = b.push(Op::Sqrt(q));
+        let at = b.finish(vec![root]).trace(&[1.0], &[]).unwrap();
+        assert!(matches!(at.op, Op::Div(..)), "{at:?}");
+    }
+
+    #[test]
+    fn a_nan_made_of_finite_operands_is_found() {
+        let mut b = Builder::new(1, 0);
+        b.at(origin(3, 8));
+        let x = b.push(Op::Input(0));
+        b.at(origin(0, 9));
+        let ln = b.push(Op::Ln(x));
+        let at = b.finish(vec![ln]).trace(&[-2.0], &[]).unwrap();
+        assert_eq!((at.op, at.operands.as_slice(), at.origin), (Op::Ln(0), &[-2.0][..], origin(0, 9)));
+        assert!(at.value.is_nan());
+    }
+
+    #[test]
+    fn a_non_finite_input_is_blamed_as_an_input_and_no_operation_is() {
+        // `1 / (r - 1)` turns an infinite `r` into a finite zero, so only NaN reaches its
+        // output; `r - 1` carries an infinity through.
+        let mut b = Builder::new(1, 0);
+        b.at(origin(10, 11));
+        let r = b.push(Op::Input(0));
+        let one = b.constant(1.0);
+        let gap = b.push(Op::Sub(r, one));
+        let shifted = b.finish(vec![gap]);
+        for (program, bad) in [
+            (pole_at_one(), f64::NAN),
+            (shifted.clone(), f64::NAN),
+            (shifted.clone(), f64::INFINITY),
+            (shifted, f64::NEG_INFINITY),
+        ] {
+            let at = program.trace(&[bad], &[]).unwrap();
+            assert_eq!((at.reg, at.op), (0, Op::Input(0)), "the input, not the subtraction after it");
+            assert!(at.operands.is_empty());
+            assert_eq!(at.origin, origin(10, 11));
+            assert_eq!(at.value.to_bits(), bad.to_bits());
+        }
+    }
+
+    #[test]
+    fn a_non_finite_parameter_is_blamed_as_a_parameter() {
+        let mut b = Builder::new(1, 1);
+        let x = b.push(Op::Input(0));
+        let k = b.push(Op::Param(0));
+        let y = b.push(Op::Mul(k, x));
+        let at = b.finish(vec![y]).trace(&[1.0], &[f64::NAN]).unwrap();
+        assert_eq!(at.op, Op::Param(0));
+    }
+
+    /// `(if x == 0 { 0 } else { 1/x }) + ln(y)` at `x = 0`, `y = −1`: the guarded division
+    /// is infinite but discarded, and the NaN is the log's. The trace blames the log.
+    #[test]
+    fn a_trace_blames_the_log_and_not_the_division_a_select_discarded() {
+        let mut b = Builder::new(2, 0);
+        let (x, y) = (b.push(Op::Input(0)), b.push(Op::Input(1)));
+        let zero = b.constant(0.0);
+        let one = b.constant(1.0);
+        b.at(origin(10, 13));
+        let pole = b.push(Op::Div(one, x));
+        let is_zero = b.push(Op::Eq(x, zero));
+        let guarded = b.push(Op::Select(is_zero, zero, pole));
+        b.at(origin(30, 35));
+        let ln = b.push(Op::Ln(y));
+        let sum = b.push(Op::Add(guarded, ln));
+        let program = b.finish(vec![sum]);
+
+        let at = program.trace(&[0.0, -1.0], &[]).unwrap();
+        assert_eq!((at.op, at.origin, at.operands.as_slice()), (Op::Ln(1), origin(30, 35), &[-1.0][..]));
+
+        // With the log fine the output is finite, and so is the whole trace, although the
+        // division at x = 0 is infinite in a register.
+        assert_eq!(program.eval_to_vec(&[0.0, 2.0], &[])[0], 2f64.ln());
+        assert_eq!(program.trace(&[0.0, 2.0], &[]), None);
+        // A guard that discards the division leaves a finite output: nothing to trace.
+        let mut b = Builder::new(1, 0);
+        let x = b.push(Op::Input(0));
+        let (zero, one) = (b.constant(0.0), b.constant(1.0));
+        let pole = b.push(Op::Div(one, x));
+        let nonzero = b.push(Op::Ne(x, zero));
+        let taken = b.push(Op::Select(nonzero, pole, zero));
+        let p = b.finish(vec![taken]);
+        assert_eq!(p.trace(&[0.0], &[]), None);
+        // A select whose chosen arm is the bad one passes the blame to that arm's op.
+        let mut b = Builder::new(1, 0);
+        let x = b.push(Op::Input(0));
+        let (zero, one) = (b.constant(0.0), b.constant(1.0));
+        let pole = b.push(Op::Div(one, x));
+        let is_zero = b.push(Op::Eq(x, zero));
+        let chosen = b.push(Op::Select(is_zero, pole, zero));
+        let at = b.finish(vec![chosen]).trace(&[0.0], &[]).unwrap();
+        assert!(matches!(at.op, Op::Div(..)));
+    }
+
+    /// `let t = ln(y); 1/x + t` at `x = 0`, `y = -1`: two independent faults meet at the
+    /// sum. The log is the first computed, so it is the one reported, although the
+    /// division is the sum's first operand.
+    #[test]
+    fn when_two_faults_meet_the_first_computed_is_blamed() {
+        let mut b = Builder::new(2, 0);
+        let (x, y) = (b.push(Op::Input(0)), b.push(Op::Input(1)));
+        b.at(origin(5, 10));
+        let t = b.push(Op::Ln(y));
+        let one = b.constant(1.0);
+        b.at(origin(20, 23));
+        let pole = b.push(Op::Div(one, x));
+        let sum = b.push(Op::Add(pole, t));
+        let program = b.finish(vec![sum]);
+        let at = program.trace(&[0.0, -1.0], &[]).unwrap();
+        assert_eq!((at.op, at.origin), (Op::Ln(1), origin(5, 10)));
+        // Either fault alone is reported as itself.
+        assert!(matches!(program.trace(&[0.0, 2.0], &[]).unwrap().op, Op::Div(..)));
+        assert!(matches!(program.trace(&[1.0, -1.0], &[]).unwrap().op, Op::Ln(_)));
+    }
+
+    /// The trace starts from the outputs the caller checked, not any output of the program.
+    #[test]
+    fn a_trace_looks_only_at_the_outputs_asked_for() {
+        let mut b = Builder::new(2, 0);
+        let (x, y) = (b.push(Op::Input(0)), b.push(Op::Input(1)));
+        let ln = b.push(Op::Ln(y));
+        let neg = b.push(Op::Neg(x));
+        let program = b.finish(vec![neg, ln]);
+        assert_eq!(program.trace_outputs(&[1.0, -1.0], &[], 0..1), None, "the first output is fine");
+        assert!(matches!(program.trace_outputs(&[1.0, -1.0], &[], 0..2).unwrap().op, Op::Ln(_)));
+        assert!(matches!(program.trace(&[1.0, -1.0], &[]).unwrap().op, Op::Ln(_)));
     }
 
     #[test]

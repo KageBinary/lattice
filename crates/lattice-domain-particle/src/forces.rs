@@ -37,7 +37,7 @@
 
 use core::fmt;
 
-use lattice_ir::{ForceAccumulation, ParticleStore, StabilityReason, StableStep};
+use lattice_ir::{ForceAccumulation, LawFault, ParticleStore, StabilityReason, StableStep};
 
 use crate::image::MinimumImage;
 use crate::verlet::NeighborList;
@@ -101,6 +101,24 @@ pub trait ForceLaw: fmt::Debug + Send + Sync {
     /// The pair virial `Σ (xᵢ − xⱼ)·Fᵢⱼ`, joules. Zero for external fields.
     fn virial(&self, _store: &ParticleStore, _ctx: &ForceContext<'_>) -> f64 {
         0.0
+    }
+
+    /// True for a law the model wrote, whose [`ForceLaw::explain_non_finite`] has
+    /// operations to point at.
+    fn is_user_law(&self) -> bool {
+        false
+    }
+
+    /// Where this law first produces a non-finite value at the current configuration,
+    /// if it does: the pair or particle, the operation, and its source range (spec
+    /// M6.1d §4.4).
+    ///
+    /// Only a law the model wrote has operations to point at, so the default is `None`.
+    /// The domain calls this on a replay of a run that has halted, never in an ordinary
+    /// step, so an implementation may allocate. The returned fault's `domain` is empty;
+    /// the domain fills it in.
+    fn explain_non_finite(&self, _store: &ParticleStore, _ctx: &ForceContext<'_>) -> Option<LawFault> {
+        None
     }
 
     /// The timestep this law needs, if it imposes one.
