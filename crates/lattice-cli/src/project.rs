@@ -32,7 +32,7 @@ use crate::render;
 const CHECK_FAILED: u8 = 1;
 
 /// Read a model file into a `SourceFile`.
-fn read(path: &str) -> Result<SourceFile, String> {
+pub fn read(path: &str) -> Result<SourceFile, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     // Show just the file name in diagnostics; the full path is already on screen.
     let name = Path::new(path)
@@ -185,7 +185,7 @@ pub fn explain_halt(
 }
 
 /// A number as a message shows it: plain when it reads easily, else in exponent form.
-fn show(value: f64) -> String {
+pub fn show(value: f64) -> String {
     if value == 0.0 || !value.is_finite() || (1e-3..1e6).contains(&value.abs()) {
         format!("{value}")
     } else {
@@ -194,7 +194,7 @@ fn show(value: f64) -> String {
 }
 
 /// The name of an operation as a message says it: `div`, `ln`, `powi`.
-fn op_name(op: Op) -> String {
+pub fn op_name(op: Op) -> String {
     let debug = format!("{op:?}");
     debug.split('(').next().unwrap_or(&debug).to_lowercase()
 }

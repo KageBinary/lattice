@@ -22,6 +22,8 @@ pub struct UserForce {
     pub law: UserLaw,
     /// The report line: the law, its bindings, and its contract.
     pub description: String,
+    /// The values its `param`s were bound to, in slot order.
+    pub params: Vec<f64>,
 }
 
 /// Bind a law where a particle set uses it. `sample` is that set's particles, which a
@@ -242,7 +244,7 @@ pub fn bind(
     }
 
     let description = describe(law, &user, &params, branches, &pairings);
-    Some(UserForce { law: user, description })
+    Some(UserForce { law: user, description, params })
 }
 
 /// The particles a law will act between, for sampling it at compile time: the set's
