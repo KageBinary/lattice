@@ -1,0 +1,24 @@
+// expect: E0420
+// `observe` reduces an observer law. A force acts on particles rather than measuring
+// them, so naming one at an `observe` is refused.
+
+project observe_a_force {
+  dimensions: 2;
+  duration: 1 picosecond;
+
+  force push(a: particle) -> vec2<newton> {
+    return vec2(1 newton, 0 newton);
+  }
+
+  particles atoms {
+    count: 4;
+    region: [1 nanometer, 1 nanometer];
+    spacing: 0.3 nanometer;
+    mass: 39.948 dalton;
+    force: push();
+  }
+
+  solve dynamics(atoms) with velocity_verlet(dt=10 femtosecond);
+
+  observe sum(push(atoms)) every 0.1 picosecond;
+}

@@ -432,6 +432,40 @@ impl Simulation {
         Ok(())
     }
 
+    /// Attach several observers in order, as [`Simulation::add_observer`] does one.
+    ///
+    /// This is how a compiled model's own observers (its `observe sum(law(set))`
+    /// statements) are attached, before any the caller adds. Stops at the first refusal
+    /// and says which observer and why; the ones before it stay attached.
+    pub fn add_observers(&mut self, observers: Vec<Box<dyn Observer>>) -> Result<(), String> {
+        for observer in observers {
+            let name = observer.contract().name.to_string();
+            self.add_observer(observer).map_err(|gaps| {
+                let gaps: Vec<String> = gaps.iter().map(ToString::to_string).collect();
+                format!("observer `{name}` was refused: {}", gaps.join("; "))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Explain a halt on `observation` that an attached observer published (`E0950`).
+    ///
+    /// For a run that stopped as [`StopReason::NonFinite`]: the domains are still in the
+    /// state the observer was shown, so each enabled observer that declares the row is
+    /// asked to trace its computation against it ([`Observer::explain_non_finite`]),
+    /// with no replay. `None` when no observer published the row, or none can say. An
+    /// observer that panics while explaining is skipped.
+    pub fn explain_observer_halt(&self, observation: &str) -> Option<lattice_ir::LawFault> {
+        self.observers.iter().filter(|slot| !slot.disabled).find_map(|slot| {
+            if !slot.observer.contract().outputs.iter().any(|(name, _)| name == observation) {
+                return None;
+            }
+            let ctx = ObserveContext::new(self.clock.time, self.clock.step, &self.domains, &self.observations)
+                .restricted_to(&slot.reads);
+            catch_unwind(AssertUnwindSafe(|| slot.observer.explain_non_finite(&ctx, observation))).ok().flatten()
+        })
+    }
+
     /// Observers disabled so far for panicking (`E0951`).
     pub fn observer_faults(&self) -> &[ObserverFault] {
         &self.observer_faults
@@ -1419,11 +1453,13 @@ mod tests {
             id: lattice_ir::ObserverId::from_index(0),
             target: "a".to_string(),
             interval: Some(1.0),
+            law: None,
         });
         model.observers.push(lattice_ir::ObserverSpec {
             id: lattice_ir::ObserverId::from_index(1),
             target: "b".to_string(),
             interval: Some(0.25),
+            law: None,
         });
         let config = RunConfig::from_model(&model);
         assert_eq!(config.sample_interval, Some(0.25));

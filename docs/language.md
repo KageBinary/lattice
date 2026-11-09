@@ -889,7 +889,7 @@ What the explanation does not do:
 
 | Code | When |
 |---|---|
-| `E0950` | at run time, not compile time: a user law (a `force`, a `potential` or a reaction's `rate:`) produced, or was handed, a non-finite value |
+| `E0950` | at run time, not compile time: a user law (a `force`, a `potential`, a reaction's `rate:` or an `observer` reduced at an `observe`) produced, or was handed, a non-finite value |
 
 ### Kinds, and what each promises
 
@@ -930,9 +930,49 @@ general-purpose functions such as `sqrt`, `abs`, `min`, `max`, `exp`, `dot` and 
 particle is refused (`E0412`). It runs on particles in no cell, so `c(…)`, `temperature`
 and `arrhenius(…)` are `E0418`.
 
-**An observer law is accepted and type-checked, but cannot be used yet.** Its `observe`
-use site, which reduces it over a particle set, arrives later in M6.2; until then an
-observer law compiles to nothing and warns `W0316`. Naming one in a `force:` is `E0420`.
+An observer law is used at an `observe` statement, which reduces it over a particle
+domain:
+
+```
+observe sum(kinetic_x(atoms)) every 0.1 picosecond;
+observe mean(right_half(atoms, x0 = 2 nanometer));
+```
+
+The outer call is a reduction, `sum`, `mean`, `min` or `max` (`E0419` for anything else,
+or for no reduction at all). The inner call names an `observer` law (`E0420` for a force
+or a potential; the same code refuses an `observer` named in a `force:`), its first
+argument is a solved `particles` set (`E0421` otherwise: a field, a grid, an unsolved set,
+or a name nothing has, with a suggestion when one is close), and the rest bind the law's
+`param`s by name, exactly as at a `force:` setting. The law is evaluated once per particle
+and the values are reduced in particle index order. The run records one row, named
+`SET.LAW.REDUCTION` (`atoms.kinetic_x.sum`), in the law's unit, with kind `Metric`: a
+reduction of a user's quantity is never an invariant. `sum` is a left fold from `+0.0`,
+`mean` is that sum divided by the count, and `min` and `max` pick equal values by sign
+(`-0.0` is below `+0.0`) and are NaN if any value is. Thread count cannot change a row: no
+observer runs on the CPU pool.
+
+An observer samples at its own `every`, by the half-step rule the run's sample cadence
+uses. The run samples at the smallest interval of all its `observe` statements, so a
+slower observer is due at some of those samples and never between them, and its series
+has fewer points. Without `every` it is due at every sample. Each reduction of a law over a
+set is recorded once (`E0201` for a repeat).
+
+On an empty set `sum` is `0` and `mean`, `min` and `max` are NaN, which halts a run like
+any other non-finite row; the compiler warns (`W0321`) when the set is declared with
+`count: 0`. A law that no `observe` uses draws `W0316`. A row that goes non-finite halts
+the run, and `lattice run` explains it (`E0950`) by evaluating the law again on the state it
+sampled, which the run still holds, so nothing is replayed: it names the first particle in
+index order whose value is not finite and the operation that made it so.
+
+**The plain `observe TARGET` is unchanged: it sets a cadence and filters nothing.** Every
+domain's whole set of rows is recorded at the smallest interval of all the `observe`
+statements, whatever the targets say. Its target is resolved, though: it must be a domain,
+a species or field, or an observation some domain publishes (`total_energy`), and
+otherwise the compiler warns `W0320`, with a "did you mean" when a name is close. Making
+the plain form filter is recorded for a later stage.
+
+An observer that a run switches off (a plugin that panics, or one that breaks its contract)
+is printed by `lattice run` as `E0951`, and the run carries on without it.
 
 ### Values and operations
 
@@ -979,12 +1019,16 @@ operand is ignored in favour of the other, as it always was.
 | `E0416` | an `observer` law with a second particle; pair observers are not implemented |
 | `E0417` | an `observer` law returning a vector; observe each component separately |
 | `E0418` | an `observer` law reading `c(…)`, `temperature` or `arrhenius`: observers read particles only |
-| `E0420` | a law of the wrong kind at a use site; today, an `observer` named in a particle set's `force:` |
+| `E0419` | an `observe` whose outer call is not one of `sum`, `mean`, `min`, `max`, or that names an observer law with no reduction |
+| `E0420` | a law of the wrong kind at a use site: an `observer` named in a particle set's `force:`, or a `force` or `potential` named in an `observe` |
+| `E0421` | an observer law reduced over something that is not a solved particle set |
 | `W0313` | a `let` or `param` whose name is also a unit |
 | `W0314` | a law that does not limit the timestep: a `force`, or a potential with no well inside its cutoff |
 | `W0315` | an untruncated pair potential whose energy at the cutoff is not zero |
-| `W0316` | a law no particle set uses; for an `observer`, a law nothing observes (its `observe` use site is not implemented yet) |
+| `W0316` | a law no particle set uses; for an `observer`, a law no `observe` reduces |
 | `W0317` | a pair force whose velocity terms do positive work on the pair: a damper with the wrong sign |
+| `W0320` | a plain `observe` target that is not a domain, a species or field, or a published observation |
+| `W0321` | `mean`, `min` or `max` of a particle set declared with `count: 0`: NaN, which halts a run |
 
 ## Solving
 
@@ -1031,12 +1075,13 @@ visualize probability_density;         // the domain picks an encoding
 | `E021x` | geometry and chemistry: unknown builtin (`E0210`), invalid shape or formula (`E0211`), unbalanced reaction (`E0212`) |
 | `E04xx` | units: dimensional mismatch, affine scale misuse, value out of range; in laws, `E0410`–`E0415` (see [User-defined laws](#user-defined-laws)) |
 | `E0900` | not implemented yet — the message names the milestone |
-| `E0950` | a user law produced a non-finite value: reported by `lattice run` after a run halts, not by the compiler (see [When a law produces a NaN](#when-a-law-produces-a-nan)) |
-| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), charges that do not suit a Coulomb law (`W0311`–`W0312`), a name that hides a unit (`W0313`), user laws (`W0314`–`W0317`), and rate laws (`W0318`–`W0319`) |
+| `E0950` | a user law produced a non-finite value: reported by `lattice run` after a run halts, not by the compiler (see [When a law produces a NaN](#when-a-law-produces-a-nan)); for an observer law, from the state the run stopped in |
+| `E0951` | an observer was switched off during a run: it panicked or broke its contract. Printed by `lattice run`; the run continues |
+| `W03xx` | warnings: ambiguous grouping, unknown setting, unsolved state, the quantum module's physics checks (`W0308`–`W0310`), charges that do not suit a Coulomb law (`W0311`–`W0312`), a name that hides a unit (`W0313`), user laws (`W0314`–`W0317`), rate laws (`W0318`–`W0319`), and `observe` targets and sets (`W0320`–`W0321`) |
 
 Every rejection carries a source position and either a suggested fix or the rule it
 enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the
-52 models in `tests/invalid/`.
+55 models in `tests/invalid/`.
 
 ---
 

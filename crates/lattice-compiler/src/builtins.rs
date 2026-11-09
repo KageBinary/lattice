@@ -246,7 +246,7 @@ pub(crate) fn unknown(
 }
 
 /// The closest name by edit distance, if one is close enough to be worth suggesting.
-fn closest<'a>(name: &str, candidates: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn closest<'a>(name: &str, candidates: &[&'a str]) -> Option<&'a str> {
     let budget = if name.len() <= 4 { 1 } else { 2 };
     candidates
         .iter()

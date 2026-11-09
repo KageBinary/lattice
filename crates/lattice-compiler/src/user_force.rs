@@ -8,7 +8,7 @@
 use lattice_domain_particle::user::layout;
 use lattice_domain_particle::{Truncation, UserLaw, UserLawKind};
 use lattice_expr::Program;
-use lattice_syntax::{Argument, Diagnostic, Diagnostics, Expr, ExprKind};
+use lattice_syntax::{Argument, Diagnostic, Diagnostics, Expr, ExprKind, Span};
 use lattice_units::Dimension;
 
 use crate::eval::Evaluator;
@@ -49,110 +49,14 @@ pub fn bind(
     };
     let is_pair = lowered.kind.is_pair();
     let is_pair_potential = lowered.kind == UserLawKind::PairPotential;
-
-    let mut known: Vec<&str> = law.params.iter().map(|p| p.name.as_str()).collect();
-    if is_pair {
-        known.push("cutoff");
-    }
-    if is_pair_potential {
-        known.push("truncation");
-    }
-    let mut failed = false;
-    let mut bound: Vec<Option<Vec<f64>>> = vec![None; law.params.len()];
-    let mut cutoff = None;
-    let mut truncation = is_pair_potential.then_some(Truncation::EnergyShift);
-    let mut seen: Vec<&str> = Vec::new();
-    for argument in arguments {
-        let Some(name) = &argument.name else {
-            diagnostics.push(
-                Diagnostic::error(format!("`{}` binds its parameters by name", law.name))
-                    .with_code("E0204")
-                    .at(argument.span, "a value without a name")
-                    .help(format!("write it as `name=value`; `{}` takes {}", law.name, known.join(", "))),
-            );
-            failed = true;
-            continue;
-        };
-        if seen.contains(&name.text.as_str()) {
-            diagnostics.push(
-                Diagnostic::error(format!("`{}` is bound twice", name.text)).with_code("E0201").span(name.span),
-            );
-            failed = true;
-            continue;
-        }
-        seen.push(&name.text);
-        if let Some(index) = law.params.iter().position(|p| p.name == name.text) {
-            match bind_value(&argument.value, law.params[index].ty, &name.text, evaluator, diagnostics) {
-                Some(values) => bound[index] = Some(values),
-                None => failed = true,
-            }
-        } else if name.text == "cutoff" && is_pair {
-            match evaluator.require(&argument.value, Dimension::LENGTH, "the cutoff", diagnostics) {
-                Some(rc) if rc > 0.0 && rc.is_finite() => cutoff = Some(rc),
-                Some(rc) => {
-                    diagnostics.push(
-                        Diagnostic::error("the cutoff must be a positive length")
-                            .with_code("E0405")
-                            .at(argument.value.span, format!("found {rc} m")),
-                    );
-                    failed = true;
-                }
-                None => failed = true,
-            }
-        } else if name.text == "truncation" && is_pair_potential {
-            truncation = match argument.value.as_name() {
-                Some("energy_shift") => Some(Truncation::EnergyShift),
-                Some("force_shift") => Some(Truncation::ForceShift),
-                Some("none") => None,
-                _ => {
-                    diagnostics.push(
-                        Diagnostic::error("`truncation` is `energy_shift`, `force_shift` or `none`")
-                            .with_code("E0208")
-                            .span(argument.value.span),
-                    );
-                    failed = true;
-                    None
-                }
-            };
-        } else {
-            diagnostics.push(
-                Diagnostic::error(format!("`{}` has no parameter `{}`", law.name, name.text))
-                    .with_code("E0204")
-                    .at(name.span, "unknown parameter")
-                    .help(format!("`{}` takes {}", law.name, known.join(", "))),
-            );
-            failed = true;
-        }
-    }
-
-    let mut params = Vec::with_capacity(lowered.param_slots);
-    for (param, binding) in law.params.iter().zip(&bound) {
-        match binding.as_ref().or(param.default.as_ref()) {
-            Some(values) => params.extend_from_slice(values),
-            None => {
-                diagnostics.push(
-                    Diagnostic::error(format!("`{}` needs `{}`", law.name, param.name))
-                        .with_code("E0203")
-                        .at(value.span, format!("`{}` is not bound", param.name))
-                        .help(format!("add `{}=…` here, or give the `param` a default", param.name)),
-                );
-                failed = true;
-            }
-        }
-    }
-    if is_pair && cutoff.is_none() && !failed {
-        diagnostics.push(
-            Diagnostic::error(format!("`{}` is a pair law and needs a `cutoff`", law.name))
-                .with_code("E0203")
-                .at(value.span, "no cutoff")
-                .note("pairs are found through a neighbour list, which needs to know how far to look")
-                .help("add `cutoff=2.5 meter`"),
-        );
-        failed = true;
-    }
-    if failed {
-        return None;
-    }
+    let Bound { params, cutoff, truncation } = bind_arguments(
+        law,
+        arguments,
+        value.span,
+        BindOptions { cutoff: is_pair, truncation: is_pair_potential },
+        evaluator,
+        diagnostics,
+    )?;
 
     let LoweredLaw { kind, program, energy, branches, .. } = lowered;
     let user = UserLaw::new(law.name.clone(), kind, program, params.clone(), cutoff, truncation)
@@ -245,6 +149,148 @@ pub fn bind(
 
     let description = describe(law, &user, &params, branches, &pairings);
     Some(UserForce { law: user, description, params })
+}
+
+/// What a use site may bind besides a law's own `param`s.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BindOptions {
+    /// A pair law takes a `cutoff`, and needs one.
+    pub(crate) cutoff: bool,
+    /// A pair potential takes a `truncation`.
+    pub(crate) truncation: bool,
+}
+
+/// The values a use site bound.
+#[derive(Clone, Debug)]
+pub(crate) struct Bound {
+    /// The `param`s' values in slot order: a scalar takes one slot, a vector two.
+    pub(crate) params: Vec<f64>,
+    /// The cutoff of a pair law, m.
+    pub(crate) cutoff: Option<f64>,
+    /// How a pair potential is brought to zero at its cutoff.
+    pub(crate) truncation: Option<Truncation>,
+}
+
+/// Bind the named `arguments` of a use site to `law`'s parameters, and to the cutoff and
+/// truncation `options` allow. Reports every problem and returns `None` on any.
+///
+/// The one place a law's arguments are read, shared by a force or potential at a
+/// `force:` setting and an observer law at an `observe` statement, so the two cannot
+/// disagree about what `name=value` means. `call` is the whole use site, which a missing
+/// argument is reported at.
+pub(crate) fn bind_arguments(
+    law: &TypedLaw,
+    arguments: &[Argument],
+    call: Span,
+    options: BindOptions,
+    evaluator: &Evaluator<'_>,
+    diagnostics: &mut Diagnostics,
+) -> Option<Bound> {
+    let (is_pair, is_pair_potential) = (options.cutoff, options.truncation);
+    let mut known: Vec<&str> = law.params.iter().map(|p| p.name.as_str()).collect();
+    if is_pair {
+        known.push("cutoff");
+    }
+    if is_pair_potential {
+        known.push("truncation");
+    }
+    let mut failed = false;
+    let mut bound: Vec<Option<Vec<f64>>> = vec![None; law.params.len()];
+    let mut cutoff = None;
+    let mut truncation = is_pair_potential.then_some(Truncation::EnergyShift);
+    let mut seen: Vec<&str> = Vec::new();
+    for argument in arguments {
+        let Some(name) = &argument.name else {
+            diagnostics.push(
+                Diagnostic::error(format!("`{}` binds its parameters by name", law.name))
+                    .with_code("E0204")
+                    .at(argument.span, "a value without a name")
+                    .help(format!("write it as `name=value`; `{}` takes {}", law.name, known.join(", "))),
+            );
+            failed = true;
+            continue;
+        };
+        if seen.contains(&name.text.as_str()) {
+            diagnostics.push(
+                Diagnostic::error(format!("`{}` is bound twice", name.text)).with_code("E0201").span(name.span),
+            );
+            failed = true;
+            continue;
+        }
+        seen.push(&name.text);
+        if let Some(index) = law.params.iter().position(|p| p.name == name.text) {
+            match bind_value(&argument.value, law.params[index].ty, &name.text, evaluator, diagnostics) {
+                Some(values) => bound[index] = Some(values),
+                None => failed = true,
+            }
+        } else if name.text == "cutoff" && is_pair {
+            match evaluator.require(&argument.value, Dimension::LENGTH, "the cutoff", diagnostics) {
+                Some(rc) if rc > 0.0 && rc.is_finite() => cutoff = Some(rc),
+                Some(rc) => {
+                    diagnostics.push(
+                        Diagnostic::error("the cutoff must be a positive length")
+                            .with_code("E0405")
+                            .at(argument.value.span, format!("found {rc} m")),
+                    );
+                    failed = true;
+                }
+                None => failed = true,
+            }
+        } else if name.text == "truncation" && is_pair_potential {
+            truncation = match argument.value.as_name() {
+                Some("energy_shift") => Some(Truncation::EnergyShift),
+                Some("force_shift") => Some(Truncation::ForceShift),
+                Some("none") => None,
+                _ => {
+                    diagnostics.push(
+                        Diagnostic::error("`truncation` is `energy_shift`, `force_shift` or `none`")
+                            .with_code("E0208")
+                            .span(argument.value.span),
+                    );
+                    failed = true;
+                    None
+                }
+            };
+        } else {
+            diagnostics.push(
+                Diagnostic::error(format!("`{}` has no parameter `{}`", law.name, name.text))
+                    .with_code("E0204")
+                    .at(name.span, "unknown parameter")
+                    .help(format!("`{}` takes {}", law.name, known.join(", "))),
+            );
+            failed = true;
+        }
+    }
+
+    let mut params = Vec::new();
+    for (param, binding) in law.params.iter().zip(&bound) {
+        match binding.as_ref().or(param.default.as_ref()) {
+            Some(values) => params.extend_from_slice(values),
+            None => {
+                diagnostics.push(
+                    Diagnostic::error(format!("`{}` needs `{}`", law.name, param.name))
+                        .with_code("E0203")
+                        .at(call, format!("`{}` is not bound", param.name))
+                        .help(format!("add `{}=…` here, or give the `param` a default", param.name)),
+                );
+                failed = true;
+            }
+        }
+    }
+    if is_pair && cutoff.is_none() && !failed {
+        diagnostics.push(
+            Diagnostic::error(format!("`{}` is a pair law and needs a `cutoff`", law.name))
+                .with_code("E0203")
+                .at(call, "no cutoff")
+                .note("pairs are found through a neighbour list, which needs to know how far to look")
+                .help("add `cutoff=2.5 meter`"),
+        );
+        failed = true;
+    }
+    if failed {
+        return None;
+    }
+    Some(Bound { params, cutoff, truncation })
 }
 
 /// The particles a law will act between, for sampling it at compile time: the set's

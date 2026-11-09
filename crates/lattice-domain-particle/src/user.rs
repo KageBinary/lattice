@@ -103,6 +103,16 @@ pub mod layout {
     }
 }
 
+/// The name of the input or parameter a non-finite `op` read, when the value was already
+/// bad on the way in and no operation of the law is to blame for it.
+pub(crate) fn faulty_input(op: Op, pair: bool) -> Option<String> {
+    match op {
+        Op::Input(n) => Some(layout::input_name(pair, n)),
+        Op::Param(n) => Some(format!("parameter {n}")),
+        _ => None,
+    }
+}
+
 /// What a user law computes, which decides what the engine does with its outputs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UserLawKind {
@@ -350,11 +360,7 @@ impl UserLaw {
 
     /// A fault at `site`, naming the input when that is what arrived non-finite.
     fn fault(&self, site: FaultSite, at: NonFiniteAt) -> LawFault {
-        let input = match at.op {
-            Op::Input(n) => Some(layout::input_name(self.kind.is_pair(), n)),
-            Op::Param(n) => Some(format!("parameter {n}")),
-            _ => None,
-        };
+        let input = faulty_input(at.op, self.kind.is_pair());
         LawFault { domain: String::new(), law: self.name.clone(), site, at, input }
     }
 

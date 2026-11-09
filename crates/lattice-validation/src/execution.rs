@@ -35,7 +35,10 @@ use lattice_domain_quantum2d::{Absorber, Hamiltonian, Kinetic, Potential, Quantu
 use lattice_domain_particle::{
     HarmonicWell, Integrator, ParticleDomain, UniformAcceleration, PARTICLE_GRAIN,
 };
-use lattice_ir::{Arena, BoundarySet, Domain, Executor, Grid2d, ParticleSpec, StepContext};
+use lattice_ir::{
+    Arena, BoundarySet, Domain, Executor, Grid2d, ObserveContext, Observations, Observer, ParticleSpec,
+    StepContext,
+};
 use lattice_runtime::{RunConfig, Simulation};
 
 use crate::{Case, Level, Outcome};
@@ -59,7 +62,7 @@ pub(crate) static CASES: &[Case] = &[
         name: "particle_trajectories_match_across_thread_counts",
         domain: "cpu",
         level: Level::CrossBackend,
-        claim: "per-particle force laws, a user-defined law, and every integrator give bit-identical trajectories on 1, 2, 3 and 8 threads",
+        claim: "per-particle force laws, a user-defined law, and every integrator give bit-identical trajectories, and observer-law rows (sum, mean, min, max) bit-identical values, on 1, 2, 3 and 8 threads",
         run: particle_trajectories_match,
     },
     Case {
@@ -242,6 +245,14 @@ fn particle_domain() -> ParticleDomain {
     domain
 }
 
+/// An observer law over the cloud, reading position, velocity and mass.
+const CLOUD_OBSERVER: &str = "observer energy_ish(a: particle) -> joule {
+    return 0.5 * a.mass * dot(a.velocity, a.velocity) + a.position.x * 1 newton;
+}";
+
+/// The state after `steps` steps, then what each reduction of [`CLOUD_OBSERVER`] records
+/// for it: observers run on the calling thread whatever the executor, so their rows differ
+/// between thread counts only if the state does.
 fn run_particles(executor: &Executor, integrator: Integrator, steps: usize) -> Vec<u64> {
     let mut domain = particle_domain().with_integrator(integrator);
     let mut arena = Arena::with_capacity(0);
@@ -251,14 +262,34 @@ fn run_particles(executor: &Executor, integrator: Integrator, steps: usize) -> V
         domain.advance(1e-3, &mut ctx);
     }
     let store = domain.store();
-    store
+    let mut bits: Vec<u64> = store
         .pos_x()
         .iter()
         .chain(store.pos_y())
         .chain(store.vel_x())
         .chain(store.vel_y())
         .map(|value| value.to_bits())
-        .collect()
+        .collect();
+    let domains: Vec<Box<dyn Domain>> = vec![Box::new(domain)];
+    let published = Observations::new();
+    let context = ObserveContext::new(steps as f64 * 1e-3, steps as u64, &domains, &published);
+    let mut rows = Observations::new();
+    for reduction in ["sum", "mean", "min", "max"] {
+        let mut observer = lattice_compiler::observe::observer_from_source(
+            CLOUD_OBSERVER,
+            &format!("{reduction}(energy_ish(cloud))"),
+            None,
+        )
+        .unwrap_or_else(|rendered| panic!("the validation observer compiles:
+{rendered}"));
+        observer.observe(&context, &mut rows);
+    }
+    assert_eq!(rows.len(), 4, "every reduction recorded its row");
+    bits.extend(rows.iter().map(|row| {
+        assert!(row.value.is_finite());
+        row.value.to_bits()
+    }));
+    bits
 }
 
 fn particle_trajectories_match() -> Outcome {
