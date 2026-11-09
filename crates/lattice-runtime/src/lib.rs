@@ -196,6 +196,9 @@ pub enum ObserverFaultKind {
     WrongUnit,
     /// It published a row of kind `Invariant`, which only an engine solver may claim.
     InvariantRow,
+    /// It published the same row twice in one call, which would give the timeline two
+    /// columns of one name.
+    DuplicateRow,
     /// It returned a curve its contract's `outputs` does not declare.
     UndeclaredCurve,
     /// It returned a curve named like one a domain or observer already returned.
@@ -231,6 +234,7 @@ impl ObserverFault {
             ObserverFaultKind::UndeclaredRow
             | ObserverFaultKind::WrongUnit
             | ObserverFaultKind::InvariantRow
+            | ObserverFaultKind::DuplicateRow
             | ObserverFaultKind::UndeclaredCurve
             | ObserverFaultKind::DuplicateCurve => "broke its contract",
         };
@@ -302,8 +306,16 @@ pub struct Simulation {
 }
 
 /// An attached observer, and whether it is still running.
+///
+/// What the run needs from the observer's contract is copied here by `add_observer`, and
+/// `Observer::contract` is not called again: it is user code, and a panic in it outside
+/// the `catch_unwind` around `observe` would take the run down.
 struct ObserverSlot {
     observer: Box<dyn Observer>,
+    /// The contract's `name`, for the fault record.
+    name: String,
+    /// The contract's `outputs`: the rows and curves it may publish, with their units.
+    outputs: Vec<(std::borrow::Cow<'static, str>, std::borrow::Cow<'static, str>)>,
     /// The domains its contract lists in `reads`, kept here so the context can borrow
     /// them while the observer is borrowed mutably.
     reads: Vec<std::borrow::Cow<'static, str>>,
@@ -385,7 +397,8 @@ impl Simulation {
     ///   supplies those names.
     ///
     /// At run time a row outside the declared `outputs`, or in another unit than the one
-    /// declared there, disables the observer (`E0951`). The observer reaches only the
+    /// declared there, or the same row twice in one call, disables the observer
+    /// (`E0951`). The observer reaches only the
     /// domains its contract lists in `reads`.
     pub fn add_observer(&mut self, observer: Box<dyn Observer>) -> Result<(), Vec<ObserverGap>> {
         let names: Vec<&str> = self.domains.iter().map(|domain| domain.name()).collect();
@@ -399,9 +412,10 @@ impl Simulation {
         for (index, (name, _)) in contract.outputs.iter().enumerate() {
             let name = name.as_ref();
             let repeated = contract.outputs[..index].iter().any(|(other, _)| other == name);
-            let taken = self.observers.iter().any(|slot| {
-                slot.observer.contract().outputs.iter().any(|(other, _)| other == name)
-            });
+            let taken = self
+                .observers
+                .iter()
+                .any(|slot| slot.outputs.iter().any(|(other, _)| other == name));
             if repeated || taken {
                 gaps.push(ObserverGap::OutputTaken(name.to_string()));
             }
@@ -412,8 +426,9 @@ impl Simulation {
         if !gaps.is_empty() {
             return Err(gaps);
         }
-        let reads = observer.contract().reads.clone();
-        self.observers.push(ObserverSlot { observer, reads, disabled: false });
+        let (name, reads, outputs) =
+            (contract.name.to_string(), contract.reads.clone(), contract.outputs.clone());
+        self.observers.push(ObserverSlot { observer, name, reads, outputs, disabled: false });
         Ok(())
     }
 
@@ -486,7 +501,7 @@ impl Simulation {
             let fault = match catch_unwind(AssertUnwindSafe(|| slot.observer.curves())) {
                 Err(payload) => Some((ObserverFaultKind::Panic, panic_message(payload.as_ref()))),
                 Ok(found) => {
-                    let outputs = &slot.observer.contract().outputs;
+                    let outputs = &slot.outputs;
                     let mut breach = None;
                     for (index, curve) in found.iter().enumerate() {
                         let name = curve.name.as_str();
@@ -517,7 +532,7 @@ impl Simulation {
             if let Some((kind, message)) = fault {
                 slot.disabled = true;
                 self.observer_faults.push(ObserverFault {
-                    observer: slot.observer.contract().name.to_string(),
+                    observer: slot.name.clone(),
                     kind,
                     step: self.clock.step,
                     time: self.clock.time,
@@ -636,7 +651,8 @@ impl Simulation {
     /// the rows published before it. One that panics, or publishes a row its contract
     /// does not declare in `outputs`, is disabled, that sample's rows from it are
     /// dropped, and the fault is recorded (`E0951`). A row in another unit than the one
-    /// `outputs` declares for it is the same breach.
+    /// `outputs` declares for it is the same breach, and so is the same row twice in one
+    /// call.
     ///
     /// Each call is one sample, and it advances the observers' [`Observer::due`] state,
     /// so call it once per instant: [`Simulation::run`] does, and a caller driving the
@@ -663,8 +679,9 @@ impl Simulation {
             }));
             let fault = match outcome {
                 Ok(()) => {
-                    let outputs = &slot.observer.contract().outputs;
-                    self.observer_rows.iter().find_map(|row| {
+                    let outputs = &slot.outputs;
+                    let rows = &self.observer_rows;
+                    rows.iter().enumerate().find_map(|(index, row)| {
                         if matches!(row.kind, lattice_ir::ObservationKind::Invariant(_)) {
                             return Some((
                                 ObserverFaultKind::InvariantRow,
@@ -692,6 +709,15 @@ impl Simulation {
                                     row.name, row.unit, unit
                                 ),
                             )),
+                            Some(_) if rows.iter().take(index).any(|earlier| earlier.name == row.name) => {
+                                Some((
+                                    ObserverFaultKind::DuplicateRow,
+                                    format!(
+                                        "it published row `{}` twice in one call",
+                                        row.name
+                                    ),
+                                ))
+                            }
                             Some(_) => None,
                         }
                     })
@@ -704,7 +730,7 @@ impl Simulation {
                     slot.disabled = true;
                     self.observer_rows.clear();
                     self.observer_faults.push(ObserverFault {
-                        observer: slot.observer.contract().name.to_string(),
+                        observer: slot.name.clone(),
                         kind,
                         step,
                         time,
@@ -1609,6 +1635,10 @@ mod tests {
         undeclared_on_call: Option<u32>,
         /// Publishes `<name>.steps` in the wrong unit, on this call.
         wrong_unit_on_call: Option<u32>,
+        /// Publishes `<name>.steps` twice, on this call.
+        duplicate_on_call: Option<u32>,
+        /// Once set, `contract()` panics, as a plugin's could after attachment.
+        contract_panics: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// Publishes NaN, on this call.
         nan_on_call: Option<u32>,
         /// Publishes `<name>.saw` as an invariant, on this call.
@@ -1644,6 +1674,8 @@ mod tests {
                 panic_on_call: None,
                 undeclared_on_call: None,
                 wrong_unit_on_call: None,
+                duplicate_on_call: None,
+                contract_panics: Default::default(),
                 nan_on_call: None,
                 invariant_on_call: None,
                 extra_curve: None,
@@ -1661,6 +1693,9 @@ mod tests {
 
     impl Observer for Probe {
         fn contract(&self) -> &lattice_ir::ObserverContract {
+            if self.contract_panics.load(std::sync::atomic::Ordering::SeqCst) {
+                panic!("contract() called during the run");
+            }
             &self.contract
         }
         fn observe(&mut self, ctx: &ObserveContext<'_>, out: &mut Observations) {
@@ -1682,6 +1717,9 @@ mod tests {
                 counter.steps as f64
             };
             out.record_metric(format!("{name}.steps"), steps, unit);
+            if self.duplicate_on_call == Some(self.calls) {
+                out.record_metric(format!("{name}.steps"), steps, unit);
+            }
             let seen = ctx.observations().value("a.count").expect("domain rows come first");
             if self.invariant_on_call == Some(self.calls) {
                 out.record_invariant(format!("{name}.saw"), lattice_ir::Invariant::Energy, seen);
@@ -1786,6 +1824,14 @@ mod tests {
         assert_eq!(column(&outcome, "first.saw"), column(&outcome, "a.count"));
         assert!(outcome.observer_faults.is_empty());
         assert!(outcome.artifact.warnings().is_empty());
+
+        // The series table carries every row's unit and kind, observers' included.
+        let json = outcome.artifact.to_json();
+        let series = json.get("series").expect("the artifact has a series table");
+        let entry = series.get("second.steps").expect("an observer's row is in the table");
+        assert_eq!(entry.get("unit"), Some(&Json::from("1")));
+        assert_eq!(entry.get("kind"), Some(&Json::from("metric")));
+        assert!(series.get("a.count").is_some(), "and so is a domain's");
     }
 
     #[test]
@@ -1968,6 +2014,87 @@ mod tests {
             "{:?}",
             outcome.artifact.warnings()
         );
+    }
+
+    /// The same declared row twice in one call is a breach: the timeline would get two
+    /// columns of one name.
+    #[test]
+    fn a_duplicate_row_disables_the_observer() {
+        let mut breaker = Probe::new("breaker");
+        breaker.duplicate_on_call = Some(3);
+        let mut simulation = observed(vec![breaker, Probe::new("fine")]);
+        let outcome = run5(&mut simulation);
+
+        assert!(outcome.is_success());
+        assert_eq!(column(&outcome, "breaker.calls").len(), 2, "calls 1 and 2 only");
+        assert_eq!(column(&outcome, "breaker.steps").len(), 2, "the bad sample is dropped");
+        assert_eq!(column(&outcome, "fine.calls").len(), 6);
+        for sample in outcome.artifact.timeline() {
+            for (index, (name, _)) in sample.values.iter().enumerate() {
+                assert!(
+                    sample.values[..index].iter().all(|(other, _)| other != name),
+                    "duplicate column `{name}` at step {}",
+                    sample.step
+                );
+            }
+        }
+
+        assert_eq!(outcome.observer_faults.len(), 1);
+        let fault = &outcome.observer_faults[0];
+        assert_eq!((fault.observer.as_str(), fault.step), ("breaker", 2));
+        assert_eq!(fault.kind, ObserverFaultKind::DuplicateRow);
+        let text = fault.describe();
+        assert!(
+            text.contains("broke its contract") && text.contains("`breaker.steps`") && text.contains("twice"),
+            "{text}"
+        );
+        assert!(
+            outcome.artifact.warnings().iter().any(|w| w.starts_with("error[E0951]:") && w.contains("twice")),
+            "{:?}",
+            outcome.artifact.warnings()
+        );
+    }
+
+    /// `contract()` is user code. It is read once, at attachment; a `contract()` that
+    /// panics afterwards does not take the run down, whatever else the observer does.
+    #[test]
+    fn a_panicking_contract_after_attachment_is_never_called() {
+        let mut crasher = Probe::new("crasher");
+        crasher.panic_on_call = Some(3);
+        let mut undeclared = Probe::new("undeclared");
+        undeclared.undeclared_on_call = Some(2);
+        let mut duplicate = Probe::new("duplicate");
+        duplicate.duplicate_on_call = Some(2);
+        let mut stray = Probe::new("stray");
+        stray.extra_curve = Some("stray.other".to_string());
+        let healthy = Probe::new("healthy");
+
+        let armed: Vec<_> = [&crasher, &undeclared, &duplicate, &stray, &healthy]
+            .into_iter()
+            .map(|probe| std::sync::Arc::clone(&probe.contract_panics))
+            .collect();
+        let mut simulation = observed(vec![crasher, undeclared, duplicate, stray, healthy]);
+        for flag in &armed {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let outcome = run5(&mut simulation);
+        assert!(outcome.is_success(), "{:?}", outcome.stop);
+        let faults: Vec<(&str, ObserverFaultKind)> =
+            outcome.observer_faults.iter().map(|f| (f.observer.as_str(), f.kind)).collect();
+        // In the order they happened: call 2 (two observers), call 3, then the curves.
+        assert_eq!(
+            faults,
+            [
+                ("undeclared", ObserverFaultKind::UndeclaredRow),
+                ("duplicate", ObserverFaultKind::DuplicateRow),
+                ("crasher", ObserverFaultKind::Panic),
+                ("stray", ObserverFaultKind::UndeclaredCurve),
+            ]
+        );
+        assert_eq!(column(&outcome, "healthy.calls").len(), 6);
+        let curves: Vec<&str> = outcome.artifact.curves().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(curves, ["healthy.curve"]);
     }
 
     /// The outcome carries the accumulated faults on every return path, as the

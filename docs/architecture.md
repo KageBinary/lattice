@@ -455,6 +455,13 @@ build produce the same hash even though one took longer, which is what makes the
 usable as the regression signal FR-011 asks for. Including timings would make every run
 unique and the hash worthless.
 
+The physics section starts with `schema`, the artifact's `ARTIFACT_SCHEMA` version, and
+holds a `series` table: each recorded series' unit and kind (`invariant`, `residual`,
+`metric`, `stability_margin`, `count`), written once, in name order. The version is inside
+the hash, so raising it changes every content hash once. Schema 2 added the table (and
+the `schema` field itself, so 1 is any artifact without one). No test pins a content
+hash; the artifact's series test asserts the version, so a bump is a deliberate edit.
+
 The RNG is a hand-written PCG32 with pinned test vectors. `rand` promises
 reproducibility within a major version; a checkpoint recorded today must replay in five
 years.

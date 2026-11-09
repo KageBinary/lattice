@@ -29,6 +29,8 @@
 //! disabled and the run records `E0951` if it:
 //!
 //! - publishes a row not named in `outputs`, or in a unit other than the one declared;
+//! - publishes the same row twice in one call, which would give the timeline two columns
+//!   of one name;
 //! - publishes a row of kind `Invariant`: only the engine's own solvers may claim that a
 //!   quantity is conserved (spec M6.2 G2), so an observer publishes metrics;
 //! - returns a curve not named in `outputs`, or one whose name another curve already
@@ -76,8 +78,8 @@ pub trait Observer: Send {
     /// Rows go into `out`, which is this observer's alone; the runtime appends it to the
     /// sample afterwards. The domains' rows are read through
     /// [`ObserveContext::observations`] and cannot be altered from here. Each row must be
-    /// named in the contract's `outputs` with the unit declared there, or the observer is
-    /// disabled (`E0951`).
+    /// named in the contract's `outputs` with the unit declared there, and published at
+    /// most once per call, or the observer is disabled (`E0951`).
     ///
     /// A non-finite row halts the run with `StopReason::NonFinite`, the same as a
     /// domain's, so never publish NaN as a placeholder: publish nothing for that sample.
