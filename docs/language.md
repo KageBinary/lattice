@@ -954,6 +954,10 @@ operand is ignored in favour of the other, as it always was.
 | `E0203`, `E0204` | at a use site: a `param` with no value or default, a pair law with no `cutoff`; an unknown or positional argument |
 | `E0201`, `E0208`, `E0405` | at a use site: a parameter bound twice; a `truncation` that is not `energy_shift`, `force_shift` or `none`; a cutoff that is not a positive length, or a potential that is not finite at its cutoff for the set's particles (one that divides by a charge the set gives as zero) |
 | `E0413` | also: a law too large for the interpreter's register file (512 values) |
+| `E0416` | an `observer` law with a second particle; pair observers are not implemented |
+| `E0417` | an `observer` law returning a vector; observe each component separately |
+| `E0418` | an `observer` law reading `c(…)`, `temperature` or `arrhenius`: observers read particles only |
+| `E0420` | a law of the wrong kind at a use site; today, an `observer` named in a particle set's `force:` |
 | `W0313` | a `let` or `param` whose name is also a unit |
 | `W0314` | a law that does not limit the timestep: a `force`, or a potential with no well inside its cutoff |
 | `W0315` | an untruncated pair potential whose energy at the cutoff is not zero |
@@ -1010,7 +1014,7 @@ visualize probability_density;         // the domain picks an encoding
 
 Every rejection carries a source position and either a suggested fix or the rule it
 enforces; `crates/lattice-compiler/tests/fixtures.rs` asserts both across the
-50 models in `tests/invalid/`.
+52 models in `tests/invalid/`.
 
 ---
 
@@ -1024,7 +1028,6 @@ numbers.
 | Construct | Milestone |
 |---|---|
 | `domain fluid2d` | M4 |
-| `observer` laws | M6.2 |
 
 Stochastic kinetics (Gillespie) is not implemented either, but it has no syntax of its
 own — a `solve reactions(…) with gillespie(…)` would be the way in, and it reports an

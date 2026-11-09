@@ -717,6 +717,34 @@ project orbit {
         assert!(summary.contains("conserves nothing by construction"), "{summary}");
     }
 
+    /// An observer law checks and compiles, and is not a force: naming one in `force:` is
+    /// refused rather than run as one, and an unused observer draws no `force:` warning.
+    #[test]
+    fn an_observer_law_is_not_a_force() {
+        let observer = "observer kinetic(a: particle) -> joule {
+            return 0.5 * a.mass * dot(a.velocity, a.velocity);
+        }";
+        let model = |force: &str| {
+            format!(
+                "project p {{ {observer}
+                   particles s {{ count: 1; mass: 1 kilogram; {force} }}
+                   solve dynamics(s) with velocity_verlet(dt=0.01 second);
+                 }}"
+            )
+        };
+        let (_, diagnostics, _) = build(&model(""));
+        assert!(diagnostics.codes().is_empty(), "{:?}", diagnostics.codes());
+        let (_, codes) = err(&model("force: kinetic;"));
+        assert_eq!(codes, ["E0420"]);
+
+        // A declared constant named `temperature` is the model's own, as it is everywhere.
+        let (_, diagnostics, _) = build(
+            "project p { let temperature = 300 kelvin;
+               observer o(a: particle) -> kelvin { return temperature; } }",
+        );
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.codes());
+    }
+
     /// A rate that reads `temperature` is the state, and so a rate law, which must come
     /// out in mol/(m² s) — unless `temperature` is a constant, when the rate is one too.
     #[test]

@@ -114,6 +114,10 @@ pub enum UserLawKind {
     BodyForce,
     /// `potential u(a) -> joule`: outputs `(U, ∂U/∂x, ∂U/∂y)`.
     BodyPotential,
+    /// `observer o(a) -> unit`: one output, the quantity itself, on the body layout. It is
+    /// read once per particle at a sample and never applied as a force, so the force
+    /// loops must not be given one.
+    BodyObserver,
 }
 
 impl UserLawKind {
@@ -132,6 +136,7 @@ impl UserLawKind {
         match self {
             UserLawKind::PairForce | UserLawKind::BodyForce | UserLawKind::PairPotential => 2,
             UserLawKind::BodyPotential => 3,
+            UserLawKind::BodyObserver => 1,
         }
     }
 
@@ -604,6 +609,7 @@ impl UserLaw {
         charge: &[f64],
         visit: impl FnMut(usize, f64, f64, f64),
     ) {
+        debug_assert!(self.kind != UserLawKind::BodyObserver, "an observer is not a force");
         match self.evaluation {
             Evaluation::Scalar => self.body_forces_scalar(pos, vel, mass, charge, visit),
             Evaluation::Batched => self.body_forces_batched(pos, vel, mass, charge, visit),

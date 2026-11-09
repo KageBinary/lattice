@@ -64,6 +64,7 @@ pub fn lower(law: &TypedLaw) -> Result<LoweredLaw, Box<Diagnostic>> {
         (LawKind::Force, false) => UserLawKind::BodyForce,
         (LawKind::Potential, true) => UserLawKind::PairPotential,
         (LawKind::Potential, false) => UserLawKind::BodyPotential,
+        (LawKind::Observer, _) => UserLawKind::BodyObserver,
         (LawKind::Rate, _) => unreachable!("a rate law is lowered by `lower_rate`"),
     };
     let mut offsets = Vec::with_capacity(law.params.len());
@@ -91,7 +92,8 @@ pub fn lower(law: &TypedLaw) -> Result<LoweredLaw, Box<Diagnostic>> {
             let a = layout::BODY_A;
             (written.gradient(&[a + layout::PX, a + layout::PY]), Some(written))
         }
-        UserLawKind::PairForce | UserLawKind::BodyForce => (written, None),
+        // An observer's value is the program's one output; nothing is differentiated.
+        UserLawKind::PairForce | UserLawKind::BodyForce | UserLawKind::BodyObserver => (written, None),
     };
     if !program.fits() {
         return Err(Box::new(Diagnostic::error(format!("`{}` is too large to compile", law.name))
@@ -458,6 +460,38 @@ mod tests {
         assert!(!law.branches);
         let out = law.program.eval_to_vec(&pair_inputs(1.5, 0.0), &[4.0]);
         assert!((out[0] - 0.5).abs() < 1e-15 && (out[1] - 2.0).abs() < 1e-15, "{out:?}");
+    }
+
+    #[test]
+    fn an_observer_lowers_to_its_value_on_the_body_layout() {
+        let law = lowered(
+            "project p { observer kinetic_x(a: particle) -> joule {
+                param scale: 1 = 1;
+                return scale * 0.5 * a.mass * a.velocity.x * a.velocity.x;
+            } }",
+        );
+        assert_eq!(law.kind, UserLawKind::BodyObserver);
+        assert_eq!(law.program.output_count(), 1);
+        assert_eq!(law.program.input_count(), layout::BODY_INPUTS as usize);
+        assert_eq!(law.program.input_count(), law.kind.inputs());
+        assert_eq!(law.param_slots, 1);
+        assert!(law.energy.is_none(), "no derivative is taken");
+        let mut inputs = vec![0.0; layout::BODY_INPUTS as usize];
+        inputs[(layout::BODY_A + layout::VX) as usize] = 3.0;
+        inputs[(layout::BODY_A + layout::MASS) as usize] = 2.0;
+        // The program is the law as written, bit for bit: ((s × 0.5) × m) × vx × vx.
+        let out = law.program.eval_to_vec(&inputs, &[1.5]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to_bits(), (1.5_f64 * 0.5 * 2.0 * 3.0 * 3.0).to_bits());
+
+        // A law with `if` branches, like any body law.
+        let law = lowered(
+            "project p { observer right_half(a: particle) -> 1 {
+                return if a.position.x > 0 meter { 1 } else { 0 };
+            } }",
+        );
+        assert_eq!(law.kind, UserLawKind::BodyObserver);
+        assert!(law.branches);
     }
 
     #[test]

@@ -1038,6 +1038,16 @@ impl<'a> Compiler<'a> {
                 // A law that failed its check was reported where it was declared; it
                 // has nothing to bind.
                 let Some(law) = self.laws.iter().find(|law| law.name == name) else { continue };
+                if law.kind == laws::LawKind::Observer {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!("`{name}` is an observer law, and `force:` takes a force or a potential"))
+                            .with_code("E0420")
+                            .at(setting.value.span, "an observer here")
+                            .note("an observer measures particles and applies nothing to them")
+                            .help("an observer is reduced at an `observe` statement; a law that acts on particles is a `force` or `potential`"),
+                    );
+                    continue;
+                }
                 if let Some(user) = crate::user_force::bind(law, &setting.value, &evaluator, &sample, &mut self.diagnostics) {
                     self.law_uses.push(LawUse {
                         law: name.to_string(),
@@ -1307,6 +1317,11 @@ impl<'a> Compiler<'a> {
     fn warn_about_unused_laws(&mut self, project: &Project) {
         for law in project.laws() {
             if self.used_laws.contains(&law.name.text) || !self.laws.iter().any(|l| l.name == law.name.text) {
+                continue;
+            }
+            // An observer is used at an `observe`, not in a particle set's `force:`; the
+            // `observe` site that records its use arrives with it.
+            if self.laws.iter().any(|l| l.name == law.name.text && l.kind == laws::LawKind::Observer) {
                 continue;
             }
             self.diagnostics.push(
