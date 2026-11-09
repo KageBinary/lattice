@@ -18,16 +18,21 @@
 //! # Reaching a domain's state
 //!
 //! [`ObserveContext::domain`] downcasts a domain to its concrete type through
-//! [`Domain::as_any`](crate::DomainType::as_any), and only for a domain the observer's
+//! [`Domain::as_any`](crate::contract::DomainType::as_any), and only for a domain the observer's
 //! contract lists in `reads`; any other name gives `None`. That couples the observer to
 //! the domain's internals. A read-only view over the domain's data is the better
 //! surface, and the SDK is to provide one for particles (it does not exist yet).
 //!
 //! # What the runtime enforces
 //!
-//! The contract is checked against behaviour, not just filled in. A row an observer
-//! publishes must be named in `outputs` with the same unit, or the observer is disabled
-//! and the run records `E0951`.
+//! The contract is checked against behaviour, not just filled in. The observer is
+//! disabled and the run records `E0951` if it:
+//!
+//! - publishes a row not named in `outputs`, or in a unit other than the one declared;
+//! - publishes a row of kind `Invariant`: only the engine's own solvers may claim that a
+//!   quantity is conserved (spec M6.2 G2), so an observer publishes metrics;
+//! - returns a curve not named in `outputs`, or one whose name another curve already
+//!   has.
 //!
 //! A non-finite row halts the run with `StopReason::NonFinite` in the runtime, exactly as
 //! a domain's row does (spec M6.2 G7). So an observer must not publish NaN as a
@@ -81,6 +86,10 @@ pub trait Observer: Send {
     fn observe(&mut self, ctx: &ObserveContext<'_>, out: &mut Observations);
 
     /// Function-valued results, as [`Domain::curves`]. Taken once at the end of a run.
+    ///
+    /// Each curve's name must be in the contract's `outputs` and must not repeat another
+    /// curve's, or the observer is disabled and its curves from that call are dropped
+    /// (`E0951`).
     fn curves(&self) -> Vec<Curve> {
         Vec::new()
     }
@@ -288,8 +297,12 @@ impl<'a> ObserveContext<'a> {
         self.step
     }
 
-    /// The rows the domains just published, and those of observers attached before
-    /// this one.
+    /// Every row published so far this sample: the domains', and those of observers
+    /// attached before this one.
+    ///
+    /// This shows all of them whatever `reads` says. Published rows are the shared
+    /// channel between solvers and observers; `reads` governs access to domain *state*
+    /// through [`ObserveContext::domain`].
     pub fn observations(&self) -> &Observations {
         self.observations
     }

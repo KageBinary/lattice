@@ -194,6 +194,12 @@ pub enum ObserverFaultKind {
     UndeclaredRow,
     /// It published a row in a unit other than the one `outputs` declares for it.
     WrongUnit,
+    /// It published a row of kind `Invariant`, which only an engine solver may claim.
+    InvariantRow,
+    /// It returned a curve its contract's `outputs` does not declare.
+    UndeclaredCurve,
+    /// It returned a curve named like one a domain or observer already returned.
+    DuplicateCurve,
 }
 
 /// An observer that was switched off (diagnostic `E0951`).
@@ -222,9 +228,11 @@ impl ObserverFault {
     pub fn describe(&self) -> String {
         let what = match self.kind {
             ObserverFaultKind::Panic => "panicked",
-            ObserverFaultKind::UndeclaredRow | ObserverFaultKind::WrongUnit => {
-                "broke its contract"
-            }
+            ObserverFaultKind::UndeclaredRow
+            | ObserverFaultKind::WrongUnit
+            | ObserverFaultKind::InvariantRow
+            | ObserverFaultKind::UndeclaredCurve
+            | ObserverFaultKind::DuplicateCurve => "broke its contract",
         };
         format!(
             "observer `{}` {what} at step {} and was disabled: {}",
@@ -463,40 +471,58 @@ impl Simulation {
 
     /// Every curve across all domains and observers, as accumulated so far.
     ///
-    /// A disabled observer contributes none, and neither does one whose `curves`
-    /// panics; [`Simulation::run`] records that panic.
-    pub fn curves(&self) -> Vec<lattice_ir::Curve> {
-        let mut curves: Vec<lattice_ir::Curve> =
-            self.domains.iter().flat_map(|domain| domain.curves()).collect();
-        for slot in self.observers.iter().filter(|slot| !slot.disabled) {
-            if let Ok(found) = catch_unwind(AssertUnwindSafe(|| slot.observer.curves())) {
-                curves.extend(found);
-            }
-        }
-        curves
-    }
-
-    /// The end-of-run curves: each enabled observer's `curves()` is called once, and a
-    /// panic there disables it and is recorded (`E0951`).
-    fn take_curves(&mut self) -> Vec<lattice_ir::Curve> {
+    /// Each enabled observer's `curves()` is called once per call here, so it is for the
+    /// end of a run or a viewer between frames, not an inner loop. An observer that
+    /// panics, returns a curve its contract's `outputs` does not declare, or returns one
+    /// named like a curve already collected is disabled, its curves from this call are
+    /// dropped, and the fault is recorded (`E0951`). A disabled observer is not asked.
+    pub fn curves(&mut self) -> Vec<lattice_ir::Curve> {
         let mut curves: Vec<lattice_ir::Curve> =
             self.domains.iter().flat_map(|domain| domain.curves()).collect();
         for slot in &mut self.observers {
             if slot.disabled {
                 continue;
             }
-            match catch_unwind(AssertUnwindSafe(|| slot.observer.curves())) {
-                Ok(found) => curves.extend(found),
-                Err(payload) => {
-                    slot.disabled = true;
-                    self.observer_faults.push(ObserverFault {
-                        observer: slot.observer.contract().name.to_string(),
-                        kind: ObserverFaultKind::Panic,
-                        step: self.clock.step,
-                        time: self.clock.time,
-                        message: panic_message(payload.as_ref()),
-                    });
+            let fault = match catch_unwind(AssertUnwindSafe(|| slot.observer.curves())) {
+                Err(payload) => Some((ObserverFaultKind::Panic, panic_message(payload.as_ref()))),
+                Ok(found) => {
+                    let outputs = &slot.observer.contract().outputs;
+                    let mut breach = None;
+                    for (index, curve) in found.iter().enumerate() {
+                        let name = curve.name.as_str();
+                        if !outputs.iter().any(|(declared, _)| declared == name) {
+                            breach = Some((
+                                ObserverFaultKind::UndeclaredCurve,
+                                format!(
+                                    "it returned curve `{name}`, which its contract's \
+                                     `outputs` does not declare"
+                                ),
+                            ));
+                        } else if curves.iter().chain(&found[..index]).any(|c| c.name == name) {
+                            breach = Some((
+                                ObserverFaultKind::DuplicateCurve,
+                                format!("it returned curve `{name}`, which already exists"),
+                            ));
+                        }
+                        if breach.is_some() {
+                            break;
+                        }
+                    }
+                    if breach.is_none() {
+                        curves.extend(found);
+                    }
+                    breach
                 }
+            };
+            if let Some((kind, message)) = fault {
+                slot.disabled = true;
+                self.observer_faults.push(ObserverFault {
+                    observer: slot.observer.contract().name.to_string(),
+                    kind,
+                    step: self.clock.step,
+                    time: self.clock.time,
+                    message,
+                });
             }
         }
         curves
@@ -639,6 +665,16 @@ impl Simulation {
                 Ok(()) => {
                     let outputs = &slot.observer.contract().outputs;
                     self.observer_rows.iter().find_map(|row| {
+                        if matches!(row.kind, lattice_ir::ObservationKind::Invariant(_)) {
+                            return Some((
+                                ObserverFaultKind::InvariantRow,
+                                format!(
+                                    "it published row `{}` as an invariant, which only an \
+                                     engine solver may claim; publish a metric",
+                                    row.name
+                                ),
+                            ));
+                        }
                         match outputs.iter().find(|(name, _)| *name == row.name) {
                             None => Some((
                                 ObserverFaultKind::UndeclaredRow,
@@ -823,7 +859,7 @@ impl Simulation {
         }
         // Curves summarize the whole run, so they are taken once, after the last step —
         // including after a stop, where a partial result is still what was measured.
-        for curve in self.take_curves() {
+        for curve in self.curves() {
             artifact.add_curve(curve);
         }
         self.warn_of_observer_faults(&mut artifact);
@@ -950,6 +986,8 @@ mod tests {
         watching: bool,
         /// Whether it has any user law to watch.
         has_laws: bool,
+        /// A curve it publishes, if any.
+        curve: Option<String>,
     }
 
     impl Counter {
@@ -962,6 +1000,7 @@ mod tests {
                 poison_at: None,
                 watching: false,
                 has_laws: true,
+                curve: None,
             }
         }
     }
@@ -994,6 +1033,14 @@ mod tests {
                 _ => self.steps as f64,
             };
             out.record_invariant(format!("{}.count", self.name), Invariant::Energy, value);
+        }
+        fn curves(&self) -> Vec<lattice_ir::Curve> {
+            self.curve
+                .iter()
+                .map(|name| {
+                    lattice_ir::Curve::new(name.clone(), ("x", "1"), ("y", "1"), vec![0.0], vec![1.0])
+                })
+                .collect()
         }
         fn trace_laws(&mut self, on: bool) -> bool {
             self.watching = on;
@@ -1564,6 +1611,10 @@ mod tests {
         wrong_unit_on_call: Option<u32>,
         /// Publishes NaN, on this call.
         nan_on_call: Option<u32>,
+        /// Publishes `<name>.saw` as an invariant, on this call.
+        invariant_on_call: Option<u32>,
+        /// Returns this extra curve name from `curves()`.
+        extra_curve: Option<String>,
         panic_in_curves: bool,
         /// How many times `curves()` has been called.
         curve_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -1579,7 +1630,7 @@ mod tests {
                     name: name.into(),
                     summary: "a test observer".into(),
                     reads: vec!["a".into()],
-                    outputs: ["calls", "steps", "saw"]
+                    outputs: ["calls", "steps", "saw", "curve"]
                         .into_iter()
                         .map(|row| (format!("{name}.{row}").into(), "1".into()))
                         .collect(),
@@ -1594,6 +1645,8 @@ mod tests {
                 undeclared_on_call: None,
                 wrong_unit_on_call: None,
                 nan_on_call: None,
+                invariant_on_call: None,
+                extra_curve: None,
                 panic_in_curves: false,
                 curve_calls: Default::default(),
                 every: 1,
@@ -1630,7 +1683,11 @@ mod tests {
             };
             out.record_metric(format!("{name}.steps"), steps, unit);
             let seen = ctx.observations().value("a.count").expect("domain rows come first");
-            out.record_metric(format!("{name}.saw"), seen, "1");
+            if self.invariant_on_call == Some(self.calls) {
+                out.record_invariant(format!("{name}.saw"), lattice_ir::Invariant::Energy, seen);
+            } else {
+                out.record_metric(format!("{name}.saw"), seen, "1");
+            }
             assert!(ctx.domain::<String>("a").is_none(), "the wrong type downcasts to nothing");
             assert!(ctx.domain::<Counter>("nope").is_none());
         }
@@ -1639,13 +1696,12 @@ mod tests {
             if self.panic_in_curves {
                 panic!("no curve today");
             }
-            vec![lattice_ir::Curve::new(
-                format!("{}.curve", self.name()),
-                ("x", "1"),
-                ("y", "1"),
-                vec![0.0],
-                vec![1.0],
-            )]
+            let curve = |name: String| {
+                lattice_ir::Curve::new(name, ("x", "1"), ("y", "1"), vec![0.0], vec![1.0])
+            };
+            let mut curves = vec![curve(format!("{}.curve", self.name()))];
+            curves.extend(self.extra_curve.clone().map(curve));
+            curves
         }
         fn due(&mut self, _time: f64, _dt: f64) -> bool {
             self.asked += 1;
@@ -1857,6 +1913,7 @@ mod tests {
                 ObserverGap::OutputTaken("p.calls".to_string()),
                 ObserverGap::OutputTaken("p.steps".to_string()),
                 ObserverGap::OutputTaken("p.saw".to_string()),
+                ObserverGap::OutputTaken("p.curve".to_string()),
             ]
         );
         // A name repeated within one contract is refused too.
@@ -2002,5 +2059,84 @@ mod tests {
         };
         assert_eq!((observation.as_str(), *step), ("poisoner.steps", 2));
         assert!(outcome.observer_faults.is_empty(), "not a contract breach");
+    }
+
+    /// Only the engine's solvers may publish an invariant (spec G2).
+    #[test]
+    fn an_invariant_row_disables_the_observer() {
+        let mut claimant = Probe::new("claimant");
+        claimant.invariant_on_call = Some(3);
+        let mut simulation = observed(vec![claimant, Probe::new("fine")]);
+        let outcome = run5(&mut simulation);
+
+        assert!(outcome.is_success());
+        assert_eq!(column(&outcome, "claimant.saw").len(), 2, "the bad sample is dropped");
+        assert_eq!(column(&outcome, "fine.calls").len(), 6);
+        assert_eq!(outcome.observer_faults.len(), 1);
+        let fault = &outcome.observer_faults[0];
+        assert_eq!((fault.observer.as_str(), fault.step), ("claimant", 2));
+        assert_eq!(fault.kind, ObserverFaultKind::InvariantRow);
+        assert!(fault.describe().contains("`claimant.saw`"), "{}", fault.describe());
+    }
+
+    /// A curve must be declared in `outputs`.
+    #[test]
+    fn an_undeclared_curve_disables_the_observer() {
+        let mut stray = Probe::new("stray");
+        stray.extra_curve = Some("stray.other".to_string());
+        let mut simulation = observed(vec![stray, Probe::new("fine")]);
+        let outcome = run5(&mut simulation);
+
+        assert!(outcome.is_success());
+        assert_eq!(outcome.observer_faults.len(), 1);
+        let fault = &outcome.observer_faults[0];
+        assert_eq!((fault.observer.as_str(), fault.kind), ("stray", ObserverFaultKind::UndeclaredCurve));
+        assert!(fault.describe().contains("`stray.other`"), "{}", fault.describe());
+        let curves: Vec<&str> = outcome.artifact.curves().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(curves, ["fine.curve"], "all of the offender's curves are dropped");
+    }
+
+    /// A declared curve whose name another curve already has is a clash: with one a
+    /// domain returned, or with the observer's own.
+    #[test]
+    fn a_clashing_curve_disables_the_observer() {
+        let mut domain = Counter::new("a");
+        domain.curve = Some("a.curve".to_string());
+        let mut simulation = Simulation::new(model_with("test"), vec![Box::new(domain)]);
+
+        let mut shadow = Probe::new("shadow");
+        shadow.contract.outputs.push(("a.curve".into(), "1".into()));
+        shadow.extra_curve = Some("a.curve".to_string());
+        let mut twice = Probe::new("twice");
+        twice.extra_curve = Some("twice.curve".to_string());
+        simulation.add_observer(Box::new(shadow)).unwrap();
+        simulation.add_observer(Box::new(twice)).unwrap();
+        let outcome = run5(&mut simulation);
+
+        let kinds: Vec<(&str, ObserverFaultKind)> =
+            outcome.observer_faults.iter().map(|f| (f.observer.as_str(), f.kind)).collect();
+        assert_eq!(
+            kinds,
+            [("shadow", ObserverFaultKind::DuplicateCurve), ("twice", ObserverFaultKind::DuplicateCurve)]
+        );
+        let curves: Vec<&str> = outcome.artifact.curves().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(curves, ["a.curve"], "only the domain's curve survives");
+    }
+
+    /// `Simulation::curves` records a panic in an observer's `curves()` and disables it,
+    /// as the end of a run does.
+    #[test]
+    fn curves_records_a_panicking_observer() {
+        let mut probe = Probe::new("curvy");
+        probe.panic_in_curves = true;
+        let mut simulation = observed(vec![probe, Probe::new("fine")]);
+        let curves: Vec<String> = simulation.curves().into_iter().map(|c| c.name).collect();
+        assert_eq!(curves, ["fine.curve"]);
+        assert_eq!(simulation.observer_faults().len(), 1);
+        assert_eq!(simulation.observer_faults()[0].kind, ObserverFaultKind::Panic);
+        // Disabled now: asked no more, and not recorded twice.
+        let again: Vec<String> = simulation.curves().into_iter().map(|c| c.name).collect();
+        assert_eq!(again, ["fine.curve"]);
+        assert_eq!(simulation.observer_faults().len(), 1);
     }
 }

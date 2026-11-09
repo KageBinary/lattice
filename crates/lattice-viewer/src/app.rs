@@ -304,7 +304,7 @@ impl ViewerApp {
             .default_size(380.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let State::Ready(loaded) = &self.state else {
+                    let State::Ready(loaded) = &mut self.state else {
                         ui.colored_label(
                             palette.status(Status::Critical),
                             "this model did not compile",
