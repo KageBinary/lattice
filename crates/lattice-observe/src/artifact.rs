@@ -15,7 +15,7 @@
 //! makes the hash usable as the regression signal FR-011 asks for. Including timings
 //! would make every run unique and the hash worthless.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -80,6 +80,8 @@ pub struct RunArtifact {
     timeline: Vec<TimelineSample>,
     /// The unit and kind of each series the timeline holds, keyed by name.
     series: BTreeMap<String, SeriesInfo>,
+    /// Series already warned about for changing unit or kind, so each warns once.
+    series_conflicts: BTreeSet<String>,
     curves: Vec<Curve>,
     /// Timing profile. Excluded from the content hash.
     pub profile: Profile,
@@ -108,6 +110,7 @@ impl RunArtifact {
             parameters: Json::object(),
             timeline: Vec::new(),
             series: BTreeMap::new(),
+            series_conflicts: BTreeSet::new(),
             curves: Vec::new(),
             profile: Profile::new(),
             memory: MemoryReport::new(),
@@ -172,14 +175,27 @@ impl RunArtifact {
     ///
     /// The first time a name is seen, its unit and kind go into the `series` table, so
     /// the artifact states them once instead of with every sample. A later sample that
-    /// gives the same name another unit or kind does not change the entry.
+    /// gives the same name another unit or kind does not change the entry, but it adds
+    /// a warning (once per name), so the table cannot quietly misstate the timeline.
     pub fn record(&mut self, time: f64, step: u64, observations: &Observations) {
         for o in observations.iter() {
-            if !self.series.contains_key(o.name.as_ref()) {
-                self.series.insert(
-                    o.name.to_string(),
-                    SeriesInfo { unit: o.unit.to_string(), kind: kind_code(o.kind) },
-                );
+            let kind = kind_code(o.kind);
+            match self.series.get(o.name.as_ref()) {
+                None => {
+                    self.series
+                        .insert(o.name.to_string(), SeriesInfo { unit: o.unit.to_string(), kind });
+                }
+                Some(first) if first.unit != o.unit.as_ref() || first.kind != kind => {
+                    if self.series_conflicts.insert(o.name.to_string()) {
+                        let message = format!(
+                            "series `{}` was first recorded as unit `{}`, kind `{}`, and at step {step} \
+                             as unit `{}`, kind `{kind}`; the series table keeps the first",
+                            o.name, first.unit, first.kind, o.unit
+                        );
+                        self.warnings.push(message);
+                    }
+                }
+                Some(_) => {}
             }
         }
         self.timeline.push(TimelineSample {
@@ -519,6 +535,37 @@ mod tests {
         assert_eq!(text.matches("\"m/s\"").count(), 1, "{text}");
         let timeline = json.get("timeline").unwrap().to_compact_string();
         assert!(!timeline.contains("unit") && !timeline.contains("m/s"), "{timeline}");
+    }
+
+    /// A name that changes unit or kind keeps its first entry, and the artifact says so,
+    /// once, instead of letting the table misstate the timeline.
+    #[test]
+    fn a_series_that_changes_unit_or_kind_warns_once_and_keeps_the_first() {
+        let mut a = RunArtifact::new("demo").without_timestamp();
+        let mut first = Observations::new();
+        first.record_metric("x.speed", 1.0, "m/s");
+        let mut changed = Observations::new();
+        changed.record("x.speed", 2.0, "km/s", ObservationKind::Count);
+        let mut same_again = Observations::new();
+        same_again.record_metric("x.speed", 3.0, "m/s");
+
+        a.record(0.0, 0, &first);
+        a.record(0.1, 1, &same_again);
+        assert!(a.warnings().is_empty(), "a repeat of the first is no conflict");
+        a.record(0.2, 2, &changed);
+        a.record(0.3, 3, &changed);
+
+        assert_eq!(a.warnings().len(), 1, "once per name: {:?}", a.warnings());
+        let w = &a.warnings()[0];
+        assert!(
+            w.contains("`x.speed`") && w.contains("`m/s`") && w.contains("`metric`")
+                && w.contains("`km/s`") && w.contains("`count`") && w.contains("step 2"),
+            "{w}"
+        );
+        let json = a.to_json();
+        let entry = json.get("series").unwrap().get("x.speed").unwrap();
+        assert_eq!(entry.get("unit"), Some(&Json::from("m/s")));
+        assert_eq!(entry.get("kind"), Some(&Json::from("metric")));
     }
 
     /// The schema version and the table are physics: they are inside the content hash.

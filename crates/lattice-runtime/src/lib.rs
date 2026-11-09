@@ -397,7 +397,8 @@ impl Simulation {
     ///   supplies those names.
     ///
     /// At run time a row outside the declared `outputs`, or in another unit than the one
-    /// declared there, disables the observer (`E0951`). The observer reaches only the
+    /// declared there, or the same row twice in one call, disables the observer
+    /// (`E0951`). The observer reaches only the
     /// domains its contract lists in `reads`.
     pub fn add_observer(&mut self, observer: Box<dyn Observer>) -> Result<(), Vec<ObserverGap>> {
         let names: Vec<&str> = self.domains.iter().map(|domain| domain.name()).collect();
