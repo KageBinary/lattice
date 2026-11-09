@@ -24,10 +24,14 @@
 //!
 //! # Panics
 //!
-//! The runtime wraps each call in `catch_unwind`. Because the observer has only `&`
-//! access to the simulation, a panic cannot have corrupted it, and only the observer's
-//! own state is suspect, so the observer is disabled and the run continues (NFR-004).
-//! This holds for panics, not aborts: it needs `panic = "unwind"` in the profile.
+//! The runtime wraps each call in `catch_unwind`, disables an observer that panics, and
+//! carries on (NFR-004). `&` access means the observer cannot corrupt the simulation
+//! through the `&` API, but it does not make a panic harmless: a domain with interior
+//! mutability (`RefCell`, `Mutex`) can be reached through
+//! [`ObserveContext::domain`], and a panic in the middle of a call that touches it can
+//! leave that state inconsistent. Reading through a view that exposes only plain slices
+//! avoids this. It holds for panics, not aborts: it needs `panic = "unwind"` in the
+//! profile.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -44,8 +48,13 @@ pub trait Observer: Send {
     /// Called at each sample this observer is [due](Observer::due) for, after every
     /// domain has published. `ctx.time()` and `ctx.step()` say when.
     ///
-    /// Read-only on the simulation, mutable on itself. Rows go into `out`, which is
-    /// this observer's alone: the runtime appends it to the sample afterwards, so the
+    /// `&` access to the simulation stops the observer mutating it through the `&` API,
+    /// but not through interior mutability in a domain reached via
+    /// [`ObserveContext::domain`]: a panic part-way through such a call can leave that
+    /// state inconsistent, and the runtime can only disable the observer, not repair it.
+    /// Mutable on itself. Rows go into `out`, which is
+    /// this observer's alone and must be named in the contract's `outputs`; a row that
+    /// is not disables the observer. The runtime appends it to the sample afterwards, so the
     /// domains' rows are read through [`ObserveContext::observations`] and cannot be
     /// altered from here.
     fn observe(&mut self, ctx: &ObserveContext<'_>, out: &mut Observations);
@@ -168,6 +177,10 @@ pub enum ObserverGap {
     NoLimitations,
     /// Runs on no backend.
     NoBackends,
+    /// An `outputs` name another observer, or this one, already declares.
+    OutputTaken(String),
+    /// An `outputs` name a domain already publishes.
+    OutputShadowsDomain(String),
 }
 
 impl core::fmt::Display for ObserverGap {
@@ -184,6 +197,12 @@ impl core::fmt::Display for ObserverGap {
                 f.write_str("the contract states no limitations: say what it does not measure")
             }
             ObserverGap::NoBackends => f.write_str("the contract names no backend"),
+            ObserverGap::OutputTaken(name) => {
+                write!(f, "the output `{name}` is already declared by an observer")
+            }
+            ObserverGap::OutputShadowsDomain(name) => {
+                write!(f, "the output `{name}` is a row a domain already publishes")
+            }
         }
     }
 }
