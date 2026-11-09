@@ -8,19 +8,20 @@
 //! gathered into an [`ObserverLawUse`]: the program, the values, the particle domain, the
 //! reduction, the unit and the row.
 
-use lattice_domain_particle::LawObserver;
 use lattice_ir::{ObserverLawUse, Reduction};
-use lattice_syntax::{Diagnostic, Diagnostics, Expr, ExprKind, SourceFile};
-use lattice_units::{Dimension, UnitRegistry};
+use lattice_syntax::{Diagnostics, Expr, ExprKind};
+use lattice_units::Dimension;
 
 use crate::eval::Evaluator;
 use crate::laws::{LawKind, Ty, TypedLaw};
 use crate::lower_law::lower;
 use crate::user_force::{bind_arguments, BindOptions};
 
-/// How a row's unit reads: `J` for an energy, the coherent SI form otherwise.
-pub(crate) fn unit_label(dimension: Dimension) -> String {
-    if dimension == Dimension::ENERGY {
+/// How a row's unit reads: `J` when the law declared an energy unit by name (`joule`,
+/// `J`), and the coherent SI form otherwise. A dimension alone cannot say `J`: a torque
+/// declared in `newton * meter` has the dimension of an energy and is not one.
+pub(crate) fn unit_label(dimension: Dimension, declared: Option<&str>) -> String {
+    if dimension == Dimension::ENERGY && matches!(declared, Some("joule" | "J")) {
         "J".to_string()
     } else {
         dimension.to_string()
@@ -70,47 +71,7 @@ pub(crate) fn lower_use(
         reduction,
         program: lowered.program,
         params: bound.params,
-        unit: unit_label(dimension),
+        unit: unit_label(dimension, law.declared_unit.as_deref()),
         row: format!("{domain}.{}.{}", law.name, reduction.name()),
     })
-}
-
-/// Compile one observer law and bind it as the use site `use_site` would, outside any
-/// model: for validation and tests that want a law observer without a scene around it.
-///
-/// `law_source` is the law's declaration; `use_site` is what follows `observe`, such as
-/// `sum(kinetic(cloud))` or `max(height(cloud, floor = 1 meter))`. The set is not looked
-/// up: the observer names it, and attaching it to a simulation audits that it exists.
-/// Returns the rendered diagnostics when anything fails.
-pub fn observer_from_source(
-    law_source: &str,
-    use_site: &str,
-    interval: Option<f64>,
-) -> Result<LawObserver, String> {
-    let text = format!("project law {{ {law_source} observe {use_site}; }}");
-    let file = SourceFile::new("law.lattice", text);
-    let (project, mut diagnostics) = lattice_syntax::parse(&file);
-    let Some(project) = project.filter(|_| !diagnostics.has_errors()) else {
-        return Err(diagnostics.render(&file));
-    };
-    let units = UnitRegistry::si();
-    let evaluator = Evaluator::new(&file, &units);
-    let laws = crate::laws::check_laws(&project, &evaluator, &mut diagnostics);
-    let shaped = project.observes().next().and_then(|statement| {
-        let ExprKind::Call(reduction, arguments) = &statement.target.kind else { return None };
-        let [reduced] = arguments.as_slice() else { return None };
-        let ExprKind::Call(callee, inner) = &reduced.value.kind else { return None };
-        let (law, set) = (callee.as_name()?, inner.first()?.value.as_name()?);
-        Some((Reduction::parse(reduction.as_name()?)?, laws.iter().find(|l| l.name == law)?, set, &reduced.value))
-    });
-    let Some((reduction, law, set, call)) = shaped else {
-        diagnostics.push(
-            Diagnostic::error("expected `reduction(law(set, …))`").with_code("E0419").span(project.name.span),
-        );
-        return Err(diagnostics.render(&file));
-    };
-    match lower_use(law, set, reduction, call, &evaluator, &mut diagnostics) {
-        Some(law) if !diagnostics.has_errors() => Ok(LawObserver::new(&law, interval)),
-        _ => Err(diagnostics.render(&file)),
-    }
 }

@@ -350,6 +350,7 @@ fn the_ramp_example_settles_inside_its_yard() {
     config.max_steps = None;
 
     let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+    simulation.add_observers(compiled.observers).expect("the model's own observers attach");
     let outcome = simulation.run(&config);
     assert!(outcome.is_success(), "{}", outcome.stop.describe());
 

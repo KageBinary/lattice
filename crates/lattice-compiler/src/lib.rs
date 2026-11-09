@@ -810,6 +810,22 @@ project orbit {
         assert!(compiled.model.report().contains("records `s.kinetic.sum` in J"));
     }
 
+    /// A row's unit is the law's: `J` for an energy declared as one, and the coherent SI
+    /// form for anything else, including a torque, which has an energy's dimension.
+    #[test]
+    fn a_row_is_labelled_with_the_unit_the_law_declared() {
+        let unit_of = |law: &str, name: &str| {
+            let compiled = ok(&observed(2, &format!("{law} observe sum({name}(s));")));
+            compiled.model.observers[0].law.as_ref().unwrap().unit.clone()
+        };
+        let torque = "observer torque(a: particle) -> newton * meter { return a.mass * 1 meter / second^2 * a.position.x; }";
+        assert_eq!(unit_of(torque, "torque"), "kg·m^2/s^2");
+        let energy = "observer work(a: particle) -> joule { return a.mass * 1 meter^2 / second^2; }";
+        assert_eq!(unit_of(energy, "work"), "J");
+        let speed = "observer speed(a: particle) -> meter / second { return length(a.velocity); }";
+        assert_eq!(unit_of(speed, "speed"), "m/s");
+    }
+
     /// `E0419`: the outer call must be one of the four reductions.
     #[test]
     fn an_observe_without_a_reduction_is_refused() {

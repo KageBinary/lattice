@@ -962,7 +962,11 @@ any other non-finite row; the compiler warns (`W0321`) when the set is declared 
 `count: 0`. A law that no `observe` uses draws `W0316`. A row that goes non-finite halts
 the run, and `lattice run` explains it (`E0950`) by evaluating the law again on the state it
 sampled, which the run still holds, so nothing is replayed: it names the first particle in
-index order whose value is not finite and the operation that made it so.
+index order whose value is not finite and the operation that made it so. Some non-finite
+rows have no such particle, and then the explanation blames none: a `sum` that overflows
+although every value is finite, and the `mean`, `min` or `max` of an empty set. `lattice
+run` then falls back to the replay it uses for the laws of a force or a potential, which
+finds nothing to blame for these and prints only the `HALTED:` line.
 
 **The plain `observe TARGET` is unchanged: it sets a cadence and filters nothing.** Every
 domain's whole set of rows is recorded at the smallest interval of all the `observe`

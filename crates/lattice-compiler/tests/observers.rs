@@ -139,3 +139,26 @@ fn a_non_finite_observer_row_halts_the_run_and_is_explained_at_the_operation() {
     // A row nothing published is not explained.
     assert!(simulation.explain_observer_halt("atoms.count").is_none());
 }
+
+/// A second `run` on the same simulation starts with a sample of its own: the observers'
+/// schedules start over, rather than waiting for instants the first run already passed.
+#[test]
+fn a_second_run_samples_its_initial_state() {
+    let source = gas(4, KINETIC, "observe sum(kinetic(atoms)) every 0.3 second;");
+    let file = SourceFile::new("gas.lattice", source);
+    let (compiled, diagnostics) = compile_source(&file);
+    assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+    let compiled = compiled.unwrap();
+    let config = RunConfig::from_model(&compiled.model);
+    let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+    simulation.add_observers(compiled.observers).unwrap();
+    let first = simulation.run(&config);
+    assert!(first.is_success());
+    // The clock carries on, so the second run's duration is absolute: another 0.6 s.
+    let second = simulation.run(&config.with_duration(1.5));
+    assert!(second.is_success(), "{}", second.stop.describe());
+    let started = second.artifact.timeline()[0].time;
+    let rows = series(&second, "atoms.kinetic.sum");
+    assert_eq!(rows.first().map(|(t, _)| *t), Some(started), "{rows:?}");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+}

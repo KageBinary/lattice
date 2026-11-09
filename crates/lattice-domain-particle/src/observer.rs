@@ -50,6 +50,8 @@ pub struct LawObserver {
     interval: Option<f64>,
     /// The next instant this observer is due at, seconds.
     next_due: f64,
+    /// The instant of the latest sample asked about, to notice a run starting over.
+    last_time: Option<f64>,
 }
 
 impl LawObserver {
@@ -81,7 +83,10 @@ impl LawObserver {
             limitations: vec![
                 Cow::Borrowed("sampled at observation instants only"),
                 Cow::Borrowed(
-                    "reduction in index order; not invariant to particle relabelling for min/max ties",
+                    "sum and mean depend on particle index order in their last bits: floating-point                      addition is not associative, so relabelling the particles can change them",
+                ),
+                Cow::Borrowed(
+                    "the row is a metric, never an invariant: the engine cannot know whether the                      quantity is conserved",
                 ),
             ],
             deterministic: true,
@@ -99,6 +104,7 @@ impl LawObserver {
             unit: law.unit.clone(),
             interval,
             next_due: 0.0,
+            last_time: None,
         }
     }
 
@@ -119,7 +125,15 @@ impl Observer for LawObserver {
     }
 
     fn observe(&mut self, ctx: &ObserveContext<'_>, out: &mut Observations) {
-        let Some(domain) = ctx.domain::<ParticleDomain>(&self.set) else { return };
+        // The contract lists the set and the model audit checked it is a particle domain, so
+        // not finding it is a bug; the runtime turns the panic into `E0951` and disables
+        // this observer, which is better than recording nothing for the rest of the run.
+        let Some(domain) = ctx.domain::<ParticleDomain>(&self.set) else {
+            panic!(
+                "observer `{}` could not reach `{}` as a particle domain: it is missing from the                  simulation, is not a particle domain, or is outside the observer's `reads`",
+                self.row, self.set
+            )
+        };
         let value = reduce_law(&self.program, &self.params, self.reduction, domain.store());
         out.record_metric(self.row.clone(), value, self.unit.clone());
     }
@@ -128,8 +142,16 @@ impl Observer for LawObserver {
     /// cadence uses: the sample nearest the instant, not the first one past it. The run
     /// samples at the smallest interval of all its observers, so a slower one is due at
     /// some samples and not others, and is never due between them.
+    ///
+    /// A sample at or before the previous one's instant starts the schedule over: a
+    /// second `run` on the same simulation samples its initial state at the instant the
+    /// first ended, and that sample must be taken.
     fn due(&mut self, time: f64, dt: f64) -> bool {
         let Some(interval) = self.interval.filter(|i| i.is_finite() && *i > 0.0) else { return true };
+        if self.last_time.is_some_and(|last| time <= last) {
+            self.next_due = time;
+        }
+        self.last_time = Some(time);
         let reach = time + 0.5 * dt;
         if reach < self.next_due {
             return false;
@@ -391,7 +413,9 @@ mod tests {
         assert!(contract.audit(&["gas"]).is_empty());
         assert_eq!(contract.reads, ["gas"]);
         assert_eq!(contract.outputs, [("gas.wave.max".into(), "J".into())]);
-        assert_eq!(contract.limitations.len(), 2);
+        assert_eq!(contract.limitations.len(), 3);
+        assert!(contract.limitations.iter().all(|l| !l.contains("min/max ties")));
+        assert!(contract.limitations.iter().any(|l| l.contains("sum and mean depend on particle index order")));
         assert!(contract.deterministic && !contract.differentiable);
         assert_eq!(observer.row(), "gas.wave.max");
     }
@@ -415,6 +439,31 @@ mod tests {
         assert!(matches!(row.kind, lattice_ir::ObservationKind::Metric));
         let store = domains[0].as_any().downcast_ref::<ParticleDomain>().unwrap().store();
         assert_eq!(row.value.to_bits(), scalar(&program(), &[1.7], Reduction::Sum, store).to_bits());
+    }
+
+    /// Not finding its set is a bug the runtime reports as `E0951`, not a quiet gap in the
+    /// series.
+    #[test]
+    #[should_panic(expected = "could not reach `gas` as a particle domain")]
+    fn a_missing_set_is_a_panic_not_silence() {
+        let domains: Vec<Box<dyn Domain>> = Vec::new();
+        let observations = Observations::new();
+        let ctx = ObserveContext::new(0.0, 0, &domains, &observations);
+        LawObserver::new(&law_use(Reduction::Sum), None).observe(&ctx, &mut Observations::new());
+    }
+
+    /// A run that starts over at the instant the last one ended, or earlier, is sampled
+    /// at once rather than waiting for the old schedule.
+    #[test]
+    fn a_second_run_is_sampled_at_its_start() {
+        let dt = 0.05;
+        let mut observer = LawObserver::new(&law_use(Reduction::Sum), Some(0.3));
+        assert!(observer.due(0.9, dt));
+        assert!(!observer.due(1.0, dt), "the schedule continues from the restart");
+        assert!(observer.due(0.9, dt), "the same instant starts over");
+        assert!(observer.due(0.0, dt), "and so does an earlier one");
+        assert!(!observer.due(0.1, dt));
+        assert!(observer.due(0.3, dt));
     }
 
     /// Due at 0, then by the half-step rule: a 0.3 observer on a 0.1 sample grid is due
