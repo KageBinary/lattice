@@ -38,7 +38,17 @@ pub const ARTIFACT_SCHEMA: u32 = 2;
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct SeriesInfo {
     unit: String,
-    kind: &'static str,
+    /// The full kind, so a change of which invariant a row claims is a conflict even
+    /// though the table prints only [`kind_code`].
+    kind: ObservationKind,
+}
+
+/// A kind as a warning words it: the code, and for an invariant which one.
+fn kind_label(kind: ObservationKind) -> String {
+    match kind {
+        ObservationKind::Invariant(invariant) => format!("invariant ({invariant})"),
+        other => kind_code(other).to_string(),
+    }
 }
 
 /// A stable name for a kind of reading, as written in the `series` table.
@@ -179,7 +189,7 @@ impl RunArtifact {
     /// a warning (once per name), so the table cannot quietly misstate the timeline.
     pub fn record(&mut self, time: f64, step: u64, observations: &Observations) {
         for o in observations.iter() {
-            let kind = kind_code(o.kind);
+            let kind = o.kind;
             match self.series.get(o.name.as_ref()) {
                 None => {
                     self.series
@@ -189,8 +199,12 @@ impl RunArtifact {
                     if self.series_conflicts.insert(o.name.to_string()) {
                         let message = format!(
                             "series `{}` was first recorded as unit `{}`, kind `{}`, and at step {step} \
-                             as unit `{}`, kind `{kind}`; the series table keeps the first",
-                            o.name, first.unit, first.kind, o.unit
+                             as unit `{}`, kind `{}`; the series table keeps the first",
+                            o.name,
+                            first.unit,
+                            kind_label(first.kind),
+                            o.unit,
+                            kind_label(kind)
                         );
                         self.warnings.push(message);
                     }
@@ -280,7 +294,7 @@ impl RunArtifact {
         for (name, info) in &self.series {
             series.insert(
                 name.clone(),
-                Json::object().set("unit", info.unit.clone()).set("kind", info.kind),
+                Json::object().set("unit", info.unit.clone()).set("kind", kind_code(info.kind)),
             );
         }
         root.insert("series", series);
@@ -490,7 +504,7 @@ mod tests {
     /// The series table states each series' unit and kind once, in name order, and the
     /// schema version says the table is there.
     #[test]
-    fn series_table_round_trips_through_the_json() {
+    fn series_table_is_written_once_in_name_order() {
         assert_eq!(ARTIFACT_SCHEMA, 2, "bump this deliberately, with a note in docs");
 
         let mut a = RunArtifact::new("demo").without_timestamp();
@@ -568,20 +582,47 @@ mod tests {
         assert_eq!(entry.get("kind"), Some(&Json::from("metric")));
     }
 
+    /// A change of which invariant a row claims is a conflict, though the table prints
+    /// both as `invariant`.
+    #[test]
+    fn a_series_that_changes_invariant_warns() {
+        let mut a = RunArtifact::new("demo").without_timestamp();
+        let mut first = Observations::new();
+        first.record("x.e", 1.0, "J", ObservationKind::Invariant(Invariant::Energy));
+        let mut other = Observations::new();
+        other.record("x.e", 1.0, "J", ObservationKind::Invariant(Invariant::KineticEnergy));
+        a.record(0.0, 0, &first);
+        a.record(0.1, 1, &other);
+
+        assert_eq!(a.warnings().len(), 1, "{:?}", a.warnings());
+        let w = &a.warnings()[0];
+        assert!(
+            w.contains("`x.e`") && w.contains("total energy") && w.contains("kinetic energy"),
+            "{w}"
+        );
+    }
+
     /// The schema version and the table are physics: they are inside the content hash.
     #[test]
     fn series_and_schema_are_inside_the_content_hash() {
-        let plain = artifact();
-        // Same values as `artifact()` plus one more series.
-        let mut extra = RunArtifact::new("demo").with_seed(7).without_timestamp();
-        extra.add_contract(&TEST_CONTRACT);
-        extra.set_parameter("dt", 1e-3);
-        let mut obs = sample_observations(10.0);
-        obs.record("test.extra", 1.0, "1", ObservationKind::Count);
-        extra.record(0.0, 0, &obs);
-        extra.record(0.1, 100, &sample_observations(10.001));
-        assert_ne!(plain.content_hash(), extra.content_hash());
-        assert!(plain.canonical_json().to_compact_string().starts_with("{\"schema\":2,"));
+        // Identical timelines, values and names; only one series' unit, or its kind,
+        // differs. Those live in the table alone, so the hash differing proves the
+        // table is hashed.
+        let build = |unit: &'static str, kind: ObservationKind| {
+            let mut a = RunArtifact::new("demo").with_seed(7).without_timestamp();
+            let mut obs = Observations::new();
+            obs.record("x.speed", 1.5, unit, kind);
+            a.record(0.0, 0, &obs);
+            a.record(0.1, 1, &obs);
+            a
+        };
+        let base = build("m/s", ObservationKind::Metric);
+        assert_eq!(base.timeline()[0].values, build("km/s", ObservationKind::Metric).timeline()[0].values);
+        assert_eq!(base.content_hash(), build("m/s", ObservationKind::Metric).content_hash());
+        assert_ne!(base.content_hash(), build("km/s", ObservationKind::Metric).content_hash());
+        assert_ne!(base.content_hash(), build("m/s", ObservationKind::Count).content_hash());
+
+        assert!(base.canonical_json().to_compact_string().starts_with("{\"schema\":2,"));
     }
 
     #[test]
