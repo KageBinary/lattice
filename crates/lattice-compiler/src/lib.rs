@@ -718,7 +718,8 @@ project orbit {
     }
 
     /// An observer law checks and compiles, and is not a force: naming one in `force:` is
-    /// refused rather than run as one, and an unused observer draws no `force:` warning.
+    /// refused rather than run as one. Nothing can observe one yet, so it draws an
+    /// observer-specific `W0316`, not the force-oriented one.
     #[test]
     fn an_observer_law_is_not_a_force() {
         let observer = "observer kinetic(a: particle) -> joule {
@@ -732,8 +733,13 @@ project orbit {
                  }}"
             )
         };
-        let (_, diagnostics, _) = build(&model(""));
-        assert!(diagnostics.codes().is_empty(), "{:?}", diagnostics.codes());
+        let (_, diagnostics, file) = build(&model(""));
+        let text = diagnostics.render(&file);
+        assert_eq!(diagnostics.codes(), ["W0316"], "{text}");
+        assert!(
+            text.contains("nothing observes it") && !text.contains("force:") && text.contains("not implemented yet"),
+            "{text}"
+        );
         let (_, codes) = err(&model("force: kinetic;"));
         assert_eq!(codes, ["E0420"]);
 

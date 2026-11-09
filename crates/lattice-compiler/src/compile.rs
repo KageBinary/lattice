@@ -1319,9 +1319,15 @@ impl<'a> Compiler<'a> {
             if self.used_laws.contains(&law.name.text) || !self.laws.iter().any(|l| l.name == law.name.text) {
                 continue;
             }
-            // An observer is used at an `observe`, not in a particle set's `force:`; the
-            // `observe` site that records its use arrives with it.
+            // An observer is used at an `observe`, not in a particle set's `force:`. That
+            // use site is not implemented yet, so today nothing can observe one.
             if self.laws.iter().any(|l| l.name == law.name.text && l.kind == laws::LawKind::Observer) {
+                self.diagnostics.push(
+                    Diagnostic::warning(format!("observer law `{}` is declared but nothing observes it", law.name.text))
+                        .with_code("W0316")
+                        .at(law.name.span, "unused")
+                        .note("the `observe` use site that reduces an observer law over a particle set is not implemented yet"),
+                );
                 continue;
             }
             self.diagnostics.push(

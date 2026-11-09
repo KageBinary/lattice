@@ -215,6 +215,9 @@ impl UserLaw {
     ///
     /// If the program's shape does not match the kind, it does not fit
     /// [`MAX_REGISTERS`], or a pair law has no positive cutoff: all compiler bugs.
+    /// Also if `kind` is [`UserLawKind::BodyObserver`]: a `UserLaw` is a force the loops
+    /// apply, and the force loops read outputs an observer's one-output program never
+    /// writes.
     pub fn new(
         name: impl Into<String>,
         kind: UserLawKind,
@@ -223,6 +226,10 @@ impl UserLaw {
         cutoff: Option<f64>,
         truncation: Option<Truncation>,
     ) -> UserLaw {
+        assert!(
+            kind != UserLawKind::BodyObserver,
+            "an observer law is not a force: a UserLaw cannot be built from a BodyObserver"
+        );
         assert_eq!(program.output_count(), kind.outputs(), "{kind:?} program has the wrong outputs");
         assert_eq!(program.input_count(), kind.inputs(), "{kind:?} program has the wrong inputs");
         assert_eq!(program.param_count(), params.len(), "unbound parameters");
@@ -609,7 +616,6 @@ impl UserLaw {
         charge: &[f64],
         visit: impl FnMut(usize, f64, f64, f64),
     ) {
-        debug_assert!(self.kind != UserLawKind::BodyObserver, "an observer is not a force");
         match self.evaluation {
             Evaluation::Scalar => self.body_forces_scalar(pos, vel, mass, charge, visit),
             Evaluation::Batched => self.body_forces_batched(pos, vel, mass, charge, visit),
@@ -805,6 +811,26 @@ mod tests {
         let u = b.push(Op::Mul(half_k, square));
         let program = b.finish(vec![u]).derivative(layout::R);
         UserLaw::new("spring", UserLawKind::PairPotential, program, vec![k, r0], Some(5.0), None)
+    }
+
+    #[test]
+    fn a_body_observer_is_one_output_on_the_body_layout() {
+        let kind = UserLawKind::BodyObserver;
+        assert_eq!(kind.outputs(), 1);
+        assert_eq!(kind.inputs(), layout::BODY_INPUTS as usize);
+        assert!(!kind.is_pair());
+        assert!(!kind.is_potential());
+    }
+
+    /// A `UserLaw` is applied as a force; the loops read outputs an observer's program
+    /// never writes, so one is refused in release builds as well.
+    #[test]
+    #[should_panic(expected = "an observer law is not a force")]
+    fn a_body_observer_cannot_be_a_user_law() {
+        let mut b = Builder::new(layout::BODY_INPUTS, 0);
+        let mass = b.push(Op::Input(layout::BODY_A + layout::MASS));
+        let program = b.finish(vec![mass]);
+        UserLaw::new("observer", UserLawKind::BodyObserver, program, vec![], None, None);
     }
 
     #[test]
