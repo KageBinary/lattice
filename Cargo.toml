@@ -33,8 +33,9 @@ lattice-playground = { path = "crates/lattice-playground", version = "0.1.0" }
 lattice-validation = { path = "crates/lattice-validation", version = "0.1.0" }
 
 # No profile sets `panic`, so it stays "unwind". Do not set `panic = "abort"`: the runtime
-# catches a panicking observer with `catch_unwind` and disables it (NFR-004, M6.2 R1), and
-# under "abort" that panic would kill the run instead.
+# catches a panicking observer with `catch_unwind` and disables it (M6.2 R1), and under
+# "abort" that panic would kill the run instead. This covers panics only: an infinite loop,
+# a stack overflow or an abort in an observer still hangs or kills the run.
 
 # Spec §15.1: "Optimize after validation." Release builds are what the benchmark
 # harness measures, so they carry debug line tables for profiling.

@@ -18,20 +18,34 @@
 //! # Reaching a domain's state
 //!
 //! [`ObserveContext::domain`] downcasts a domain to its concrete type through
-//! [`Domain::as_any`](crate::DomainType::as_any). That couples the observer to the
-//! domain's internals, so a plugin should go through a read-only view where one exists
-//! (the SDK's `ParticleView`) rather than the store itself.
+//! [`Domain::as_any`](crate::DomainType::as_any), and only for a domain the observer's
+//! contract lists in `reads`; any other name gives `None`. That couples the observer to
+//! the domain's internals. A read-only view over the domain's data is the better
+//! surface, and the SDK is to provide one for particles (it does not exist yet).
+//!
+//! # What the runtime enforces
+//!
+//! The contract is checked against behaviour, not just filled in. A row an observer
+//! publishes must be named in `outputs` with the same unit, or the observer is disabled
+//! and the run records `E0951`.
+//!
+//! A non-finite row halts the run with `StopReason::NonFinite` in the runtime, exactly as
+//! a domain's row does (spec M6.2 G7). So an observer must not publish NaN as a
+//! placeholder for "no value yet": leave the row out of that sample instead.
 //!
 //! # Panics
 //!
 //! The runtime wraps each call in `catch_unwind`, disables an observer that panics, and
-//! carries on (NFR-004). `&` access means the observer cannot corrupt the simulation
-//! through the `&` API, but it does not make a panic harmless: a domain with interior
-//! mutability (`RefCell`, `Mutex`) can be reached through
-//! [`ObserveContext::domain`], and a panic in the middle of a call that touches it can
-//! leave that state inconsistent. Reading through a view that exposes only plain slices
-//! avoids this. It holds for panics, not aborts: it needs `panic = "unwind"` in the
-//! profile.
+//! carries on with the run (E0951). That isolates panics, and only panics: an infinite
+//! loop or a stack overflow in an observer still hangs or kills the run, an abort is not
+//! caught, and under `panic = "abort"` (which the workspace profiles do not set, and a
+//! downstream build must not) the panic would end the run too.
+//!
+//! `&` access means the observer cannot corrupt the simulation through the `&` API, but
+//! it does not make a panic harmless: a domain with interior mutability (`RefCell`,
+//! `Mutex`) can be reached through [`ObserveContext::domain`], and a panic in the middle
+//! of a call that touches it can leave that state inconsistent. Reading plain slices
+//! avoids this.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -48,15 +62,22 @@ pub trait Observer: Send {
     /// Called at each sample this observer is [due](Observer::due) for, after every
     /// domain has published. `ctx.time()` and `ctx.step()` say when.
     ///
-    /// `&` access to the simulation stops the observer mutating it through the `&` API,
-    /// but not through interior mutability in a domain reached via
-    /// [`ObserveContext::domain`]: a panic part-way through such a call can leave that
-    /// state inconsistent, and the runtime can only disable the observer, not repair it.
-    /// Mutable on itself. Rows go into `out`, which is
-    /// this observer's alone and must be named in the contract's `outputs`; a row that
-    /// is not disables the observer. The runtime appends it to the sample afterwards, so the
-    /// domains' rows are read through [`ObserveContext::observations`] and cannot be
-    /// altered from here.
+    /// The observer is mutable on itself and read-only on the simulation: `&` access
+    /// stops it changing a domain through the `&` API, but not through interior
+    /// mutability in a domain reached via [`ObserveContext::domain`]. A panic part-way
+    /// through such a call can leave that state inconsistent, and the runtime can only
+    /// disable the observer, not repair it.
+    ///
+    /// Rows go into `out`, which is this observer's alone; the runtime appends it to the
+    /// sample afterwards. The domains' rows are read through
+    /// [`ObserveContext::observations`] and cannot be altered from here. Each row must be
+    /// named in the contract's `outputs` with the unit declared there, or the observer is
+    /// disabled (`E0951`).
+    ///
+    /// A non-finite row halts the run with `StopReason::NonFinite`, the same as a
+    /// domain's, so never publish NaN as a placeholder: publish nothing for that sample.
+    ///
+    /// Every call is one sample. See [`Observer::due`].
     fn observe(&mut self, ctx: &ObserveContext<'_>, out: &mut Observations);
 
     /// Function-valued results, as [`Domain::curves`]. Taken once at the end of a run.
@@ -66,6 +87,10 @@ pub trait Observer: Send {
 
     /// Whether the sample instant `time` is one this observer wants, given the step
     /// `dt` the run is taking. Default: every sample.
+    ///
+    /// Asked once per sample, before [`Observer::observe`], and an implementation may
+    /// advance its schedule when it answers yes. So the runtime treats each sample as
+    /// happening once: `Simulation::observe` must not be called twice for one instant.
     fn due(&mut self, _time: f64, _dt: f64) -> bool {
         true
     }
@@ -214,6 +239,8 @@ pub struct ObserveContext<'a> {
     step: u64,
     domains: &'a [Box<dyn Domain>],
     observations: &'a Observations,
+    /// The domains the observer may reach; `None` is all of them.
+    reads: Option<&'a [Cow<'static, str>]>,
 }
 
 impl core::fmt::Debug for ObserveContext<'_> {
@@ -229,13 +256,26 @@ impl core::fmt::Debug for ObserveContext<'_> {
 
 impl<'a> ObserveContext<'a> {
     /// A context at `time` and `step` over `domains`, with `observations` published.
+    ///
+    /// Every domain is reachable until [`ObserveContext::restricted_to`] narrows it.
     pub fn new(
         time: f64,
         step: u64,
         domains: &'a [Box<dyn Domain>],
         observations: &'a Observations,
     ) -> Self {
-        Self { time, step, domains, observations }
+        Self { time, step, domains, observations, reads: None }
+    }
+
+    /// The same context, reaching only the domains named in `reads`: an observer's
+    /// contract is what it may read.
+    pub fn restricted_to(mut self, reads: &'a [Cow<'static, str>]) -> Self {
+        self.reads = Some(reads);
+        self
+    }
+
+    fn allows(&self, name: &str) -> bool {
+        self.reads.is_none_or(|reads| reads.iter().any(|read| read == name))
     }
 
     /// Simulation time of this sample, seconds.
@@ -254,17 +294,21 @@ impl<'a> ObserveContext<'a> {
         self.observations
     }
 
-    /// The domain named `name`, as its concrete type, if it is a `T`.
+    /// The domain named `name`, as its concrete type, if it is a `T` and the observer's
+    /// contract lists it in `reads`. Any other name gives `None`.
     pub fn domain<T: 'static>(&self, name: &str) -> Option<&T> {
+        if !self.allows(name) {
+            return None;
+        }
         // `&**` matters: `Box<dyn Domain>` is itself `Any`, so calling `as_any` on the
         // box would downcast the box rather than the domain inside it.
         let domain: &dyn Domain = &**self.domains.iter().find(|d| d.name() == name)?;
         DomainType::as_any(domain).downcast_ref::<T>()
     }
 
-    /// The names of the domain instances, in model order.
+    /// The names of the domain instances the observer may read, in model order.
     pub fn domain_names(&self) -> impl Iterator<Item = &str> {
-        self.domains.iter().map(|d| d.name())
+        self.domains.iter().map(|d| d.name()).filter(|name| self.allows(name))
     }
 }
 

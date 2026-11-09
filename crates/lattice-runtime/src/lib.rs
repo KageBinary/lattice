@@ -192,9 +192,14 @@ pub enum ObserverFaultKind {
     Panic,
     /// It published a row its contract's `outputs` does not declare.
     UndeclaredRow,
+    /// It published a row in a unit other than the one `outputs` declares for it.
+    WrongUnit,
 }
 
-/// An observer that was switched off (diagnostic `E0951`, NFR-004).
+/// An observer that was switched off (diagnostic `E0951`).
+///
+/// Only a panic, or a breach of the observer's own contract, is caught. An observer that
+/// loops forever, overflows the stack or aborts still hangs or kills the run.
 #[derive(Clone, PartialEq, Debug)]
 pub struct ObserverFault {
     /// The observer's contract name.
@@ -217,7 +222,9 @@ impl ObserverFault {
     pub fn describe(&self) -> String {
         let what = match self.kind {
             ObserverFaultKind::Panic => "panicked",
-            ObserverFaultKind::UndeclaredRow => "broke its contract",
+            ObserverFaultKind::UndeclaredRow | ObserverFaultKind::WrongUnit => {
+                "broke its contract"
+            }
         };
         format!(
             "observer `{}` {what} at step {} and was disabled: {}",
@@ -289,6 +296,9 @@ pub struct Simulation {
 /// An attached observer, and whether it is still running.
 struct ObserverSlot {
     observer: Box<dyn Observer>,
+    /// The domains its contract lists in `reads`, kept here so the context can borrow
+    /// them while the observer is borrowed mutably.
+    reads: Vec<std::borrow::Cow<'static, str>>,
     disabled: bool,
 }
 
@@ -366,7 +376,9 @@ impl Simulation {
     ///   ([`ObserverGap::OutputShadowsDomain`]); one scratch sample of the domains
     ///   supplies those names.
     ///
-    /// At run time a row outside the declared `outputs` disables the observer (`E0951`).
+    /// At run time a row outside the declared `outputs`, or in another unit than the one
+    /// declared there, disables the observer (`E0951`). The observer reaches only the
+    /// domains its contract lists in `reads`.
     pub fn add_observer(&mut self, observer: Box<dyn Observer>) -> Result<(), Vec<ObserverGap>> {
         let names: Vec<&str> = self.domains.iter().map(|domain| domain.name()).collect();
         let contract = observer.contract();
@@ -392,7 +404,8 @@ impl Simulation {
         if !gaps.is_empty() {
             return Err(gaps);
         }
-        self.observers.push(ObserverSlot { observer, disabled: false });
+        let reads = observer.contract().reads.clone();
+        self.observers.push(ObserverSlot { observer, reads, disabled: false });
         Ok(())
     }
 
@@ -596,7 +609,12 @@ impl Simulation {
     /// Observers run in attachment order, each at a sample it is due for, and each sees
     /// the rows published before it. One that panics, or publishes a row its contract
     /// does not declare in `outputs`, is disabled, that sample's rows from it are
-    /// dropped, and the fault is recorded (`E0951`).
+    /// dropped, and the fault is recorded (`E0951`). A row in another unit than the one
+    /// `outputs` declares for it is the same breach.
+    ///
+    /// Each call is one sample, and it advances the observers' [`Observer::due`] state,
+    /// so call it once per instant: [`Simulation::run`] does, and a caller driving the
+    /// clock itself must not call it twice for the same instant.
     pub fn observe(&mut self) {
         self.observations.clear();
         for domain in &self.domains {
@@ -608,7 +626,8 @@ impl Simulation {
                 continue;
             }
             self.observer_rows.clear();
-            let ctx = ObserveContext::new(time, step, &self.domains, &self.observations);
+            let ctx = ObserveContext::new(time, step, &self.domains, &self.observations)
+                .restricted_to(&slot.reads);
             let rows = &mut self.observer_rows;
             let observer = &mut slot.observer;
             let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -619,19 +638,27 @@ impl Simulation {
             let fault = match outcome {
                 Ok(()) => {
                     let outputs = &slot.observer.contract().outputs;
-                    self.observer_rows
-                        .iter()
-                        .find(|row| !outputs.iter().any(|(name, _)| *name == row.name))
-                        .map(|row| {
-                            (
+                    self.observer_rows.iter().find_map(|row| {
+                        match outputs.iter().find(|(name, _)| *name == row.name) {
+                            None => Some((
                                 ObserverFaultKind::UndeclaredRow,
                                 format!(
                                     "it published row `{}`, which its contract's `outputs` \
                                      does not declare",
                                     row.name
                                 ),
-                            )
-                        })
+                            )),
+                            Some((_, unit)) if *unit != row.unit => Some((
+                                ObserverFaultKind::WrongUnit,
+                                format!(
+                                    "it published row `{}` in `{}`, but its contract's \
+                                     `outputs` declares `{}`",
+                                    row.name, row.unit, unit
+                                ),
+                            )),
+                            Some(_) => None,
+                        }
+                    })
                 }
                 Err(payload) => Some((ObserverFaultKind::Panic, panic_message(payload.as_ref()))),
             };
@@ -1533,6 +1560,10 @@ mod tests {
         panic_on_call: Option<u32>,
         /// Publishes a row its contract does not declare, on this call.
         undeclared_on_call: Option<u32>,
+        /// Publishes `<name>.steps` in the wrong unit, on this call.
+        wrong_unit_on_call: Option<u32>,
+        /// Publishes NaN, on this call.
+        nan_on_call: Option<u32>,
         panic_in_curves: bool,
         /// How many times `curves()` has been called.
         curve_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -1561,6 +1592,8 @@ mod tests {
                 calls: 0,
                 panic_on_call: None,
                 undeclared_on_call: None,
+                wrong_unit_on_call: None,
+                nan_on_call: None,
                 panic_in_curves: false,
                 curve_calls: Default::default(),
                 every: 1,
@@ -1589,7 +1622,13 @@ mod tests {
                 out.record_metric(format!("{name}.extra"), 1.0, "1");
             }
             let counter = ctx.domain::<Counter>("a").expect("domain `a` downcasts to Counter");
-            out.record_metric(format!("{name}.steps"), counter.steps as f64, "1");
+            let unit = if self.wrong_unit_on_call == Some(self.calls) { "m" } else { "1" };
+            let steps = if self.nan_on_call == Some(self.calls) {
+                f64::NAN
+            } else {
+                counter.steps as f64
+            };
+            out.record_metric(format!("{name}.steps"), steps, unit);
             let seen = ctx.observations().value("a.count").expect("domain rows come first");
             out.record_metric(format!("{name}.saw"), seen, "1");
             assert!(ctx.domain::<String>("a").is_none(), "the wrong type downcasts to nothing");
@@ -1889,5 +1928,79 @@ mod tests {
         assert_eq!(refused.observer_faults, simulation.observer_faults());
         assert_eq!(refused.observer_faults.len(), 1);
         assert!(refused.artifact.warnings().iter().any(|w| w.starts_with("error[E0951]:")));
+    }
+
+    /// A row in another unit than `outputs` declares is a breach like an undeclared row.
+    #[test]
+    fn a_row_in_the_wrong_unit_disables_the_observer() {
+        let mut breaker = Probe::new("breaker");
+        breaker.wrong_unit_on_call = Some(3);
+        let mut simulation = observed(vec![breaker, Probe::new("fine")]);
+        let outcome = run5(&mut simulation);
+
+        assert!(outcome.is_success());
+        assert_eq!(column(&outcome, "breaker.calls").len(), 2, "calls 1 and 2 only");
+        assert_eq!(column(&outcome, "breaker.steps").len(), 2, "the bad sample is dropped");
+        assert_eq!(column(&outcome, "fine.calls").len(), 6);
+
+        assert_eq!(outcome.observer_faults.len(), 1);
+        let fault = &outcome.observer_faults[0];
+        assert_eq!((fault.observer.as_str(), fault.step), ("breaker", 2));
+        assert_eq!(fault.kind, ObserverFaultKind::WrongUnit);
+        let text = fault.describe();
+        assert!(
+            text.contains("`breaker.steps`") && text.contains("`m`") && text.contains("declares `1`"),
+            "{text}"
+        );
+    }
+
+    /// An observer reaches only the domains its contract lists in `reads`.
+    #[test]
+    fn an_observer_reaches_only_the_domains_it_declares() {
+        /// Per sample: reached `a`, reached `b`, the names listed.
+        type Seen = Vec<(bool, bool, Vec<String>)>;
+        struct Reach {
+            contract: lattice_ir::ObserverContract,
+            seen: std::sync::Arc<std::sync::Mutex<Seen>>,
+        }
+        impl Observer for Reach {
+            fn contract(&self) -> &lattice_ir::ObserverContract {
+                &self.contract
+            }
+            fn observe(&mut self, ctx: &ObserveContext<'_>, _: &mut Observations) {
+                self.seen.lock().unwrap().push((
+                    ctx.domain::<Counter>("a").is_some(),
+                    ctx.domain::<Counter>("b").is_some(),
+                    ctx.domain_names().map(str::to_string).collect(),
+                ));
+            }
+        }
+        let mut contract = Probe::new("reach").contract;
+        contract.outputs = vec![("reach.none".into(), "1".into())];
+        let seen = std::sync::Arc::<std::sync::Mutex<Seen>>::default();
+        let mut simulation =
+            simulation(vec![Box::new(Counter::new("a")), Box::new(Counter::new("b"))]);
+        simulation
+            .add_observer(Box::new(Reach { contract, seen: std::sync::Arc::clone(&seen) }))
+            .unwrap();
+        run5(&mut simulation);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 6);
+        // `b` exists and is a Counter, but the contract reads only `a`.
+        assert!(seen.iter().all(|(a, b, names)| *a && !*b && names == &["a".to_string()]));
+    }
+
+    /// A non-finite observer row halts the run as a domain's does (spec G7).
+    #[test]
+    fn a_non_finite_observer_row_halts_the_run() {
+        let mut poisoner = Probe::new("poisoner");
+        poisoner.nan_on_call = Some(3);
+        let mut simulation = observed(vec![poisoner]);
+        let outcome = run5(&mut simulation);
+        let StopReason::NonFinite { observation, step, .. } = &outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+        assert_eq!((observation.as_str(), *step), ("poisoner.steps", 2));
+        assert!(outcome.observer_faults.is_empty(), "not a contract breach");
     }
 }
