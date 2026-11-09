@@ -25,12 +25,14 @@
 //! observation went bad and when. Continuing would fill the artifact with `NaN` and
 //! bury the first one.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
 mod schedule;
 
 use lattice_ir::{
-    Arena, CompiledModel, Domain, Executor, Observations, StabilityReason, StableStep, StepContext,
+    Arena, CompiledModel, Domain, Executor, ObserveContext, Observations, Observer, ObserverGap,
+    StabilityReason, StableStep, StepContext,
 };
 use lattice_observe::{Json, Profile, RunArtifact, Throughput, phase};
 
@@ -183,6 +185,32 @@ impl StopReason {
     }
 }
 
+/// An observer that panicked and was switched off (diagnostic `E0951`, NFR-004).
+#[derive(Clone, PartialEq, Debug)]
+pub struct ObserverFault {
+    /// The observer's contract name.
+    pub observer: String,
+    /// The step of the sample it panicked at.
+    pub step: u64,
+    /// The time of that sample, seconds.
+    pub time: f64,
+    /// The panic message.
+    pub message: String,
+}
+
+impl ObserverFault {
+    /// The diagnostic code.
+    pub const CODE: &'static str = "E0951";
+
+    /// A message for the user.
+    pub fn describe(&self) -> String {
+        format!(
+            "observer `{}` panicked at step {} and was disabled: {}",
+            self.observer, self.step, self.message
+        )
+    }
+}
+
 /// What a completed run produced.
 #[derive(Debug)]
 pub struct RunOutcome {
@@ -194,6 +222,9 @@ pub struct RunOutcome {
     pub timestep: f64,
     /// The self-describing record.
     pub artifact: RunArtifact,
+    /// Observers disabled so far for panicking. The run carried on without them, so
+    /// this does not change [`RunOutcome::is_success`].
+    pub observer_faults: Vec<ObserverFault>,
 }
 
 impl RunOutcome {
@@ -227,6 +258,21 @@ pub struct Simulation {
     /// Coupling faults seen so far, so a mis-wired edge is reported once rather than
     /// once per step.
     coupling_faults: Vec<String>,
+    /// Attached observers, in attachment order.
+    observers: Vec<ObserverSlot>,
+    /// One observer's rows, before they are appended to the sample. Kept apart so the
+    /// observer reads the domains' rows through `&` while it writes its own.
+    observer_rows: Observations,
+    /// Observers that panicked, in the order they did.
+    observer_faults: Vec<ObserverFault>,
+    /// The timestep of the latest step, which an observer's `due` is told.
+    last_dt: f64,
+}
+
+/// An attached observer, and whether it is still running.
+struct ObserverSlot {
+    observer: Box<dyn Observer>,
+    disabled: bool,
 }
 
 impl core::fmt::Debug for Simulation {
@@ -282,7 +328,32 @@ impl Simulation {
             observations: Observations::new(),
             profile: Profile::new(),
             coupling_faults: Vec::new(),
+            observers: Vec::new(),
+            observer_rows: Observations::new(),
+            observer_faults: Vec::new(),
+            last_dt: 0.0,
         }
+    }
+
+    /// Attach an observer, after auditing its contract.
+    ///
+    /// Observers run in attachment order, after every domain has published, and only
+    /// at the samples their [`Observer::due`] accepts. The audit refuses an empty
+    /// summary, `reads`, `outputs` or `limitations`, and a `reads` name that is not a
+    /// domain of this model; the gaps are returned and the observer is not attached.
+    pub fn add_observer(&mut self, observer: Box<dyn Observer>) -> Result<(), Vec<ObserverGap>> {
+        let names: Vec<&str> = self.domains.iter().map(|domain| domain.name()).collect();
+        let gaps = observer.contract().audit(&names);
+        if !gaps.is_empty() {
+            return Err(gaps);
+        }
+        self.observers.push(ObserverSlot { observer, disabled: false });
+        Ok(())
+    }
+
+    /// Observers disabled so far for panicking (`E0951`).
+    pub fn observer_faults(&self) -> &[ObserverFault] {
+        &self.observer_faults
     }
 
     /// Split every solver's loops across `executor`'s threads.
@@ -332,9 +403,19 @@ impl Simulation {
             .collect()
     }
 
-    /// Every curve across all domains, as accumulated so far.
+    /// Every curve across all domains and observers, as accumulated so far.
+    ///
+    /// An observer whose `curves` panics contributes none here; [`Simulation::run`]
+    /// records the panic.
     pub fn curves(&self) -> Vec<lattice_ir::Curve> {
-        self.domains.iter().flat_map(|domain| domain.curves()).collect()
+        let mut curves: Vec<lattice_ir::Curve> =
+            self.domains.iter().flat_map(|domain| domain.curves()).collect();
+        for slot in &self.observers {
+            if let Ok(found) = catch_unwind(AssertUnwindSafe(|| slot.observer.curves())) {
+                curves.extend(found);
+            }
+        }
+        curves
     }
 
     /// The tightest stability constraint across all domains.
@@ -435,14 +516,47 @@ impl Simulation {
             }
         }
 
+        self.last_dt = dt;
         self.clock.advance(dt);
     }
 
-    /// Refresh the observation set from every domain.
+    /// Refresh the observation set from every domain, then from every observer.
+    ///
+    /// Observers run in attachment order, each at a sample it is due for, and each sees
+    /// the rows published before it. One that panics is disabled, its partial rows are
+    /// dropped, and the fault is recorded (`E0951`); nothing else changes.
     pub fn observe(&mut self) {
         self.observations.clear();
         for domain in &self.domains {
             domain.observe(&mut self.observations);
+        }
+        let (time, step, dt) = (self.clock.time, self.clock.step, self.last_dt);
+        for slot in &mut self.observers {
+            if slot.disabled {
+                continue;
+            }
+            self.observer_rows.clear();
+            let ctx = ObserveContext::new(time, step, &self.domains, &self.observations);
+            let rows = &mut self.observer_rows;
+            let observer = &mut slot.observer;
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if observer.due(time, dt) {
+                    observer.observe(&ctx, rows);
+                }
+            }));
+            match outcome {
+                Ok(()) => self.observations.append(&mut self.observer_rows),
+                Err(payload) => {
+                    slot.disabled = true;
+                    self.observer_rows.clear();
+                    self.observer_faults.push(ObserverFault {
+                        observer: slot.observer.contract().name.to_string(),
+                        step,
+                        time,
+                        message: panic_message(payload.as_ref()),
+                    });
+                }
+            }
         }
     }
 
@@ -483,6 +597,7 @@ impl Simulation {
                     clock: self.clock,
                     timestep: 0.0,
                     artifact,
+                    observer_faults: Vec::new(),
                 };
             }
         };
@@ -506,11 +621,13 @@ impl Simulation {
                     clock: self.clock,
                     timestep,
                     artifact,
+                    observer_faults: Vec::new(),
                 };
             }
         };
 
         // Sample the initial state, so the artifact records where the run began.
+        self.last_dt = timestep;
         self.observe();
         artifact.record(self.clock.time, self.clock.step, &self.observations);
         let mut next_sample = config.sample_interval.unwrap_or(0.0);
@@ -588,12 +705,29 @@ impl Simulation {
         for curve in self.curves() {
             artifact.add_curve(curve);
         }
+        for slot in &mut self.observers {
+            if !slot.disabled
+                && let Err(payload) = catch_unwind(AssertUnwindSafe(|| slot.observer.curves()))
+            {
+                slot.disabled = true;
+                self.observer_faults.push(ObserverFault {
+                    observer: slot.observer.contract().name.to_string(),
+                    step: self.clock.step,
+                    time: self.clock.time,
+                    message: panic_message(payload.as_ref()),
+                });
+            }
+        }
+        for fault in &self.observer_faults {
+            artifact.warn(format!("error[{}]: {}", ObserverFault::CODE, fault.describe()));
+        }
 
         RunOutcome {
             stop,
             clock: self.clock,
             timestep,
             artifact,
+            observer_faults: self.observer_faults.clone(),
         }
     }
 
@@ -652,6 +786,16 @@ impl Simulation {
             })
             .sum()
     }
+}
+
+/// The text of a panic payload, which is a `&str` or a `String` unless the panic was
+/// raised with `panic_any`.
+fn panic_message(payload: &(dyn core::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "(no message)".to_string())
 }
 
 #[cfg(test)]
@@ -1293,5 +1437,253 @@ mod tests {
             simulation.step(0.1);
         }
         assert!(!ready.load(Ordering::SeqCst));
+    }
+
+    /// An observer for the tests: it records `<name>.steps`, the step count of the
+    /// `Counter` called `a`, read through the context, and `<name>.calls`.
+    struct Probe {
+        contract: lattice_ir::ObserverContract,
+        calls: u32,
+        panic_on_call: Option<u32>,
+        panic_in_curves: bool,
+        /// Only every n-th sample is wanted.
+        every: u32,
+        asked: u32,
+    }
+
+    impl Probe {
+        fn new(name: &'static str) -> Probe {
+            Probe {
+                contract: lattice_ir::ObserverContract {
+                    name: name.into(),
+                    summary: "a test observer".into(),
+                    reads: vec!["a".into()],
+                    outputs: vec![(format!("{name}.calls").into(), "1".into())],
+                    side_effects: lattice_ir::SideEffects::None,
+                    limitations: vec!["exists only to be tested".into()],
+                    deterministic: true,
+                    backends: lattice_ir::Backends::CPU,
+                    differentiable: false,
+                },
+                calls: 0,
+                panic_on_call: None,
+                panic_in_curves: false,
+                every: 1,
+                asked: 0,
+            }
+        }
+
+        fn name(&self) -> String {
+            self.contract.name.to_string()
+        }
+    }
+
+    impl Observer for Probe {
+        fn contract(&self) -> &lattice_ir::ObserverContract {
+            &self.contract
+        }
+        fn observe(&mut self, ctx: &ObserveContext<'_>, out: &mut Observations) {
+            self.calls += 1;
+            let name = self.name();
+            // Written before the panic, to show that a half-finished sample is dropped.
+            out.record_metric(format!("{name}.calls"), f64::from(self.calls), "1");
+            if self.panic_on_call == Some(self.calls) {
+                panic!("probe gave up on call {}", self.calls);
+            }
+            let counter = ctx.domain::<Counter>("a").expect("domain `a` downcasts to Counter");
+            out.record_metric(format!("{name}.steps"), counter.steps as f64, "1");
+            let seen = ctx.observations().value("a.count").expect("domain rows come first");
+            out.record_metric(format!("{name}.saw"), seen, "1");
+            assert!(ctx.domain::<String>("a").is_none(), "the wrong type downcasts to nothing");
+            assert!(ctx.domain::<Counter>("nope").is_none());
+        }
+        fn curves(&self) -> Vec<lattice_ir::Curve> {
+            if self.panic_in_curves {
+                panic!("no curve today");
+            }
+            vec![lattice_ir::Curve::new(
+                format!("{}.curve", self.name()),
+                ("x", "1"),
+                ("y", "1"),
+                vec![0.0],
+                vec![1.0],
+            )]
+        }
+        fn due(&mut self, _time: f64, _dt: f64) -> bool {
+            self.asked += 1;
+            (self.asked - 1) % self.every == 0
+        }
+    }
+
+    fn observed(probes: Vec<Probe>) -> Simulation {
+        let mut simulation = simulation(vec![Box::new(Counter::new("a"))]);
+        for probe in probes {
+            simulation.add_observer(Box::new(probe)).expect("a complete contract attaches");
+        }
+        simulation
+    }
+
+    fn run5(simulation: &mut Simulation) -> RunOutcome {
+        simulation.run(&RunConfig::new().with_max_steps(5).with_timestep(0.1))
+    }
+
+    fn column(outcome: &RunOutcome, name: &str) -> Vec<(u64, u64)> {
+        outcome
+            .artifact
+            .timeline()
+            .iter()
+            .filter_map(|sample| {
+                sample.values.iter().find(|(n, _)| n == name).map(|(_, v)| (sample.step, v.to_bits()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn add_observer_refuses_an_incomplete_contract() {
+        let mut simulation = simulation(vec![Box::new(Counter::new("a"))]);
+
+        let mut no_limits = Probe::new("p");
+        no_limits.contract.limitations.clear();
+        assert_eq!(
+            simulation.add_observer(Box::new(no_limits)).unwrap_err(),
+            vec![ObserverGap::NoLimitations]
+        );
+
+        let mut unknown = Probe::new("p");
+        unknown.contract.reads = vec!["b".into()];
+        assert_eq!(
+            simulation.add_observer(Box::new(unknown)).unwrap_err(),
+            vec![ObserverGap::UnknownRead("b".to_string())]
+        );
+
+        let mut no_outputs = Probe::new("p");
+        no_outputs.contract.outputs.clear();
+        assert_eq!(
+            simulation.add_observer(Box::new(no_outputs)).unwrap_err(),
+            vec![ObserverGap::NoOutputs]
+        );
+
+        // None of the three was attached.
+        let outcome = run5(&mut simulation);
+        assert!(outcome.artifact.timeline().iter().all(|s| s.values.len() == 1));
+    }
+
+    #[test]
+    fn observers_run_after_the_domains_in_attachment_order() {
+        let mut simulation = observed(vec![Probe::new("first"), Probe::new("second")]);
+        let outcome = run5(&mut simulation);
+        let names: Vec<&str> =
+            outcome.artifact.timeline()[0].values.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "a.count",
+                "first.calls",
+                "first.steps",
+                "first.saw",
+                "second.calls",
+                "second.steps",
+                "second.saw",
+            ]
+        );
+        // One call per sample, the initial state included, and the observer saw the
+        // domain's row for the same sample.
+        assert_eq!(column(&outcome, "first.calls").len(), 6);
+        assert_eq!(column(&outcome, "first.saw"), column(&outcome, "a.count"));
+        assert!(outcome.observer_faults.is_empty());
+        assert!(outcome.artifact.warnings().is_empty());
+    }
+
+    #[test]
+    fn an_observer_is_called_only_when_due() {
+        let mut every_other = Probe::new("slow");
+        every_other.every = 2;
+        let mut simulation = observed(vec![every_other, Probe::new("fast")]);
+        let outcome = run5(&mut simulation);
+        let slow: Vec<u64> = column(&outcome, "slow.calls").iter().map(|&(step, _)| step).collect();
+        assert_eq!(slow, [0, 2, 4], "samples 1, 3 and 5 of six are due");
+        assert_eq!(column(&outcome, "fast.calls").len(), 6);
+    }
+
+    #[test]
+    fn an_observer_is_told_the_timestep() {
+        struct Dt(lattice_ir::ObserverContract, std::sync::Arc<std::sync::Mutex<Vec<(f64, f64)>>>);
+        impl Observer for Dt {
+            fn contract(&self) -> &lattice_ir::ObserverContract {
+                &self.0
+            }
+            fn observe(&mut self, _: &ObserveContext<'_>, _: &mut Observations) {}
+            fn due(&mut self, time: f64, dt: f64) -> bool {
+                self.1.lock().unwrap().push((time, dt));
+                true
+            }
+        }
+        let log = Default::default();
+        let mut simulation = observed(Vec::new());
+        simulation.add_observer(Box::new(Dt(Probe::new("dt").contract, std::sync::Arc::clone(&log)))).unwrap();
+        run5(&mut simulation);
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 6);
+        assert!(log.iter().all(|&(_, dt)| dt == 0.1), "{log:?}");
+        assert_eq!(log[0].0, 0.0);
+    }
+
+    /// NFR-004: an observer that panics is disabled and the run goes on. Its third call
+    /// panics, so rows exist for calls 1 and 2 only, the diagnostic is `E0951`, and
+    /// every other row is bit-for-bit what a run without it records.
+    #[test]
+    fn a_panicking_observer_is_disabled_and_the_run_carries_on() {
+        let mut bare = observed(Vec::new());
+        let reference = run5(&mut bare);
+
+        let mut bystander = Probe::new("bystander");
+        bystander.every = 1;
+        let mut crasher = Probe::new("crasher");
+        crasher.panic_on_call = Some(3);
+        let mut simulation = observed(vec![crasher, bystander]);
+        let outcome = run5(&mut simulation);
+
+        assert_eq!(outcome.stop, StopReason::StepLimit);
+        assert!(outcome.is_success());
+        assert_eq!(outcome.clock.step, 5);
+
+        // Rows stop after call 2: the samples at steps 0 and 1. The third call's
+        // half-written `crasher.calls` row is not kept.
+        assert_eq!(column(&outcome, "crasher.calls").len(), 2);
+        assert_eq!(column(&outcome, "crasher.steps").len(), 2);
+
+        // The diagnostic.
+        assert_eq!(outcome.observer_faults.len(), 1);
+        let fault = &outcome.observer_faults[0];
+        assert_eq!(fault.observer, "crasher");
+        assert_eq!(fault.step, 2, "the third sample is at step 2");
+        assert_eq!(ObserverFault::CODE, "E0951");
+        assert_eq!(
+            fault.describe(),
+            "observer `crasher` panicked at step 2 and was disabled: probe gave up on call 3"
+        );
+        assert!(
+            outcome.artifact.warnings().iter().any(|w| w.starts_with("error[E0951]: observer `crasher`")),
+            "{:?}",
+            outcome.artifact.warnings()
+        );
+
+        // Everything else is untouched, including an observer attached after it.
+        assert_eq!(column(&outcome, "a.count"), column(&reference, "a.count"));
+        assert_eq!(column(&outcome, "bystander.calls").len(), 6);
+        assert_eq!(simulation.observer_faults(), outcome.observer_faults.as_slice());
+    }
+
+    #[test]
+    fn a_panic_in_curves_is_recorded_not_propagated() {
+        let mut probe = Probe::new("curvy");
+        probe.panic_in_curves = true;
+        let mut simulation = observed(vec![probe, Probe::new("fine")]);
+        let outcome = run5(&mut simulation);
+        assert!(outcome.is_success());
+        assert_eq!(outcome.observer_faults.len(), 1);
+        assert_eq!(outcome.observer_faults[0].observer, "curvy");
+        let curves: Vec<&str> = outcome.artifact.curves().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(curves, ["fine.curve"]);
     }
 }
