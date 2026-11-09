@@ -453,6 +453,7 @@ fn describe(
         UserLawKind::BodyPotential => "conserves energy",
         UserLawKind::PairForce => "conserves momentum (equal and opposite by construction); energy not claimed",
         UserLawKind::BodyForce => "conserves nothing by construction; energy not claimed",
+        UserLawKind::BodyObserver => "measures only; applies no force",
     };
     parts.push(promise.to_string());
     parts.join("; ")

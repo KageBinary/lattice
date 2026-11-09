@@ -1,0 +1,10 @@
+// expect: E0418
+// An observer runs on particles, in no cell: it has no concentration to read.
+
+project observer_law_reads_chemistry {
+  dimensions: 2;
+
+  observer local_concentration(a: particle) -> mole / meter^2 {
+    return c(A);
+  }
+}

@@ -1,0 +1,11 @@
+// expect: E0417
+// An observer returns a scalar, because the use site reduces it with sum, mean, min
+// or max. A vector is observed one component at a time.
+
+project observer_law_vector_return {
+  dimensions: 2;
+
+  observer velocity_of(a: particle) -> vec2<meter / second> {
+    return a.velocity;
+  }
+}

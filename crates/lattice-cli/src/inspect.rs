@@ -219,6 +219,7 @@ fn law_listing(file: &SourceFile, law: &TypedLaw, uses: &[&LawUse]) -> String {
         UserLawKind::BodyForce => ("body force", &["Fx", "Fy"]),
         UserLawKind::PairPotential => ("pair potential", &["U", "dU/dr"]),
         UserLawKind::BodyPotential => ("body potential", &["U", "dU/dx", "dU/dy"]),
+        UserLawKind::BodyObserver => ("observer", &["value"]),
     };
     let mut out = format!(
         "law {}: {label}, {} inputs ({shown_inputs}), {} params ({})\n",

@@ -84,6 +84,10 @@ pub enum LawKind {
     /// and no body, just the expression. It reads concentrations through `c(…)` and the
     /// cell's `temperature`, and returns a rate in mol/(m²·s).
     Rate,
+    /// `observer o(a: particle) -> unit`: a per-particle quantity of any scalar
+    /// dimension, which an `observe` reduces over a particle set (spec M6.2 §4.1). It
+    /// reads one particle's members and nothing of the chemistry.
+    Observer,
 }
 
 impl LawKind {
@@ -91,16 +95,19 @@ impl LawKind {
         match text {
             "force" => Some(LawKind::Force),
             "potential" => Some(LawKind::Potential),
+            "observer" => Some(LawKind::Observer),
             _ => None,
         }
     }
 
-    /// The type a law of this kind returns.
-    pub fn returns(self) -> Ty {
+    /// The type a law of this kind returns, or `None` for an observer, which returns a
+    /// scalar of whatever dimension its header declares.
+    pub fn returns(self) -> Option<Ty> {
         match self {
-            LawKind::Force => Ty::Vec2(Dimension::FORCE),
-            LawKind::Potential => Ty::Scalar(Dimension::ENERGY),
-            LawKind::Rate => Ty::Scalar(Dimension::AREAL_REACTION_RATE),
+            LawKind::Force => Some(Ty::Vec2(Dimension::FORCE)),
+            LawKind::Potential => Some(Ty::Scalar(Dimension::ENERGY)),
+            LawKind::Rate => Some(Ty::Scalar(Dimension::AREAL_REACTION_RATE)),
+            LawKind::Observer => None,
         }
     }
 
@@ -109,12 +116,13 @@ impl LawKind {
             LawKind::Force => "vec2<newton>",
             LawKind::Potential => "joule",
             LawKind::Rate => "mole / (meter^2 second)",
+            LawKind::Observer => "joule",
         }
     }
 }
 
 /// Law kinds the specification names whose turn has not come, as `(kind, milestone)`.
-const PLANNED_KINDS: &[(&str, &str)] = &[("observer", "M6.2")];
+const PLANNED_KINDS: &[(&str, &str)] = &[];
 
 /// What a law reads from a particle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -400,7 +408,7 @@ fn check_law(law: &LawDecl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnos
             None => Diagnostic::error(format!("`{}` is not a kind of law", law.kind.text))
                 .with_code("E0205")
                 .at(law.kind.span, "unknown law kind")
-                .help("the kinds of law are `force` and `potential`"),
+                .help("the kinds of law are `force`, `potential` and `observer`"),
         };
         diagnostics.push(diagnostic);
         return None;
@@ -455,7 +463,7 @@ pub fn check_rate(
 ) -> Option<TypedLaw> {
     let mut checker = Checker::new(evaluator, diagnostics, LawKind::Rate, species);
     let result = checker.expr(value);
-    let expected = LawKind::Rate.returns();
+    let expected = LawKind::Rate.returns().expect("a rate law returns a rate");
     let mut result = result?;
     checker.coerce_zero(&mut result, expected);
     if result.ty != expected {
@@ -534,12 +542,13 @@ impl Checker<'_, '_, '_> {
     // --- the header ----------------------------------------------------------
 
     fn header(&mut self, law: &LawDecl) {
+        let article = if self.kind == LawKind::Observer { "an" } else { "a" };
         for param in &law.params {
             let is_particle =
                 matches!(&param.ty.kind, TypeKind::Plain(expr) if expr.as_name() == Some("particle"));
             if !is_particle {
                 self.error(
-                    Diagnostic::error(format!("a {} takes particles", law.kind.text))
+                    Diagnostic::error(format!("{article} {} takes particles", law.kind.text))
                         .with_code("E0411")
                         .at(param.ty.span, "expected `particle`")
                         .help("values the law needs from its use site are declared in the body with `param`"),
@@ -556,6 +565,30 @@ impl Checker<'_, '_, '_> {
             }
             self.particles.push(param.name.clone());
         }
+        if self.kind == LawKind::Observer {
+            // Pair observers need the neighbour list and the cutoff semantics of pair
+            // laws; they are the next step, so the second particle is refused by name.
+            if self.particles.len() >= 2 {
+                self.error(
+                    Diagnostic::error("observer laws take one particle; pair observers are not implemented")
+                        .with_code("E0416")
+                        .at(self.particles[1].span, "a second particle")
+                        .note("an observer is evaluated once per particle of a set, and reduced over the set")
+                        .help(format!(
+                            "write `observer {}({}: particle)`",
+                            law.name.text, self.particles[0].text
+                        )),
+                );
+            } else if law.params.is_empty() {
+                self.error(
+                    Diagnostic::error("an observer acts on one particle")
+                        .with_code("E0411")
+                        .at(law.name.span, "no parameters")
+                        .help(format!("write `observer {}(a: particle) -> joule`", law.name.text)),
+                );
+            }
+            return;
+        }
         if !(1..=2).contains(&law.params.len()) {
             let found = law.params.len();
             self.error(
@@ -571,17 +604,46 @@ impl Checker<'_, '_, '_> {
     }
 
     fn declared_return(&mut self, law: &LawDecl) -> Option<Ty> {
-        let expected = self.kind.returns();
         let Some(written) = &law.returns else {
             self.error(
                 Diagnostic::error(format!("`{}` does not say what it returns", law.name.text))
                     .with_code("E0411")
                     .at(law.name.span, "no return type")
-                    .help(format!("a {} returns `-> {}`", law.kind.text, self.kind.written_return())),
+                    .help(if self.kind == LawKind::Observer {
+                        "an observer returns a scalar and names its unit: `-> joule`, or `-> 1` for a plain number"
+                            .to_string()
+                    } else {
+                        format!("a {} returns `-> {}`", law.kind.text, self.kind.written_return())
+                    }),
             );
             return None;
         };
         let ty = self.type_of(written)?;
+        let Some(expected) = self.kind.returns() else {
+            // An observer: any scalar, in the unit it declares.
+            return match ty {
+                Ty::Scalar(_) => Some(ty),
+                Ty::Vec2(_) => {
+                    self.error(
+                        Diagnostic::error("an observer returns a scalar, not a vector")
+                            .with_code("E0417")
+                            .at(written.span, format!("declared {}", ty.describe()))
+                            .note("it is reduced over a particle set, and a reduction of vectors is not defined")
+                            .help("observe each component separately: one observer returning `v.x`, another `v.y`"),
+                    );
+                    None
+                }
+                Ty::Bool | Ty::Particle => {
+                    self.error(
+                        Diagnostic::error(format!("an observer returns a scalar quantity, not {}", ty.describe()))
+                            .with_code("E0411")
+                            .at(written.span, format!("declared {}", ty.describe()))
+                            .help("write a unit, such as `-> joule`, or `-> 1` for a plain number"),
+                    );
+                    None
+                }
+            };
+        };
         if ty != expected {
             self.error(
                 Diagnostic::error(format!("a {} returns {}", law.kind.text, expected.describe()))
@@ -844,6 +906,10 @@ impl Checker<'_, '_, '_> {
         if let Some(index) = self.params.iter().position(|p| p.name == name) {
             return Some(TExpr { kind: TExprKind::Param(index), ty: self.params[index].ty, span });
         }
+        if self.kind == LawKind::Observer && name == "temperature" && !self.evaluator.is_constant(name) {
+            self.error(observer_reads_particles_only(name, span));
+            return None;
+        }
         if self.kind == LawKind::Rate && name == "temperature" {
             if self.evaluator.is_constant(name) {
                 // The model's own constant wins, as declared names do everywhere; but a
@@ -974,11 +1040,21 @@ impl Checker<'_, '_, '_> {
             return None;
         };
 
+        // An observer reads particles and has no chemistry context. A `let` or `param`
+        // that happens to be called `c` is a value, and is told so below instead.
+        if self.kind == LawKind::Observer && matches!(name, "c" | "arrhenius") {
+            let is_value = self.locals.iter().any(|l| l.name == name) || self.params.iter().any(|p| p.name == name);
+            if !is_value {
+                self.error(observer_reads_particles_only(name, callee.span));
+                return None;
+            }
+        }
+
         // A rate law's two readers of the state, which no other law has.
         match (name, self.kind == LawKind::Rate) {
             ("c", true) => return self.concentration(arguments, span),
             ("arrhenius", true) => return self.arrhenius(arguments, span),
-            ("c" | "arrhenius", false) => {
+            ("c" | "arrhenius", false) if self.kind != LawKind::Observer => {
                 self.error(
                     Diagnostic::error(format!("`{name}` belongs to a reaction's rate law"))
                         .with_code("E0413")
@@ -1020,7 +1096,7 @@ impl Checker<'_, '_, '_> {
                     .collect();
                 if self.kind == LawKind::Rate {
                     known.extend(["c", "arrhenius"]);
-                } else {
+                } else if self.kind != LawKind::Observer {
                     known.push("distance");
                 }
                 Diagnostic::error(format!("`{name}` is not a function a law can call"))
@@ -1422,6 +1498,16 @@ fn is_literal_zero(expr: &Expr) -> bool {
     }
 }
 
+/// `c(…)`, `temperature` and `arrhenius(…)` in an observer law: it runs on particles, in
+/// no cell, so there is no concentration or temperature to read.
+fn observer_reads_particles_only(name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error("observer laws read particles only")
+        .with_code("E0418")
+        .at(span, format!("`{name}` reads a cell's chemistry"))
+        .note("an observer is evaluated per particle, with no concentrations or temperature in its context")
+        .help("read `a.position`, `a.velocity`, `a.mass` or `a.charge`, or a `param`")
+}
+
 /// The warning for a `let` or `param` whose name is also a unit.
 pub(crate) fn shadow_warning(name: &Ident) -> Diagnostic {
     Diagnostic::warning(format!("`{}` is also a unit, and this hides it", name.text))
@@ -1661,9 +1747,75 @@ mod tests {
     }
 
     #[test]
-    fn law_kinds_are_known_or_planned() {
+    fn law_kinds_are_known() {
         assert_eq!(codes("project p { torque t(a: particle) -> joule { return 1 joule; } }"), ["E0205"]);
-        assert_eq!(codes("project p { observer o(a: particle) -> joule { return 1 joule; } }"), ["E0900"]);
+        assert!(PLANNED_KINDS.is_empty(), "every named kind of law is implemented");
+    }
+
+    #[test]
+    fn a_valid_observer_law_checks() {
+        let law = ok("project p { observer kinetic_x(a: particle) -> joule {
+            return 0.5 * a.mass * a.velocity.x * a.velocity.x;
+        } }");
+        assert_eq!(law.kind, LawKind::Observer);
+        assert_eq!(law.particles, ["a"]);
+        assert_eq!(law.result.ty, Ty::Scalar(Dimension::ENERGY));
+        assert!(law.reads_velocity && law.reads_members);
+        assert!(!law.reads_temperature);
+
+        // The unit is the law's own, whatever dimension: a plain number is `-> 1`, and
+        // a `param` and an `if` are as welcome as in any body law.
+        let law = ok("project p { observer right_half(a: particle) -> 1 {
+            param x0: meter = 0 meter;
+            return if a.position.x > x0 { 1 } else { 0 };
+        } }");
+        assert_eq!(law.result.ty, Ty::Scalar(Dimension::DIMENSIONLESS));
+        assert_eq!(law.params.len(), 1);
+        ok("project p { observer speed(a: particle) -> meter / second { return length(a.velocity); } }");
+        ok("project p { observer q(a: particle) -> coulomb { return a.charge; } }");
+    }
+
+    #[test]
+    fn an_observer_is_checked_against_its_declared_unit() {
+        assert_eq!(codes("project p { observer o(a: particle) -> joule { return a.mass; } }"), ["E0411"]);
+        assert_eq!(codes("project p { observer o(a: particle) { return a.mass; } }"), ["E0411"]);
+        assert_eq!(codes("project p { observer o(a: particle) -> bool { return a.mass > 1 kilogram; } }"), ["E0411"]);
+    }
+
+    #[test]
+    fn an_observer_takes_one_particle() {
+        let body = "{ return 1 meter; }";
+        assert_eq!(codes(&format!("project p {{ observer o(a: particle, b: particle) -> meter {body} }}")), ["E0416"]);
+        assert_eq!(codes(&format!("project p {{ observer o() -> meter {body} }}")), ["E0411"]);
+        assert_eq!(codes(&format!("project p {{ observer o(a: meter) -> meter {body} }}")), ["E0411"]);
+    }
+
+    #[test]
+    fn an_observer_returns_a_scalar() {
+        assert_eq!(
+            codes("project p { observer o(a: particle) -> vec2<meter / second> { return a.velocity; } }"),
+            ["E0417"]
+        );
+    }
+
+    #[test]
+    fn an_observer_reads_particles_only() {
+        for body in [
+            "return c(A) * 1 meter^2 / mole;",
+            "return arrhenius(50 kilojoule / mole) * 1 joule;",
+            "return temperature;",
+            "return temperature * 1 joule / kelvin;",
+        ] {
+            let source = format!("project p {{ observer o(a: particle) -> joule {{ {body} }} }}");
+            assert_eq!(codes(&source), ["E0418"], "{body}");
+        }
+        // A `let` or `param` named `c` is a value, and calling it is the accurate error.
+        for declaration in ["let c = 1 meter;", "param c: meter = 1 meter;"] {
+            let source = format!("project p {{ observer o(a: particle) -> meter {{ {declaration} return c(a); }} }}");
+            let (laws, diagnostics) = check(&source);
+            assert!(laws.is_empty());
+            assert_eq!(diagnostics.codes(), ["E0413"], "{declaration}");
+        }
     }
 
     #[test]

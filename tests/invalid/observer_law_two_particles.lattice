@@ -1,0 +1,11 @@
+// expect: E0416
+// An observer law is evaluated once per particle. A pair observer needs the
+// neighbour list and a cutoff, and is not implemented.
+
+project observer_law_two_particles {
+  dimensions: 2;
+
+  observer closeness(a: particle, b: particle) -> meter {
+    return distance(a, b);
+  }
+}
