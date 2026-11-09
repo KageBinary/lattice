@@ -45,7 +45,9 @@ pub mod artifact;
 pub mod json;
 pub mod timing;
 
-pub use artifact::{contract_to_json, fnv1a_64, seconds, RunArtifact, TimelineSample};
+pub use artifact::{
+    contract_to_json, fnv1a_64, seconds, RunArtifact, TimelineSample, ARTIFACT_SCHEMA,
+};
 pub use json::Json;
 pub use timing::{
     format_bytes, format_count, format_duration, phase, MemoryReport, PhaseStats, Profile,
