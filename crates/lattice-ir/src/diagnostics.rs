@@ -232,6 +232,12 @@ impl Observations {
         self.entries.is_empty()
     }
 
+    /// Move every reading of `other` onto the end of this set, leaving `other` empty
+    /// but keeping its capacity.
+    pub fn append(&mut self, other: &mut Observations) {
+        self.entries.append(&mut other.entries);
+    }
+
     /// Drop all readings, keeping capacity.
     pub fn clear(&mut self) {
         self.entries.clear();

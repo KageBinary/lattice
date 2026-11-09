@@ -19,6 +19,7 @@
 //! | [`arena`] | Preallocated per-step scratch space | NFR-001 |
 //! | [`contract`] | The [`Domain`] trait and the [`SolverContract`] every solver publishes | §7.3, NFR-003 |
 //! | [`diagnostics`] | Conservation drift, coupling ledger, solver residuals | §14.3, §10.4 |
+//! | [`observer`] | The [`Observer`] trait and the contract a plugin must fill in | §16.3, P8 |
 //! | [`fault`] | Where a user law first produced a non-finite value | NFR-007 |
 //! | [`rng`] | Reproducible seeded randomness | P6, FR-011 |
 //!
@@ -98,6 +99,7 @@ pub mod graph;
 pub mod grid;
 pub mod ids;
 pub mod model;
+pub mod observer;
 pub mod particles;
 pub mod port;
 pub mod render;
@@ -117,6 +119,9 @@ pub use contract::{
 pub use diagnostics::{
     ConservationLedger, DriftMonitor, Invariant, Observation, ObservationKind, Observations,
     Reconciliation, ResidualHistory, SolveOutcome, Transfer,
+};
+pub use observer::{
+    Backends, ObserveContext, Observer, ObserverContract, ObserverGap, SideEffects,
 };
 pub use fault::{FaultSite, LawFault};
 pub use graph::{GraphError, Operation, OperationGraph, OperationKind};

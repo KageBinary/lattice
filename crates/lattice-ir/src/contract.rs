@@ -532,7 +532,11 @@ pub trait Domain: Send + DomainType {
 }
 
 /// Typed backend adapters can inspect concrete solver configuration at setup.
-/// This blanket implementation does not add boilerplate to domain implementations.
+/// This blanket implementation does not add boilerplate to domain implementations, and
+/// it is what [`ObserveContext::domain`](crate::ObserveContext::domain) downcasts with.
+///
+/// Call it on the domain, not on its box: `Box<dyn Domain>` is itself `Any`, so
+/// `boxed.as_any()` downcasts the box. Write `(**boxed).as_any()`.
 pub trait DomainType {
     fn as_any(&self) -> &dyn std::any::Any;
 }
