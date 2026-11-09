@@ -925,8 +925,10 @@ An `observer` measures one particle. Its header takes exactly one `particle` (a 
 checked against what the body computes (`E0411`); `-> 1` is a plain number. A vector
 return is `E0417`: observe each component separately. An observer may read the particle's
 members (`a.position`, `a.velocity`, `a.mass`, `a.charge`), `param`s and `let`s, and the
-same functions as other laws. It runs on particles in no cell, so `c(…)`, `temperature` and
-`arrhenius(…)` are `E0418`.
+general-purpose functions such as `sqrt`, `abs`, `min`, `max`, `exp`, `dot` and `length`.
+`distance` and `minimum_image` are not available: they are for a pair, and a law on one
+particle is refused (`E0412`). It runs on particles in no cell, so `c(…)`, `temperature`
+and `arrhenius(…)` are `E0418`.
 
 **An observer law is accepted and type-checked, but cannot be used yet.** Its `observe`
 use site, which reduces it over a particle set, arrives later in M6.2; until then an

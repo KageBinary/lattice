@@ -1040,17 +1040,21 @@ impl Checker<'_, '_, '_> {
             return None;
         };
 
-        // An observer reads particles and has no chemistry context.
+        // An observer reads particles and has no chemistry context. A `let` or `param`
+        // that happens to be called `c` is a value, and is told so below instead.
         if self.kind == LawKind::Observer && matches!(name, "c" | "arrhenius") {
-            self.error(observer_reads_particles_only(name, callee.span));
-            return None;
+            let is_value = self.locals.iter().any(|l| l.name == name) || self.params.iter().any(|p| p.name == name);
+            if !is_value {
+                self.error(observer_reads_particles_only(name, callee.span));
+                return None;
+            }
         }
 
         // A rate law's two readers of the state, which no other law has.
         match (name, self.kind == LawKind::Rate) {
             ("c", true) => return self.concentration(arguments, span),
             ("arrhenius", true) => return self.arrhenius(arguments, span),
-            ("c" | "arrhenius", false) => {
+            ("c" | "arrhenius", false) if self.kind != LawKind::Observer => {
                 self.error(
                     Diagnostic::error(format!("`{name}` belongs to a reaction's rate law"))
                         .with_code("E0413")
@@ -1804,6 +1808,13 @@ mod tests {
         ] {
             let source = format!("project p {{ observer o(a: particle) -> joule {{ {body} }} }}");
             assert_eq!(codes(&source), ["E0418"], "{body}");
+        }
+        // A `let` or `param` named `c` is a value, and calling it is the accurate error.
+        for declaration in ["let c = 1 meter;", "param c: meter = 1 meter;"] {
+            let source = format!("project p {{ observer o(a: particle) -> meter {{ {declaration} return c(a); }} }}");
+            let (laws, diagnostics) = check(&source);
+            assert!(laws.is_empty());
+            assert_eq!(diagnostics.codes(), ["E0413"], "{declaration}");
         }
     }
 
