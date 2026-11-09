@@ -83,10 +83,13 @@ impl LawObserver {
             limitations: vec![
                 Cow::Borrowed("sampled at observation instants only"),
                 Cow::Borrowed(
-                    "sum and mean depend on particle index order in their last bits: floating-point                      addition is not associative, so relabelling the particles can change them",
+                    "sum and mean depend on particle index order in their last bits: floating-point addition is not associative, so relabelling the particles can change them",
                 ),
                 Cow::Borrowed(
-                    "the row is a metric, never an invariant: the engine cannot know whether the                      quantity is conserved",
+                    "the row is a metric, never an invariant: the engine cannot know whether the quantity is conserved",
+                ),
+                Cow::Borrowed(
+                    "mean, min and max of an empty set are NaN, which halts the run",
                 ),
             ],
             deterministic: true,
@@ -130,7 +133,7 @@ impl Observer for LawObserver {
         // this observer, which is better than recording nothing for the rest of the run.
         let Some(domain) = ctx.domain::<ParticleDomain>(&self.set) else {
             panic!(
-                "observer `{}` could not reach `{}` as a particle domain: it is missing from the                  simulation, is not a particle domain, or is outside the observer's `reads`",
+                "observer `{}` could not reach `{}` as a particle domain: it is missing from the simulation, is not a particle domain, or is outside the observer's `reads`",
                 self.row, self.set
             )
         };
@@ -413,9 +416,15 @@ mod tests {
         assert!(contract.audit(&["gas"]).is_empty());
         assert_eq!(contract.reads, ["gas"]);
         assert_eq!(contract.outputs, [("gas.wave.max".into(), "J".into())]);
-        assert_eq!(contract.limitations.len(), 3);
-        assert!(contract.limitations.iter().all(|l| !l.contains("min/max ties")));
-        assert!(contract.limitations.iter().any(|l| l.contains("sum and mean depend on particle index order")));
+        assert_eq!(
+            contract.limitations,
+            [
+                "sampled at observation instants only",
+                "sum and mean depend on particle index order in their last bits: floating-point addition is not associative, so relabelling the particles can change them",
+                "the row is a metric, never an invariant: the engine cannot know whether the quantity is conserved",
+                "mean, min and max of an empty set are NaN, which halts the run",
+            ]
+        );
         assert!(contract.deterministic && !contract.differentiable);
         assert_eq!(observer.row(), "gas.wave.max");
     }
@@ -444,7 +453,9 @@ mod tests {
     /// Not finding its set is a bug the runtime reports as `E0951`, not a quiet gap in the
     /// series.
     #[test]
-    #[should_panic(expected = "could not reach `gas` as a particle domain")]
+    #[should_panic(
+        expected = "observer `gas.wave.sum` could not reach `gas` as a particle domain: it is missing from the simulation, is not a particle domain, or is outside the observer's `reads`"
+    )]
     fn a_missing_set_is_a_panic_not_silence() {
         let domains: Vec<Box<dyn Domain>> = Vec::new();
         let observations = Observations::new();

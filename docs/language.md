@@ -938,8 +938,9 @@ observe sum(kinetic_x(atoms)) every 0.1 picosecond;
 observe mean(right_half(atoms, x0 = 2 nanometer));
 ```
 
-The outer call is a reduction, `sum`, `mean`, `min` or `max` (`E0419` for anything else,
-or for no reduction at all). The inner call names an `observer` law (`E0420` for a force
+The outer call is a reduction, `sum`, `mean`, `min` or `max` (`E0419` for any other call
+of a law, or for a law named with no reduction; `E0202` when the reduction's argument is
+not a call of a law, or the law does not exist). The inner call names an `observer` law (`E0420` for a force
 or a potential; the same code refuses an `observer` named in a `force:`), its first
 argument is a solved `particles` set (`E0421` otherwise: a field, a grid, an unsolved set,
 or a name nothing has, with a suggestion when one is close), and the rest bind the law's
@@ -967,6 +968,21 @@ rows have no such particle, and then the explanation blames none: a `sum` that o
 although every value is finite, and the `mean`, `min` or `max` of an empty set. `lattice
 run` then falls back to the replay it uses for the laws of a force or a potential, which
 finds nothing to blame for these and prints only the `HALTED:` line.
+
+**A pinned particle makes a law that reads its mass non-finite.** A particle of infinite
+mass is pinned in place, and `0.5 * a.mass * dot(a.velocity, a.velocity)` is then `inf * 0`,
+which is NaN: the row is non-finite and the run halts (`E0950` blames that particle's
+`a.mass * …` operation). The built-in `kinetic_energy` skips pinned particles; a law does
+not unless it says so, and it can, with an `if` on the mass:
+
+```
+observer kinetic(a: particle) -> joule {
+  return if a.mass < 1e300 kilogram { 0.5 * a.mass * dot(a.velocity, a.velocity) } else { 0 joule };
+}
+```
+
+Only the arm the condition picks counts, so the guarded law is finite for a pinned
+particle and equals the built-in's sum to the bit.
 
 **The plain `observe TARGET` is unchanged: it sets a cadence and filters nothing.** Every
 domain's whole set of rows is recorded at the smallest interval of all the `observe`
@@ -1018,12 +1034,13 @@ operand is ignored in favour of the other, as it always was.
 | `E0414` | a condition that is not a truth value |
 | `E0415` | a body with no `return`, or statements after it |
 | `E0203`, `E0204` | at a use site: a `param` with no value or default, a pair law with no `cutoff`; an unknown or positional argument |
-| `E0201`, `E0208`, `E0405` | at a use site: a parameter bound twice; a `truncation` that is not `energy_shift`, `force_shift` or `none`; a cutoff that is not a positive length, or a potential that is not finite at its cutoff for the set's particles (one that divides by a charge the set gives as zero) |
+| `E0201`, `E0208`, `E0405` | at a use site: a parameter bound twice; at an `observe`, the same law, reduction and set observed twice (their row would repeat) or, as `E0405`, an `every` that is not a positive time on a law form; a `truncation` that is not `energy_shift`, `force_shift` or `none`; a cutoff that is not a positive length, or a potential that is not finite at its cutoff for the set's particles (one that divides by a charge the set gives as zero) |
 | `E0413` | also: a law too large for the interpreter's register file (512 values) |
 | `E0416` | an `observer` law with a second particle; pair observers are not implemented |
 | `E0417` | an `observer` law returning a vector; observe each component separately |
 | `E0418` | an `observer` law reading `c(…)`, `temperature` or `arrhenius`: observers read particles only |
 | `E0419` | an `observe` whose outer call is not one of `sum`, `mean`, `min`, `max`, or that names an observer law with no reduction |
+| `E0202` | also, in an `observe`: a reduction whose argument is not a call of a law (`sum(atoms)`), or a call of a law that does not exist (`sum(nolaw(atoms))`, with a suggestion when a name is close) |
 | `E0420` | a law of the wrong kind at a use site: an `observer` named in a particle set's `force:`, or a `force` or `potential` named in an `observe` |
 | `E0421` | an observer law reduced over something that is not a solved particle set |
 | `W0313` | a `let` or `param` whose name is also a unit |

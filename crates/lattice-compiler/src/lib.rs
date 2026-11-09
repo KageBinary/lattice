@@ -826,6 +826,44 @@ project orbit {
         assert_eq!(unit_of(speed, "speed"), "m/s");
     }
 
+    /// A pinned particle (infinite mass) makes `0.5 m v²` NaN; the guard shown in
+    /// docs/language.md keeps it finite, because only the arm taken counts.
+    #[test]
+    fn a_guard_on_the_mass_keeps_a_pinned_particle_finite() {
+        use lattice_domain_particle::user::layout;
+        let program_of = |law: &str, name: &str| {
+            let compiled = ok(&observed(2, &format!("{law} observe sum({name}(s));")));
+            compiled.model.observers[0].law.as_ref().unwrap().program.clone()
+        };
+        let mut inputs = vec![0.0; layout::BODY_INPUTS as usize];
+        inputs[layout::MASS as usize] = f64::INFINITY;
+        let bare = program_of(
+            "observer bare(a: particle) -> joule { return 0.5 * a.mass * dot(a.velocity, a.velocity); }",
+            "bare",
+        );
+        assert!(bare.eval_to_vec(&inputs, &[])[0].is_nan());
+        let guarded = program_of(
+            "observer guarded(a: particle) -> joule {
+               return if a.mass < 1e300 kilogram { 0.5 * a.mass * dot(a.velocity, a.velocity) } else { 0 joule };
+             }",
+            "guarded",
+        );
+        assert_eq!(guarded.eval_to_vec(&inputs, &[])[0].to_bits(), 0.0f64.to_bits());
+        inputs[layout::MASS as usize] = 2.0;
+        inputs[layout::VX as usize] = 3.0;
+        assert_eq!(guarded.eval_to_vec(&inputs, &[])[0], 9.0);
+    }
+
+    /// The codes `observe` raises that are not its own: an argument that is not a law call
+    /// or a law that does not exist is `E0202`, and the table in docs/language.md says so.
+    #[test]
+    fn an_observe_that_reduces_no_law_is_a_resolution_error() {
+        for tail in ["observe sum(s);", "observe sum(nolaw(s));"] {
+            let (text, codes) = errors(&observed(2, tail));
+            assert_eq!(codes, ["E0202"], "{tail}: {text}");
+        }
+    }
+
     /// `E0419`: the outer call must be one of the four reductions.
     #[test]
     fn an_observe_without_a_reduction_is_refused() {
