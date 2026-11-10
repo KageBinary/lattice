@@ -89,6 +89,23 @@ fn every_example_compiles() {
     }
 }
 
+/// No example's plain `observe` names nothing: `W0320` is for a misspelling, and every
+/// target the examples write (a domain, a field, a species, a world) must resolve.
+#[test]
+fn every_example_observes_something_that_exists() {
+    for path in lattice_files(&repo_root().join("examples")) {
+        let file = load(path.as_path());
+        let (_, diagnostics) = compile_source(&file);
+        let codes = diagnostics.codes();
+        assert!(
+            !codes.contains(&"W0320") && !codes.contains(&"W0321"),
+            "{} has an observe that names nothing:\n{}",
+            path.display(),
+            diagnostics.render(&file)
+        );
+    }
+}
+
 /// Every example must also *run*. Compiling is not the same as being steppable: a
 /// model can pass every static check and still fail to negotiate a timestep.
 #[test]
@@ -106,6 +123,7 @@ fn every_example_runs() {
         config.max_steps = Some(20);
 
         let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+        simulation.add_observers(compiled.observers).expect("the model's own observers attach");
         let outcome = simulation.run(&config);
 
         assert!(
@@ -332,6 +350,7 @@ fn the_ramp_example_settles_inside_its_yard() {
     config.max_steps = None;
 
     let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+    simulation.add_observers(compiled.observers).expect("the model's own observers attach");
     let outcome = simulation.run(&config);
     assert!(outcome.is_success(), "{}", outcome.stop.describe());
 

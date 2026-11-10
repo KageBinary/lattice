@@ -65,6 +65,7 @@ pub mod laws;
 pub mod lower_law;
 pub mod user_force;
 pub mod molecular;
+pub mod observe;
 pub mod quantum;
 pub mod rigid;
 
@@ -718,7 +719,7 @@ project orbit {
     }
 
     /// An observer law checks and compiles, and is not a force: naming one in `force:` is
-    /// refused rather than run as one. Nothing can observe one yet, so it draws an
+    /// refused rather than run as one. One that nothing observes draws an
     /// observer-specific `W0316`, not the force-oriented one.
     #[test]
     fn an_observer_law_is_not_a_force() {
@@ -737,7 +738,7 @@ project orbit {
         let text = diagnostics.render(&file);
         assert_eq!(diagnostics.codes(), ["W0316"], "{text}");
         assert!(
-            text.contains("nothing observes it") && !text.contains("force:") && text.contains("not implemented yet"),
+            text.contains("nothing observes it") && !text.contains("force:") && !text.contains("not implemented yet"),
             "{text}"
         );
         let (_, codes) = err(&model("force: kinetic;"));
@@ -749,6 +750,231 @@ project orbit {
                observer o(a: particle) -> kelvin { return temperature; } }",
         );
         assert!(!diagnostics.has_errors(), "{:?}", diagnostics.codes());
+    }
+
+    const KINETIC: &str = "observer kinetic(a: particle) -> joule {
+        return 0.5 * a.mass * dot(a.velocity, a.velocity);
+    }";
+
+    /// A project with `KINETIC`, a solved set `s` of `count` particles and `tail`.
+    fn observed(count: usize, tail: &str) -> String {
+        format!(
+            "project p {{ duration: 1 second; {KINETIC}
+               grid g {{ size: [4, 4]; extent: [1 meter, 1 meter]; }}
+               field t on g = 300 kelvin {{ diffusivity: 1e-4 meter^2/second; }}
+               particles s {{ count: {count}; speed: 1 meter/second; mass: 1 kilogram; }}
+               solve dynamics(s) with velocity_verlet(dt=0.01 second);
+               solve diffusion(t) with crank_nicolson(dt=0.05 second);
+               {tail} }}"
+        )
+    }
+
+    /// The rendered diagnostics and the error codes alone: the laws these models declare
+    /// and do not observe draw warnings that are not the point.
+    fn errors(source: &str) -> (String, Vec<String>) {
+        let (text, codes) = err(source);
+        (text, codes.into_iter().filter(|code| code.starts_with('E')).collect())
+    }
+
+    /// `observe sum(law(set))` lowers to a law observer with its own row, unit, cadence
+    /// and bound parameters, and uses the law, so it is no longer unused.
+    #[test]
+    fn an_observer_law_is_reduced_at_its_use_site() {
+        let source = observed(
+            4,
+            "observer right_half(a: particle) -> 1 {
+                 param x0: meter = 0 meter;
+                 return if a.position.x > x0 { 1 } else { 0 };
+             }
+             observe sum(kinetic(s)) every 0.1 second;
+             observe mean(right_half(s, x0 = 2 meter));
+             observe s;",
+        );
+        let (compiled, diagnostics, file) = build(&source);
+        let rendered = diagnostics.render(&file);
+        assert!(diagnostics.is_empty(), "{rendered}");
+        let compiled = compiled.unwrap();
+        let [kinetic, right, plain] = &compiled.model.observers[..] else { panic!("three observers") };
+        let law = kinetic.law.as_ref().expect("a law observer");
+        assert_eq!((law.row.as_str(), law.unit.as_str(), law.domain.as_str()), ("s.kinetic.sum", "J", "s"));
+        assert_eq!(law.reduction, lattice_ir::Reduction::Sum);
+        assert_eq!(kinetic.interval, Some(0.1));
+        let law = right.law.as_ref().unwrap();
+        assert_eq!((law.row.as_str(), law.unit.as_str()), ("s.right_half.mean", "1"));
+        assert_eq!(law.params, [2.0]);
+        assert_eq!(right.interval, None);
+        assert!(plain.law.is_none(), "the plain form filters nothing");
+        // Attached in source order, one per law form.
+        let names: Vec<String> = compiled.observers.iter().map(|o| o.contract().name.to_string()).collect();
+        assert_eq!(names, ["s.kinetic.sum", "s.right_half.mean"]);
+        assert!(compiled.model.report().contains("records `s.kinetic.sum` in J"));
+    }
+
+    /// A row's unit is the law's: `J` for an energy declared as one, and the coherent SI
+    /// form for anything else, including a torque, which has an energy's dimension.
+    #[test]
+    fn a_row_is_labelled_with_the_unit_the_law_declared() {
+        let unit_of = |law: &str, name: &str| {
+            let compiled = ok(&observed(2, &format!("{law} observe sum({name}(s));")));
+            compiled.model.observers[0].law.as_ref().unwrap().unit.clone()
+        };
+        let torque = "observer torque(a: particle) -> newton * meter { return a.mass * 1 meter / second^2 * a.position.x; }";
+        assert_eq!(unit_of(torque, "torque"), "kg·m^2/s^2");
+        let energy = "observer work(a: particle) -> joule { return a.mass * 1 meter^2 / second^2; }";
+        assert_eq!(unit_of(energy, "work"), "J");
+        let speed = "observer speed(a: particle) -> meter / second { return length(a.velocity); }";
+        assert_eq!(unit_of(speed, "speed"), "m/s");
+    }
+
+    /// A pinned particle (infinite mass) makes `0.5 m v²` NaN; the guard shown in
+    /// docs/language.md keeps it finite, because only the arm taken counts.
+    #[test]
+    fn a_guard_on_the_mass_keeps_a_pinned_particle_finite() {
+        use lattice_domain_particle::user::layout;
+        let program_of = |law: &str, name: &str| {
+            let compiled = ok(&observed(2, &format!("{law} observe sum({name}(s));")));
+            compiled.model.observers[0].law.as_ref().unwrap().program.clone()
+        };
+        let mut inputs = vec![0.0; layout::BODY_INPUTS as usize];
+        inputs[layout::MASS as usize] = f64::INFINITY;
+        let bare = program_of(
+            "observer bare(a: particle) -> joule { return 0.5 * a.mass * dot(a.velocity, a.velocity); }",
+            "bare",
+        );
+        assert!(bare.eval_to_vec(&inputs, &[])[0].is_nan());
+        let guarded = program_of(
+            "observer guarded(a: particle) -> joule {
+               return if a.mass < 1e300 kilogram { 0.5 * a.mass * dot(a.velocity, a.velocity) } else { 0 joule };
+             }",
+            "guarded",
+        );
+        assert_eq!(guarded.eval_to_vec(&inputs, &[])[0].to_bits(), 0.0f64.to_bits());
+        inputs[layout::MASS as usize] = 2.0;
+        inputs[layout::VX as usize] = 3.0;
+        assert_eq!(guarded.eval_to_vec(&inputs, &[])[0], 9.0);
+    }
+
+    /// The codes `observe` raises that are not its own: an argument that is not a law call
+    /// or a law that does not exist is `E0202`, and the table in docs/language.md says so.
+    #[test]
+    fn an_observe_that_reduces_no_law_is_a_resolution_error() {
+        for tail in ["observe sum(s);", "observe sum(nolaw(s));"] {
+            let (text, codes) = errors(&observed(2, tail));
+            assert_eq!(codes, ["E0202"], "{tail}: {text}");
+        }
+    }
+
+    /// `E0419`: the outer call must be one of the four reductions.
+    #[test]
+    fn an_observe_without_a_reduction_is_refused() {
+        for tail in ["observe average(kinetic(s));", "observe kinetic(s);"] {
+            let (text, codes) = errors(&observed(2, tail));
+            assert_eq!(codes, ["E0419"], "{tail}: {text}");
+            assert!(text.contains("sum") && text.contains("mean"), "{text}");
+        }
+    }
+
+    /// `E0420`: the inner callee must be an observer law.
+    #[test]
+    fn an_observe_of_a_force_is_refused() {
+        let (text, codes) = errors(&observed(
+            2,
+            "force pull(a: particle) -> vec2<newton> { return vec2(0 newton, 0 newton); }
+             observe sum(pull(s));",
+        ));
+        assert_eq!(codes, ["E0420"], "{text}");
+        assert!(text.contains("`pull` is a force"), "{text}");
+    }
+
+    /// `E0421`: the set must be a solved particle domain, and a near miss is suggested.
+    #[test]
+    fn an_observe_over_something_that_is_not_a_particle_domain_is_refused() {
+        for (set, expect) in [
+            ("t", "it is a field"),
+            ("g", "it is a grid"),
+            ("ss", "did you mean `s`?"),
+            ("nothing_like_it", "nothing is called that"),
+        ] {
+            let (text, codes) = errors(&observed(2, &format!("observe sum(kinetic({set}));")));
+            assert_eq!(codes, ["E0421"], "{set}: {text}");
+            assert!(text.contains(expect), "{set}: {text}");
+        }
+        let (text, codes) = errors(&observed(2, "observe sum(kinetic());"));
+        assert_eq!(codes, ["E0421"], "{text}");
+        // A set that was declared and never solved has no domain.
+        let (text, codes) = err(
+            "project p { observer kinetic(a: particle) -> joule { return 0.5 * a.mass * dot(a.velocity, a.velocity); }
+               particles s { count: 2; mass: 1 kilogram; }
+               observe sum(kinetic(s)); }",
+        );
+        assert!(codes.contains(&"E0421".to_string()) && text.contains("never solved"), "{codes:?} {text}");
+    }
+
+    /// Arguments bind as they do for a force: unknown, missing, unnamed and duplicated
+    /// parameters are the same errors.
+    #[test]
+    fn observer_parameters_bind_like_a_forces() {
+        let law = "observer above(a: particle) -> 1 { param x0: meter; return if a.position.x > x0 { 1 } else { 0 }; }";
+        let cases = [
+            ("above(s)", "E0203"),
+            ("above(s, y0 = 1 meter)", "E0204"),
+            ("above(s, 1 meter)", "E0204"),
+            ("above(s, x0 = 1 meter, x0 = 2 meter)", "E0201"),
+            ("above(s, x0 = 1 second)", "E0400"),
+        ];
+        for (call, code) in cases {
+            let (text, codes) = errors(&observed(2, &format!("{law} observe sum({call});")));
+            assert!(codes.contains(&code.to_string()), "{call}: {codes:?} {text}");
+        }
+        let compiled = ok(&observed(2, &format!("{law} observe sum(above(s, x0 = 1 meter));")));
+        assert_eq!(compiled.model.observers[0].law.as_ref().unwrap().params, [1.0]);
+    }
+
+    /// `E0413` applies where an observer law is lowered, which is its `observe`.
+    #[test]
+    fn an_observer_law_too_large_for_the_register_file_is_refused() {
+        // Distinct terms: the builder shares identical sub-expressions.
+        let terms = (1..=300).map(|k| format!("{k} * a.mass * a.position.x")).collect::<Vec<_>>().join(" + ");
+        let law = format!("observer big(a: particle) -> kilogram * meter {{ return {terms}; }}");
+        let (text, codes) = errors(&observed(2, &format!("{law} observe sum(big(s));")));
+        assert_eq!(codes, ["E0413"], "{text}");
+    }
+
+    #[test]
+    fn the_same_row_cannot_be_observed_twice() {
+        let (text, codes) = errors(&observed(
+            2,
+            "observe sum(kinetic(s)) every 0.1 second; observe sum(kinetic(s)) every 0.2 second;",
+        ));
+        assert_eq!(codes, ["E0201"], "{text}");
+        // Another reduction of the same law is another row.
+        ok(&observed(2, "observe sum(kinetic(s)); observe max(kinetic(s));"));
+        let (text, codes) = errors(&observed(2, "observe sum(kinetic(s)) every 0 second;"));
+        assert_eq!(codes, ["E0405"], "{text}");
+    }
+
+    /// `W0320`: a plain `observe` target must name a domain, a species or field, or an
+    /// observation; a near miss is suggested. `W0321`: `mean`, `min` and `max` of a set
+    /// that starts empty are NaN, which halts a run.
+    #[test]
+    fn plain_targets_are_resolved_and_empty_sets_are_warned_about() {
+        for target in ["s", "t", "total_energy", "s.kinetic_energy", "kinetic_energy"] {
+            let (_, diagnostics, file) = build(&observed(2, &format!("observe {target};")));
+            assert_eq!(diagnostics.codes(), ["W0316"], "{target}: {}", diagnostics.render(&file));
+        }
+        let (_, diagnostics, file) = build(&observed(2, "observe ss every 1 second; observe kinetic_energi;"));
+        let text = diagnostics.render(&file);
+        assert_eq!(diagnostics.codes(), ["W0316", "W0320", "W0320"], "{text}");
+        assert!(text.contains("observe target `ss` names nothing") && text.contains("did you mean `s`?"), "{text}");
+        assert!(text.contains("did you mean `kinetic_energy`?"), "{text}");
+
+        for (reduction, warns) in [("sum", false), ("mean", true), ("min", true), ("max", true)] {
+            let (compiled, diagnostics, file) = build(&observed(0, &format!("observe {reduction}(kinetic(s));")));
+            let text = diagnostics.render(&file);
+            assert!(!diagnostics.has_errors(), "{text}");
+            assert_eq!(diagnostics.codes().contains(&"W0321"), warns, "{reduction}: {text}");
+            assert!(compiled.is_some());
+        }
     }
 
     /// A rate that reads `temperature` is the state, and so a rate law, which must come

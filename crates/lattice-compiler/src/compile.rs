@@ -30,15 +30,15 @@ use lattice_coupling::{Coupler, CouplingEdge, Mapping, PortRef};
 use crate::{chemistry, molecular, quantum, rigid};
 use lattice_domain_quantum2d::Scheme as QuantumScheme;
 use lattice_domain_particle::{
-    analysis, Angle, Bond, BoundaryBox, Coulomb, HarmonicAngle, HarmonicBond, HarmonicWell, Integrator,
+    analysis, LawObserver, Angle, Bond, BoundaryBox, Coulomb, HarmonicAngle, HarmonicBond, HarmonicWell, Integrator,
     LennardJones, LinearDrag, ParticleBoundary, ParticleDomain, ParticleId, ParticleSpec,
     RdfRequest, SoftRepulsion, Thermostat, UniformAcceleration,
 };
 use lattice_ir::{
     BodySpec, BoundarySet, BufferKind, BufferPlan, CompiledModel, Domain, DomainId, DomainSpec,
     Invariant,
-    FidelityProfile, Grid2d, ObserverId, ObserverSpec, Operation, OperationGraph, OperationKind,
-    Pcg32, Precision, Side, VisualSpec,
+    FidelityProfile, Grid2d, ObserverId, ObserverLawUse, ObserverSpec, Observer, Operation,
+    OperationGraph, OperationKind, Pcg32, Precision, Reduction, Side, VisualSpec,
 };
 use lattice_syntax::{
     Decl, Diagnostic, Diagnostics, Expr, ExprKind, FieldDecl, Ident, Project, SolveStmt, SourceFile,
@@ -112,6 +112,10 @@ pub struct Compiled {
     pub laws: Vec<TypedLaw>,
     /// Where each law was bound to a particle set, and to what values.
     pub law_uses: Vec<LawUse>,
+    /// The observers the model's `observe sum(law(set))` statements declare, in source
+    /// order. A simulation must attach them (`Simulation::add_observers`) before any of
+    /// its own, or those rows are never recorded.
+    pub observers: Vec<Box<dyn Observer>>,
 }
 
 /// A user law at a use site: `force: spring(stiffness=40 newton/meter, …)`.
@@ -302,6 +306,24 @@ impl Default for RigidWorld {
     }
 }
 
+/// The names of the observations the domains publish, whole (`atoms.kinetic_energy`) and
+/// without the domain prefix (`kinetic_energy`): what a plain `observe` target may name.
+fn published_names(domains: &[Box<dyn Domain>]) -> Vec<String> {
+    let mut sample = lattice_ir::Observations::new();
+    for domain in domains {
+        domain.observe(&mut sample);
+    }
+    let mut names = Vec::new();
+    for observation in sample.iter() {
+        let name = observation.name.to_string();
+        if let Some((_, rest)) = name.split_once('.') {
+            names.push(rest.to_string());
+        }
+        names.push(name);
+    }
+    names
+}
+
 impl<'a> Compiler<'a> {
     fn new(file: &'a SourceFile, units: &'a UnitRegistry) -> Compiler<'a> {
         Compiler {
@@ -414,7 +436,6 @@ impl<'a> Compiler<'a> {
         for decl in project.declarations_of("particles") {
             self.declare_particles(decl);
         }
-        self.warn_about_unused_laws(project);
         // Materials, then bodies, then joints: each refers to the one before it by
         // name, and resolving forward references would buy nothing but the ability to
         // write a scene in a confusing order.
@@ -458,7 +479,8 @@ impl<'a> Compiler<'a> {
 
         // An observer reads every buffer, which is what places it after all the
         // advances in the schedule.
-        let observers = self.lower_observers(project);
+        let observers = self.lower_observers(project, &lowering.domains);
+        self.warn_about_unused_laws(project);
         let all_buffers: Vec<_> = lowering.buffers.buffers().iter().map(|b| b.id).collect();
         for observer in &observers {
             let mut operation =
@@ -490,12 +512,19 @@ impl<'a> Compiler<'a> {
         };
 
         let coupler = self.lower_couples(project);
+        let law_observers = model
+            .observers
+            .iter()
+            .filter_map(LawObserver::from_spec)
+            .map(|observer| Box::new(observer) as Box<dyn Observer>)
+            .collect();
         Compiled {
             model,
             domains,
             coupler,
             laws: core::mem::take(&mut self.laws),
             law_uses: core::mem::take(&mut self.law_uses),
+            observers: law_observers,
         }
     }
 
@@ -1319,14 +1348,13 @@ impl<'a> Compiler<'a> {
             if self.used_laws.contains(&law.name.text) || !self.laws.iter().any(|l| l.name == law.name.text) {
                 continue;
             }
-            // An observer is used at an `observe`, not in a particle set's `force:`. That
-            // use site is not implemented yet, so today nothing can observe one.
+            // An observer is used at an `observe`, not in a particle set's `force:`.
             if self.laws.iter().any(|l| l.name == law.name.text && l.kind == laws::LawKind::Observer) {
                 self.diagnostics.push(
                     Diagnostic::warning(format!("observer law `{}` is declared but nothing observes it", law.name.text))
                         .with_code("W0316")
                         .at(law.name.span, "unused")
-                        .note("the `observe` use site that reduces an observer law over a particle set is not implemented yet"),
+                        .help(format!("reduce it over a particle set with `observe sum({}(set));`", law.name.text)),
                 );
                 continue;
             }
@@ -3004,8 +3032,16 @@ impl<'a> Compiler<'a> {
         ids
     }
 
-    fn lower_observers(&mut self, project: &Project) -> Vec<ObserverSpec> {
-        let mut observers = Vec::new();
+    /// Lower the `observe` statements (spec M6.2 §4.2).
+    ///
+    /// `observe sum(kinetic(atoms)) every T;` is an observer law reduced over a particle
+    /// domain, and becomes an [`ObserverLawUse`] a run records at its own cadence. Any
+    /// other `observe TARGET` keeps its present meaning, which is to set a cadence and
+    /// filter nothing; its target is resolved so a misspelling is warned about (`W0320`).
+    fn lower_observers(&mut self, project: &Project, domains: &[Box<dyn Domain>]) -> Vec<ObserverSpec> {
+        let mut observers: Vec<ObserverSpec> = Vec::new();
+        let mut rows: Vec<(String, Span)> = Vec::new();
+        let mut published: Option<Vec<String>> = None;
         for statement in project.observes() {
             let target = match statement.target.as_name() {
                 Some(name) => name.to_string(),
@@ -3019,13 +3055,221 @@ impl<'a> Compiler<'a> {
                 let evaluator = self.evaluator();
                 evaluator.require(expr, Dimension::TIME, "an observe interval", &mut self.diagnostics)
             });
+            let law = match self.observer_law(&statement.target) {
+                Err(()) => continue,
+                Ok(Some(law)) => {
+                    if let Some(seconds) = interval.filter(|seconds| !(*seconds > 0.0 && seconds.is_finite())) {
+                        self.error(
+                            Diagnostic::error("an observe interval must be a positive time")
+                                .with_code("E0405")
+                                .at(statement.every.as_ref().map_or(statement.span, |e| e.span), format!("found {seconds} s")),
+                        );
+                        continue;
+                    }
+                    if let Some((_, first)) = rows.iter().find(|(row, _)| *row == law.row) {
+                        let first = *first;
+                        self.error(
+                            Diagnostic::error(format!("`{}` is observed twice", law.row))
+                                .with_code("E0201")
+                                .at(statement.target.span, "the same law, reduction and set again")
+                                .also(first, "first observed here")
+                                .help("each reduction of a law over a set is recorded once; change the cadence on the first"),
+                        );
+                        continue;
+                    }
+                    rows.push((law.row.clone(), statement.target.span));
+                    Some(law)
+                }
+                Ok(None) => {
+                    let names = published.get_or_insert_with(|| published_names(domains));
+                    self.resolve_plain_target(&statement.target, names);
+                    None
+                }
+            };
             observers.push(ObserverSpec {
                 id: ObserverId::from_index(observers.len() as u32),
                 target,
                 interval,
+                law,
             });
         }
         observers
+    }
+
+    /// Take apart an `observe` target of the form `reduction(law(set, args…))`.
+    ///
+    /// `Ok(None)` is a target that is not that form (the plain `observe atoms`), `Err`
+    /// one that is and was reported. The errors: `E0419` for a call that is not a
+    /// reduction, `E0420` for a law that is not an observer, `E0421` for a set that is not
+    /// a particle domain.
+    fn observer_law(&mut self, target: &Expr) -> Result<Option<ObserverLawUse>, ()> {
+        let ExprKind::Call(callee, arguments) = &target.kind else { return Ok(None) };
+        let Some(outer) = callee.as_name() else { return Ok(None) };
+        let reduction = Reduction::parse(outer);
+        let is_law = |compiler: &Compiler<'_>, name: &str| compiler.law_names.iter().any(|law| law == name);
+        // The one argument, when it is itself a call: `law(set, …)`.
+        let inner = match arguments.as_slice() {
+            [argument] if argument.name.is_none() => match &argument.value.kind {
+                ExprKind::Call(inner, _) => inner.as_name().map(|name| (name, &argument.value)),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (reduction, inner) {
+            (Some(_), Some(_)) => {}
+            (Some(_), None) => {
+                self.error(
+                    Diagnostic::error(format!("`{outer}` reduces an observer law over a particle set"))
+                        .with_code("E0202")
+                        .at(target.span, "not a call of a law")
+                        .help(format!("write `{outer}(law(set))`, with the name of an `observer` law and a particle set")),
+                );
+                return Err(());
+            }
+            (None, Some((law, _))) if is_law(self, law) => {
+                self.used_laws.insert(law.to_string());
+                self.error(
+                    Diagnostic::error(format!("`{outer}` is not a reduction"))
+                        .with_code("E0419")
+                        .at(callee.span, "not one of sum, mean, min, max")
+                        .note("an observer law gives one value per particle; a reduction turns them into one number")
+                        .help(format!("`observe sum({law}(…))`, or `mean`, `min` or `max`")),
+                );
+                return Err(());
+            }
+            (None, _) if is_law(self, outer) => {
+                self.used_laws.insert(outer.to_string());
+                self.error(
+                    Diagnostic::error(format!("`{outer}` is an observer law, and `observe` needs a reduction of it"))
+                        .with_code("E0419")
+                        .at(target.span, "no reduction")
+                        .note("an observer law gives one value per particle; a reduction turns them into one number")
+                        .help(format!("write `observe sum({outer}(…));`, or `mean`, `min` or `max`")),
+                );
+                return Err(());
+            }
+            _ => return Ok(None),
+        }
+        let (Some(reduction), Some((law_name, call))) = (reduction, inner) else { return Err(()) };
+        if !is_law(self, law_name) {
+            let observers: Vec<&str> =
+                self.laws.iter().filter(|l| l.kind == laws::LawKind::Observer).map(|l| l.name.as_str()).collect();
+            let suggestion = crate::builtins::closest(law_name, &observers).map(str::to_string);
+            let mut diagnostic = Diagnostic::error(format!("there is no law called `{law_name}`"))
+                .with_code("E0202")
+                .at(call.span, "unknown law");
+            if let Some(suggestion) = suggestion {
+                diagnostic = diagnostic.help(format!("did you mean `{suggestion}`?"));
+            }
+            self.error(diagnostic);
+            return Err(());
+        }
+        self.used_laws.insert(law_name.to_string());
+        // A law that failed its check was reported where it was declared.
+        let Some(law) = self.laws.iter().find(|law| law.name == law_name).cloned() else { return Err(()) };
+        if law.kind != laws::LawKind::Observer {
+            let kind = if law.kind == laws::LawKind::Force { "force" } else { "potential" };
+            self.error(
+                Diagnostic::error(format!("`{law_name}` is a {kind}, and `observe` takes an observer law"))
+                    .with_code("E0420")
+                    .at(call.span, format!("a {kind} here"))
+                    .note("a force or potential acts on particles; an observer measures them")
+                    .help(format!("a {kind} is used with `force: {law_name}(…);` in a `particles` block; write an `observer` law to measure")),
+            );
+            return Err(());
+        }
+
+        let ExprKind::Call(_, call_arguments) = &call.kind else { return Err(()) };
+        let set = call_arguments.first().filter(|a| a.name.is_none()).and_then(|a| a.value.as_name().map(|name| (name, a.value.span)));
+        let Some((set, set_span)) = set else {
+            self.error(
+                Diagnostic::error(format!("`{law_name}` is evaluated over a particle set"))
+                    .with_code("E0421")
+                    .at(call.span, "no particle set")
+                    .help(format!("name the set first: `{outer}({law_name}(atoms))`, then its parameters by name")),
+            );
+            return Err(());
+        };
+        if !(self.particles.contains_key(set) && self.domain_index.contains_key(set)) {
+            let what = if self.particles.contains_key(set) {
+                "it is declared but never solved, so no domain exists for it".to_string()
+            } else if self.grids.contains_key(set) {
+                "it is a grid".to_string()
+            } else if self.fields.get(set).is_some_and(|f| f.is_species) {
+                "it is a species".to_string()
+            } else if self.fields.contains_key(set) {
+                "it is a field".to_string()
+            } else if self.mixtures.contains_key(set) {
+                "it is a reacting mixture".to_string()
+            } else if self.domain_index.contains_key(set) {
+                "it is not a particle set".to_string()
+            } else {
+                "nothing is called that".to_string()
+            };
+            let sets: Vec<&str> =
+                self.particles.keys().filter(|name| self.domain_index.contains_key(*name)).map(String::as_str).collect();
+            let mut diagnostic = Diagnostic::error(format!("`{set}` is not a particle domain"))
+                .with_code("E0421")
+                .at(set_span, "not a particle domain")
+                .note(format!("{what}; an observer law is evaluated once per particle, and only a solved `particles` set has any"));
+            diagnostic = match crate::builtins::closest(set, &sets) {
+                Some(suggestion) => diagnostic.help(format!("did you mean `{suggestion}`?")),
+                None if sets.is_empty() => diagnostic.help("declare a `particles` set and solve it with `solve dynamics(…)`"),
+                None => diagnostic.help(format!("the particle domains are: {}", sets.join(", "))),
+            };
+            self.error(diagnostic);
+            return Err(());
+        }
+
+        let evaluator = self.evaluator();
+        let Some(used) =
+            crate::observe::lower_use(&law, set, reduction, call, &evaluator, &mut self.diagnostics)
+        else {
+            return Err(());
+        };
+        if self.particles[set].count == 0 && reduction != Reduction::Sum {
+            self.error(
+                Diagnostic::warning(format!("`{set}` may be empty, and the {} of nothing is NaN", reduction.name()))
+                    .with_code("W0321")
+                    .at(set_span, "declared with `count: 0`")
+                    .note("a run halts on a non-finite row, so this observer would stop it at the first sample")
+                    .help("give the set particles, or observe `sum`, which is 0 over an empty set"),
+            );
+        }
+        Ok(Some(used))
+    }
+
+    /// Warn (`W0320`) when a plain `observe TARGET` names nothing: not a domain, a species
+    /// or field, or an observation some domain publishes.
+    ///
+    /// The plain form sets how often the run samples and filters nothing (spec M6.2 O2),
+    /// so a target that matches nothing changes nothing, which is exactly what a
+    /// misspelling would also do. Only a name or a dotted path is resolved.
+    fn resolve_plain_target(&mut self, target: &Expr, published: &[String]) {
+        if !matches!(target.kind, ExprKind::Name(_) | ExprKind::Member(..)) {
+            return;
+        }
+        let text = self.file.slice(target.span).to_string();
+        let mut known: Vec<&str> = Vec::new();
+        known.extend(self.domain_index.keys().map(String::as_str));
+        known.extend(self.particles.keys().map(String::as_str));
+        known.extend(self.fields.keys().map(String::as_str));
+        known.extend(self.mixtures.keys().map(String::as_str));
+        known.extend(published.iter().map(String::as_str));
+        if known.contains(&text.as_str()) {
+            return;
+        }
+        known.sort_unstable();
+        known.dedup();
+        let mut diagnostic = Diagnostic::warning(format!("observe target `{text}` names nothing"))
+            .with_code("W0320")
+            .at(target.span, "not a domain, species or published observation")
+            .note("a plain `observe` sets how often the run samples; it records everything either way, so this line changes nothing");
+        diagnostic = match crate::builtins::closest(&text, &known) {
+            Some(suggestion) => diagnostic.help(format!("did you mean `{suggestion}`?")),
+            None => diagnostic.help("name a domain, a species, or an observation such as `total_energy`"),
+        };
+        self.diagnostics.push(diagnostic);
     }
 
     fn lower_visuals(&mut self, project: &Project) -> Vec<VisualSpec> {

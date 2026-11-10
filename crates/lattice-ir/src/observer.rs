@@ -60,6 +60,7 @@ use std::path::PathBuf;
 use crate::contract::{Domain, DomainType};
 use crate::curve::Curve;
 use crate::diagnostics::Observations;
+use crate::fault::LawFault;
 
 /// Something that measures a run without changing it.
 pub trait Observer: Send {
@@ -104,6 +105,18 @@ pub trait Observer: Send {
     /// happening once: `Simulation::observe` must not be called twice for one instant.
     fn due(&mut self, _time: f64, _dt: f64) -> bool {
         true
+    }
+
+    /// Explain why the row `row` is non-finite at the state `ctx` shows (diagnostic
+    /// `E0950`, spec M6.2 G7). Default: no explanation.
+    ///
+    /// Called after a run has halted on that row, with the domains still in the state
+    /// that was sampled. That state is the observer's own input, so it can trace its
+    /// computation against it without replaying the run. An observer that computes
+    /// from a program names the first particle, in index order, whose value is not
+    /// finite and the operation that made it so.
+    fn explain_non_finite(&self, _ctx: &ObserveContext<'_>, _row: &str) -> Option<LawFault> {
+        None
     }
 }
 

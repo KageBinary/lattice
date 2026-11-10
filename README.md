@@ -60,7 +60,7 @@ honesty over feature count**:
 |---|---|---|
 | **Units** | 7-dimension analysis, SI registry with prefixes, unit-expression parser, CODATA constants | 83 tests; every dimensioned literal in the spec's example models parses to the right dimension |
 | **Language** | The `.lattice` DSL — lexer, parser, AST, source-positioned diagnostics with carets | Parses spec §25.1, §25.2, §12.2 and §8.3 verbatim |
-| **Compiler** | Name and unit resolution, dimensional checking of every expression, solver selection, buffer planning, operation graph, model report | 52 invalid fixtures each rejected for its declared reason |
+| **Compiler** | Name and unit resolution, dimensional checking of every expression, solver selection, buffer planning, operation graph, model report | 55 invalid fixtures each rejected for its declared reason |
 | **Runtime** | Clock, timestep negotiation across domains, observers on a cadence, run artifacts | Refuses unstable steps before running; halts on the first non-finite value |
 | **Storage** | Structure-of-arrays particles with stable handles, halo'd grid fields, bump arenas, reproducible RNG | 112 tests; no allocation in stepping loops |
 | **Particles** | Explicit Euler, semi-implicit Euler, velocity Verlet; gravity, drag, harmonic wells, Lennard-Jones; uniform cell list; user-defined `force` and `potential` laws (spec §8.3), compiled to a program with an exact derivative and run eight pairs at a time | Free fall, oscillator period, energy drift, convergence order, momentum conservation; a user-written Lennard-Jones force bit-identical to the built-in over 1,000 steps; §8.3's damped spring decaying at `c/2μ` |

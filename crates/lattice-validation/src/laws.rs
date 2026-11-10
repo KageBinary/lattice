@@ -49,7 +49,65 @@ pub(crate) static CASES: &[Case] = &[
         claim: "spec 8.3's damped spring (with its damping sign corrected) decays at c/2mu: the Richardson-extrapolated rate agrees to second order",
         run: damped_spring,
     },
+    Case {
+        name: "observer_ke_matches_builtin",
+        domain: "laws",
+        level: Level::CrossScheme,
+        claim: "in examples/argon.lattice, an observer law 0.5 m |v|^2 reduced with `sum` records the built-in kinetic energy to the last bit at every sample, because both add the same terms in the same order",
+        run: observer_ke_matches_builtin,
+    },
 ];
+
+/// Spec M6.2 §7: the sum of an observer law equals the built-in `atoms.kinetic_energy`.
+///
+/// The comparison is bit-for-bit, not within a bound, because the two do the same
+/// arithmetic. The built-in (`ParticleDomain::kinetic_energy`) starts a total at `+0.0`
+/// and adds `0.5 * m * (vx * vx + vy * vy)` for each particle in index order. The law
+/// lowers to `(0.5 * m) * (vx * vx + vy * vy)`, the same order of operations, evaluated by
+/// the batched interpreter, and `sum` is a left fold from `+0.0` in index order. The
+/// built-in skips a particle whose mass is not finite and the law does not; the argon
+/// example has none. A model that did would differ by that particle's NaN, not by rounding.
+fn observer_ke_matches_builtin() -> Outcome {
+    const LAW: &str = "observer kinetic(a: particle) -> joule {
+    return 0.5 * a.mass * dot(a.velocity, a.velocity);
+  }
+
+  particles atoms {";
+    let example = include_str!("../../../examples/argon.lattice");
+    let source = example.replacen("particles atoms {", LAW, 1).replacen(
+        "observe atoms every 1 picosecond;",
+        "observe atoms every 0.1 picosecond;\n  observe sum(kinetic(atoms)) every 0.1 picosecond;",
+        1,
+    );
+    assert_ne!(source, example, "the example no longer has the lines this case edits");
+    let file = lattice_syntax::SourceFile::new("argon_with_observer.lattice", source);
+    let (compiled, diagnostics) = lattice_compiler::compile_source(&file);
+    assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+    let compiled = compiled.expect("a model");
+
+    let mut config = lattice_runtime::RunConfig::from_model(&compiled.model);
+    config.duration = None;
+    config.max_steps = Some(500);
+    let mut simulation =
+        lattice_runtime::Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+    simulation.add_observers(compiled.observers).expect("the model's observers attach");
+    let outcome = simulation.run(&config);
+    assert!(outcome.is_success(), "{}", outcome.stop.describe());
+
+    let (mut compared, mut differing) = (0usize, 0usize);
+    for sample in outcome.artifact.timeline() {
+        let row = |name: &str| sample.values.iter().find(|(key, _)| key == name).map(|(_, v)| *v);
+        if let (Some(builtin), Some(law)) = (row("atoms.kinetic_energy"), row("atoms.kinetic.sum")) {
+            compared += 1;
+            differing += usize::from(builtin.to_bits() != law.to_bits());
+        }
+    }
+    // A comparison of nothing is not a pass.
+    let failures = if compared == 0 { 1 } else { differing };
+    Outcome::at_most("samples where the law's sum differs from the built-in in any bit", "samples", failures as f64, 0.0)
+        .note(format!("{compared} samples of 400 argon atoms over 500 steps of 10 fs, from examples/argon.lattice"))
+        .note("bit-for-bit: both add 0.5 m (vx^2 + vy^2) per atom, in index order, from +0.0")
+}
 
 /// Argon in SI, written so the language parses the same numbers Rust does.
 const EPSILON: f64 = 1.654e-21;

@@ -129,8 +129,8 @@ pub use grid::{
     Boundary, BoundaryError, BoundarySet, Grid2d, ScalarField, Side, VectorField,
 };
 pub use model::{
-    format_number, BufferKind, BufferPlan, BufferSpec, CompiledModel, DomainSpec, ObserverSpec,
-    VisualSpec,
+    format_number, BufferKind, BufferPlan, BufferSpec, CompiledModel, DomainSpec, ObserverLawUse,
+    ObserverSpec, Reduction, VisualSpec,
 };
 pub use ids::{
     BodyId, BufferId, DomainId, FieldId, MaterialId, ObserverId, OperatorId, ParticleId,

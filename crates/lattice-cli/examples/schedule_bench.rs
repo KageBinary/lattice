@@ -26,6 +26,7 @@ fn run(side: usize, scheduled: bool) -> (std::time::Duration, Vec<Vec<u64>>) {
         .fold(f64::INFINITY, f64::min);
     let mut sim = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler)
         .with_executor(Executor::with_threads(4));
+    sim.add_observers(compiled.observers).expect("the model's observers attach");
     for _ in 0..5 {
         sim.step(dt);
     }

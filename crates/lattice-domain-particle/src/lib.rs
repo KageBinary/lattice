@@ -77,6 +77,7 @@ mod forces;
 mod image;
 mod integrator;
 mod neighbors;
+pub mod observer;
 mod thermostat;
 pub mod user;
 mod verlet;
@@ -91,6 +92,7 @@ pub use forces::{
 pub use image::MinimumImage;
 pub use integrator::{Integrator, LangevinBath, PARTICLE_GRAIN};
 pub use neighbors::CellList;
+pub use observer::{reduce_law, LawObserver};
 pub use lattice_expr::LANES;
 pub use user::{Evaluation, UserLaw, UserLawKind};
 pub use thermostat::{ornstein_uhlenbeck_coefficients, rescale_velocities, Thermostat, BOLTZMANN};

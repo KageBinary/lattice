@@ -121,7 +121,15 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
     let schedule = executor.label();
     let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler)
         .with_executor(executor);
+    // The model's own `observe sum(law(set))` rows are recorded by observers it declares.
+    simulation.add_observers(compiled.observers)?;
     let outcome = simulation.run(&config);
+
+    // An observer the run switched off is not an error of the run, but the rows it would
+    // have recorded are gone, which is worth saying whether or not the report is quiet.
+    for fault in &outcome.observer_faults {
+        print!("{}", observer_fault_diagnostic(fault).render(&file));
+    }
 
     if !args.has("quiet") {
         println!();
@@ -135,11 +143,17 @@ pub fn run(args: &Args) -> Result<ExitCode, String> {
         }
         println!();
         println!("{}", outcome.stop.describe());
-        if let lattice_runtime::StopReason::NonFinite { step, .. } = outcome.stop
-            && let Some(fault) = explain_halt(&file, executor_from(args)?, outcome.timestep, step)
-        {
-            println!();
-            print!("{}", fault.render(&file));
+        if let lattice_runtime::StopReason::NonFinite { observation, step, time } = &outcome.stop {
+            // An observer's own row is explained by tracing it against the state it
+            // sampled, which the simulation still holds; anything else is replayed.
+            let explained = match simulation.explain_observer_halt(observation) {
+                Some(fault) => Some(fault_diagnostic(&fault, *step, *time)),
+                None => explain_halt(&file, executor_from(args)?, outcome.timestep, *step),
+            };
+            if let Some(fault) = explained {
+                println!();
+                print!("{}", fault.render(&file));
+            }
         }
         println!();
         print!("{}", coupling_report(&simulation));
@@ -182,6 +196,17 @@ pub fn explain_halt(
     let fault = replay.trace_non_finite(timestep, step)?;
     let clock = replay.clock();
     Some(fault_diagnostic(&fault, clock.step, clock.time))
+}
+
+/// `E0951`: an observer the run switched off, as a diagnostic with no source position
+/// (the observer is Rust, not source).
+pub fn observer_fault_diagnostic(fault: &lattice_runtime::ObserverFault) -> Diagnostic {
+    Diagnostic::error(fault.describe())
+        .with_code(lattice_runtime::ObserverFault::CODE)
+        .note(format!(
+            "the run carried on without it: its rows stop at step {} (t = {:e} s)",
+            fault.step, fault.time
+        ))
 }
 
 /// A number as a message shows it: plain when it reads easily, else in exponent form.
@@ -780,6 +805,112 @@ project endless {
 }",
         );
         assert!(diagnostic.is_none());
+    }
+
+    /// A free gas of `count` atoms with an observer law and `observes`.
+    fn observed_gas(count: usize, extra: &str, observes: &str) -> String {
+        format!(
+            "project gas {{
+  dimensions: 2;
+  duration: 0.5 second;
+  observer kinetic(a: particle) -> joule {{ return 0.5 * a.mass * dot(a.velocity, a.velocity); }}
+  {extra}
+  particles atoms {{
+    count: {count};
+    region: [10 meter, 10 meter];
+    spacing: 1 meter;
+    mass: 2 kilogram;
+    speed: 1 meter / second;
+  }}
+  solve dynamics(atoms) with velocity_verlet(dt=0.01 second);
+  {observes}
+}}"
+        )
+    }
+
+    /// `W0320` and `W0321` are warnings: `check` prints them, compiles, and succeeds.
+    #[test]
+    fn check_warns_about_an_unresolved_target_and_an_empty_set() {
+        let source = observed_gas(
+            0,
+            "",
+            "observe atomz every 0.1 second;
+  observe mean(kinetic(atoms)) every 0.1 second;",
+        );
+        let file = SourceFile::new("warn.lattice", source.clone());
+        let (compiled, diagnostics) = compile_source(&file);
+        assert!(compiled.is_some() && !diagnostics.has_errors());
+        let rendered = diagnostics.render(&file);
+        assert_eq!(diagnostics.codes(), ["W0320", "W0321"], "{rendered}");
+        assert!(rendered.contains("warning[W0320]: observe target `atomz` names nothing"), "{rendered}");
+        assert!(rendered.contains("did you mean `atoms`?"), "{rendered}");
+        assert!(rendered.contains("warning[W0321]") && rendered.contains("NaN"), "{rendered}");
+        let mut a = args("check --quiet");
+        a.positional.push(write_model("warn.lattice", &source));
+        assert_eq!(check(&a).unwrap(), ExitCode::SUCCESS);
+    }
+
+    /// A law observer's non-finite row halts the run, and the CLI explains it at the
+    /// operation from the state the run stopped in (`E0950`, spec M6.2 G7).
+    #[test]
+    fn a_halting_law_observer_is_explained_at_its_operation() {
+        let source = observed_gas(
+            4,
+            "observer log_x(a: particle) -> 1 { return ln(a.position.x / 1 meter); }",
+            "observe sum(log_x(atoms)) every 0.1 second;",
+        )
+        .replace("spacing: 1 meter;", "spacing: 1 meter; origin: [-1.5 meter, 0 meter];");
+        let file = SourceFile::new("fixture.lattice", source);
+        let (compiled, diagnostics) = compile_source(&file);
+        assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+        let compiled = compiled.expect("a model");
+        let config = RunConfig::from_model(&compiled.model);
+        let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+        simulation.add_observers(compiled.observers).unwrap();
+        let outcome = simulation.run(&config);
+        let lattice_runtime::StopReason::NonFinite { observation, step, time } = &outcome.stop else {
+            panic!("expected a halt, got {:?}", outcome.stop)
+        };
+        assert_eq!(observation, "atoms.log_x.sum");
+        let fault = simulation.explain_observer_halt(observation).expect("the observer explains itself");
+        let diagnostic = fault_diagnostic(&fault, *step, *time);
+        assert_eq!(diagnostic.code.as_deref(), Some("E0950"));
+        assert_eq!(diagnostic.message, "law `log_x` produced a non-finite value");
+        assert_eq!(underlined(&file, &diagnostic), "ln(a.position.x / 1 meter)");
+        assert_eq!(diagnostic.primary.as_ref().unwrap().message, "ln gave NaN");
+        let operands = note_with(&diagnostic, "operands:");
+        assert!(operands.starts_with("operands: -"), "{operands}");
+        assert!(note_with(&diagnostic, "particle 0 of `atoms`").contains(&format!("step {step}")));
+    }
+
+    /// An observer the run switched off is printed as a rendered `E0951`.
+    #[test]
+    fn a_disabled_observer_is_rendered_as_e0951() {
+        let fault = lattice_runtime::ObserverFault {
+            observer: "vacf".to_string(),
+            kind: lattice_runtime::ObserverFaultKind::Panic,
+            step: 3,
+            time: 0.03,
+            message: "index out of bounds".to_string(),
+        };
+        let file = SourceFile::new("m.lattice", "project m {}");
+        let rendered = observer_fault_diagnostic(&fault).render(&file);
+        assert!(rendered.starts_with("error[E0951]: observer `vacf` panicked at step 3 and was disabled"), "{rendered}");
+        assert!(rendered.contains("index out of bounds") && rendered.contains("rows stop at step 3"), "{rendered}");
+    }
+
+    /// `lattice run` records the model's own law observers.
+    #[test]
+    fn run_records_a_law_observer_row() {
+        let source = observed_gas(4, "", "observe sum(kinetic(atoms)) every 0.1 second;");
+        let out = std::env::temp_dir().join("lattice-cli-tests").join("law_observer.json");
+        let _ = fs::remove_file(&out);
+        let mut a = args(&format!("run --quiet --json {}", out.to_string_lossy()));
+        a.positional.push(write_model("law_observer.lattice", &source));
+        assert_eq!(run(&a).unwrap(), ExitCode::SUCCESS);
+        let text = fs::read_to_string(&out).expect("artifact should exist");
+        assert!(text.contains("atoms.kinetic.sum"), "{text}");
+        let _ = fs::remove_file(&out);
     }
 
     #[test]

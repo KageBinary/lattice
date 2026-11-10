@@ -159,7 +159,10 @@ fn load(path: &Path) -> State {
         diagnostics.render(&file)
     };
     let report = compiled.model.report();
-    let simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+    let mut simulation = Simulation::coupled(compiled.model, compiled.domains, compiled.coupler);
+    if let Err(refused) = simulation.add_observers(compiled.observers) {
+        return State::Failed(refused);
+    }
 
     let stability = simulation.stability();
     let timestep = simulation

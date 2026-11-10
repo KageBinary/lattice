@@ -1,0 +1,24 @@
+// expect: E0419
+// An observer law gives one value per particle. `observe` records one number, so the
+// call must name how the values are reduced: sum, mean, min or max. `average` is not one.
+
+project observe_without_a_reduction {
+  dimensions: 2;
+  duration: 1 picosecond;
+
+  observer kinetic(a: particle) -> joule {
+    return 0.5 * a.mass * dot(a.velocity, a.velocity);
+  }
+
+  particles atoms {
+    count: 4;
+    region: [1 nanometer, 1 nanometer];
+    spacing: 0.3 nanometer;
+    mass: 39.948 dalton;
+    speed: 100 meter / second;
+  }
+
+  solve dynamics(atoms) with velocity_verlet(dt=10 femtosecond);
+
+  observe average(kinetic(atoms)) every 0.1 picosecond;
+}

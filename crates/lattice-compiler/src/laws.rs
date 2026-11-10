@@ -362,6 +362,9 @@ pub struct TypedLaw {
     /// True when a rate law reads the cell's temperature, directly or through
     /// `arrhenius`.
     pub reads_temperature: bool,
+    /// The unit the header declared when it is a bare name (`joule`, `meter`), for labelling
+    /// what an observer law records; `None` for a compound unit or a law with no header.
+    pub declared_unit: Option<String>,
     /// The declaration.
     pub span: Span,
 }
@@ -444,6 +447,10 @@ fn check_law(law: &LawDecl, evaluator: &Evaluator<'_>, diagnostics: &mut Diagnos
         reads_velocity: checker.reads_velocity,
         reads_members: checker.reads_members,
         reads_temperature: false,
+        declared_unit: law.returns.as_ref().and_then(|r| match &r.kind {
+            TypeKind::Plain(expr) => expr.as_name().map(str::to_string),
+            TypeKind::Vec2(_) => None,
+        }),
         span: law.span,
     })
 }
@@ -491,6 +498,7 @@ pub fn check_rate(
         reads_velocity: false,
         reads_members: false,
         reads_temperature: checker.reads_temperature,
+        declared_unit: None,
         span: value.span,
     })
 }

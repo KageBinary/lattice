@@ -220,6 +220,62 @@ pub struct DomainSpec {
     pub contract: Option<&'static SolverContract>,
 }
 
+/// How an observer law's per-particle values are reduced to one number (spec M6.2 §4.2).
+///
+/// Every reduction runs in particle index order. `Sum` is a left fold from `+0.0`, `Mean`
+/// is that sum divided by the count, and `Min` and `Max` pick equal operands by sign, as
+/// the expression interpreters do. None of them changes the unit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reduction {
+    /// The sum.
+    Sum,
+    /// The sum divided by the count.
+    Mean,
+    /// The smallest value.
+    Min,
+    /// The largest value.
+    Max,
+}
+
+impl Reduction {
+    /// Every reduction.
+    pub const ALL: [Reduction; 4] = [Reduction::Sum, Reduction::Mean, Reduction::Min, Reduction::Max];
+
+    /// The name an `observe` statement calls it by, and the last part of its row name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Reduction::Sum => "sum",
+            Reduction::Mean => "mean",
+            Reduction::Min => "min",
+            Reduction::Max => "max",
+        }
+    }
+
+    /// The reduction written as `name`, if it is one.
+    pub fn parse(name: &str) -> Option<Reduction> {
+        Reduction::ALL.into_iter().find(|r| r.name() == name)
+    }
+}
+
+/// An observer law used at an `observe` statement: `observe sum(kinetic(atoms)) every T;`.
+#[derive(Clone, Debug)]
+pub struct ObserverLawUse {
+    /// The law's name.
+    pub law: String,
+    /// The particle domain it is evaluated over, by instance name.
+    pub domain: String,
+    /// How its values are reduced.
+    pub reduction: Reduction,
+    /// The law lowered, one output on the body layout of the particle domain.
+    pub program: lattice_expr::Program,
+    /// The values its `param`s were bound to, in slot order.
+    pub params: Vec<f64>,
+    /// The unit of the law's value, and so of the row.
+    pub unit: String,
+    /// The row it records, `SET.LAW.REDUCTION`.
+    pub row: String,
+}
+
 /// A declared measurement.
 #[derive(Clone, Debug)]
 pub struct ObserverSpec {
@@ -229,6 +285,9 @@ pub struct ObserverSpec {
     pub target: String,
     /// Sampling interval in seconds; `None` means every step.
     pub interval: Option<f64>,
+    /// The observer law this reduces, for `observe sum(law(set))`. `None` is the plain
+    /// form, which sets a cadence and filters nothing.
+    pub law: Option<ObserverLawUse>,
 }
 
 /// Format a number for a report: plainly when it reads well that way, in scientific
@@ -333,6 +392,15 @@ impl CompiledModel {
             out.push_str(&format!("\nobservers ({})\n", self.observers.len()));
             for observer in &self.observers {
                 out.push_str(&format!("  {:<32} {}\n", observer.target, observer.cadence()));
+                if let Some(law) = &observer.law {
+                    out.push_str(&format!(
+                        "      records `{}` in {}; {} over `{}` in particle index order\n",
+                        law.row,
+                        law.unit,
+                        law.reduction.name(),
+                        law.domain
+                    ));
+                }
             }
         }
 
@@ -483,6 +551,7 @@ mod tests {
                 id: ObserverId::from_index(0),
                 target: "total_energy".to_string(),
                 interval: Some(0.1),
+                law: None,
             }],
             visuals: vec![VisualSpec {
                 target: "temperature".to_string(),
@@ -527,6 +596,7 @@ mod tests {
             id: ObserverId::from_index(0),
             target: "norm".to_string(),
             interval: None,
+            law: None,
         };
         assert_eq!(every_step.cadence(), "every step");
         let periodic = ObserverSpec { interval: Some(0.25), ..every_step };

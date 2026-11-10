@@ -1,0 +1,18 @@
+// expect: E0421
+// An observer law is evaluated once per particle, so the set it is reduced over must be
+// a particle domain. `plate` is a heat field.
+
+project observe_over_a_grid {
+  dimensions: 2;
+  duration: 1 second;
+
+  observer height(a: particle) -> meter {
+    return a.position.y;
+  }
+
+  grid bar { size: [16, 16]; extent: [1 meter, 1 meter]; }
+  field plate on bar = 300 kelvin { diffusivity: 1e-4 meter^2 / second; }
+  solve heat(plate) with crank_nicolson(dt=0.05 second);
+
+  observe max(height(plate)) every 0.1 second;
+}
