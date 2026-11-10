@@ -58,12 +58,25 @@ impl LawObserver {
     /// The observer for `law`, due every `interval` seconds, or at every sample when
     /// `None`.
     ///
+    /// # Errors
+    ///
+    /// If `interval` is `Some` of a value that is not finite and positive (`0`, a
+    /// negative number, NaN, infinity). Such an interval would make the observer sample at
+    /// every step while claiming a cadence, and a caller that builds one directly (the SDK)
+    /// does not pass through the compiler's `E0405`, so the refusal is here.
+    ///
     /// # Panics
     ///
     /// If the program does not have the shape of an observer law (one output, the body
     /// inputs of [`layout`], as many parameters as `law.params`, and a size that fits
     /// [`MAX_REGISTERS`]): a compiler bug.
-    pub fn new(law: &ObserverLawUse, interval: Option<f64>) -> LawObserver {
+    pub fn new(law: &ObserverLawUse, interval: Option<f64>) -> Result<LawObserver, String> {
+        if let Some(seconds) = interval.filter(|seconds| !(*seconds > 0.0 && seconds.is_finite())) {
+            return Err(format!(
+                "observer `{}`: the interval must be a positive, finite time in seconds, found {seconds}",
+                law.row
+            ));
+        }
         assert_eq!(law.program.output_count(), 1, "an observer law has one output");
         assert_eq!(law.program.input_count(), layout::BODY_INPUTS as usize, "an observer law reads the body inputs");
         assert_eq!(law.program.param_count(), law.params.len(), "unbound parameters");
@@ -96,7 +109,7 @@ impl LawObserver {
             backends: Backends::CPU,
             differentiable: false,
         };
-        LawObserver {
+        Ok(LawObserver {
             contract,
             law: law.law.clone(),
             set: law.domain.clone(),
@@ -108,11 +121,12 @@ impl LawObserver {
             interval,
             next_due: 0.0,
             last_time: None,
-        }
+        })
     }
 
     /// The observer a compiled model's `observe` statement declared, if it is a law form.
-    pub fn from_spec(spec: &ObserverSpec) -> Option<LawObserver> {
+    /// The inner `Err` is [`LawObserver::new`]'s refusal of the interval.
+    pub fn from_spec(spec: &ObserverSpec) -> Option<Result<LawObserver, String>> {
         spec.law.as_ref().map(|law| LawObserver::new(law, spec.interval))
     }
 
@@ -150,7 +164,7 @@ impl Observer for LawObserver {
     /// second `run` on the same simulation samples its initial state at the instant the
     /// first ended, and that sample must be taken.
     fn due(&mut self, time: f64, dt: f64) -> bool {
-        let Some(interval) = self.interval.filter(|i| i.is_finite() && *i > 0.0) else { return true };
+        let Some(interval) = self.interval else { return true };
         if self.last_time.is_some_and(|last| time <= last) {
             self.next_due = time;
         }
@@ -411,7 +425,7 @@ mod tests {
     /// about its limits.
     #[test]
     fn the_generated_contract_is_complete() {
-        let observer = LawObserver::new(&law_use(Reduction::Max), None);
+        let observer = LawObserver::new(&law_use(Reduction::Max), None).unwrap();
         let contract = observer.contract();
         assert!(contract.audit(&["gas"]).is_empty());
         assert_eq!(contract.reads, ["gas"]);
@@ -440,7 +454,7 @@ mod tests {
         let observations = Observations::new();
         let reads = [Cow::Borrowed("gas")];
         let ctx = ObserveContext::new(0.0, 0, &domains, &observations).restricted_to(&reads);
-        let mut observer = LawObserver::new(&law_use(Reduction::Sum), None);
+        let mut observer = LawObserver::new(&law_use(Reduction::Sum), None).unwrap();
         let mut out = Observations::new();
         observer.observe(&ctx, &mut out);
         let row = out.get("gas.wave.sum").expect("the row");
@@ -460,7 +474,7 @@ mod tests {
         let domains: Vec<Box<dyn Domain>> = Vec::new();
         let observations = Observations::new();
         let ctx = ObserveContext::new(0.0, 0, &domains, &observations);
-        LawObserver::new(&law_use(Reduction::Sum), None).observe(&ctx, &mut Observations::new());
+        LawObserver::new(&law_use(Reduction::Sum), None).unwrap().observe(&ctx, &mut Observations::new());
     }
 
     /// A run that starts over at the instant the last one ended, or earlier, is sampled
@@ -468,7 +482,7 @@ mod tests {
     #[test]
     fn a_second_run_is_sampled_at_its_start() {
         let dt = 0.05;
-        let mut observer = LawObserver::new(&law_use(Reduction::Sum), Some(0.3));
+        let mut observer = LawObserver::new(&law_use(Reduction::Sum), Some(0.3)).unwrap();
         assert!(observer.due(0.9, dt));
         assert!(!observer.due(1.0, dt), "the schedule continues from the restart");
         assert!(observer.due(0.9, dt), "the same instant starts over");
@@ -477,14 +491,26 @@ mod tests {
         assert!(observer.due(0.3, dt));
     }
 
+    /// An interval that is not a positive, finite time is refused rather than quietly
+    /// sampling at every step; the SDK reaches `new` without the compiler's `E0405`.
+    #[test]
+    fn a_bad_interval_is_refused() {
+        for bad in [0.0, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let refused = LawObserver::new(&law_use(Reduction::Sum), Some(bad));
+            let message = refused.expect_err("an interval of that kind must be refused");
+            assert!(message.contains("interval") && message.contains("gas.wave.sum"), "{message}");
+        }
+        assert!(LawObserver::new(&law_use(Reduction::Sum), Some(1e-30)).is_ok());
+    }
+
     /// Due at 0, then by the half-step rule: a 0.3 observer on a 0.1 sample grid is due
     /// every third sample, and never between samples.
     #[test]
     fn it_is_due_at_its_own_cadence() {
         let dt = 0.05;
-        let mut slow = LawObserver::new(&law_use(Reduction::Sum), Some(0.3));
-        let mut fast = LawObserver::new(&law_use(Reduction::Sum), Some(0.1));
-        let mut every = LawObserver::new(&law_use(Reduction::Sum), None);
+        let mut slow = LawObserver::new(&law_use(Reduction::Sum), Some(0.3)).unwrap();
+        let mut fast = LawObserver::new(&law_use(Reduction::Sum), Some(0.1)).unwrap();
+        let mut every = LawObserver::new(&law_use(Reduction::Sum), None).unwrap();
         let (mut slow_times, mut fast_count) = (Vec::new(), 0);
         // The run's samples: the initial state, then every 0.1 s by the same accumulation.
         for k in 0..=9 {

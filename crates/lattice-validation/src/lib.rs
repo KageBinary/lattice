@@ -43,6 +43,7 @@ mod heat;
 mod laws;
 mod molecular;
 mod particles;
+mod plugin;
 mod quantum;
 mod rate_laws;
 mod rigid;
@@ -270,6 +271,7 @@ pub fn all_cases() -> Vec<Case> {
     cases.extend_from_slice(chemistry::CASES);
     cases.extend_from_slice(execution::CASES);
     cases.extend_from_slice(contracts::CASES);
+    cases.extend_from_slice(plugin::CASES);
     // The GPU rows are absent rather than skipped when the backend is not compiled in or
     // no adapter opens — a case that could not run must not report as passing.
     #[cfg(feature = "gpu")]

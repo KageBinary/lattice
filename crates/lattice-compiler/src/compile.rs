@@ -516,7 +516,9 @@ impl<'a> Compiler<'a> {
             .observers
             .iter()
             .filter_map(LawObserver::from_spec)
-            .map(|observer| Box::new(observer) as Box<dyn Observer>)
+            // `lower_observers` dropped any law observer whose interval is not positive and
+            // finite (E0405), so the constructor's refusal of one is a compiler bug.
+            .map(|observer| Box::new(observer.expect("a law observer's interval was checked (E0405)")) as Box<dyn Observer>)
             .collect();
         Compiled {
             model,

@@ -1,0 +1,17 @@
+[package]
+name = "lattice-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The public surface for code written outside the engine: observers, read-only domain views, and compile_file"
+
+[dependencies]
+lattice-ir.workspace = true
+lattice-syntax.workspace = true
+lattice-compiler.workspace = true
+lattice-runtime.workspace = true
+lattice-domain-particle.workspace = true
+
+[lints]
+workspace = true

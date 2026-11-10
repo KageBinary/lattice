@@ -1775,6 +1775,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-sdk"
+version = "0.1.0"
+dependencies = [
+ "lattice-compiler",
+ "lattice-domain-particle",
+ "lattice-ir",
+ "lattice-runtime",
+ "lattice-syntax",
+]
+
+[[package]]
 name = "lattice-syntax"
 version = "0.1.0"
 dependencies = [
