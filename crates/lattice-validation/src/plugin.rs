@@ -64,6 +64,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Case, Level, Outcome};
 
@@ -117,6 +118,16 @@ struct Measured {
     curve: Vec<(f64, f64)>,
 }
 
+/// A path under the temporary directory that no other call in any thread of any process
+/// uses: the process id separates processes, and a counter separates the calls within one.
+/// The registry runs cases on several threads when tests call `run_all` in parallel, and a
+/// path shared between them would be removed by one while another's plugin still read it.
+fn unique_temp(stem: &str, extension: &str) -> PathBuf {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{stem}-{}-{call}.{extension}", std::process::id()))
+}
+
 /// The plugin's manifest, found from this crate's own location.
 fn manifest() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/vacf/Cargo.toml")
@@ -146,7 +157,7 @@ fn run_plugin_with(cargo: &OsStr, manifest: &Path, target: &Path, model_text: &s
     if !manifest.exists() {
         return Err(format!("the plugin's manifest is missing: {}", manifest.display()));
     }
-    let model = std::env::temp_dir().join(format!("lattice-validation-vacf-{}.lattice", std::process::id()));
+    let model = unique_temp("lattice-validation-vacf", "lattice");
     std::fs::write(&model, model_text)
         .map_err(|error| format!("cannot write the temporary model {}: {error}", model.display()))?;
     let output = Command::new(cargo)
@@ -387,13 +398,26 @@ mod tests {
         assert!(error.contains("cannot run `no-such-cargo-program`"), "{error}");
     }
 
-    /// A build that fails (here, a program that exits at once with an error) is reported
-    /// with its exit status.
+    /// A build that fails is reported with its exit status. The real cargo is run on a
+    /// manifest that exists but is not valid TOML, which cargo certainly rejects.
     #[test]
     fn a_failing_build_is_a_reason_not_a_panic() {
-        // `rustc` rejects the arguments cargo would take, so it stands in for a failed build.
-        let error = run_plugin_with(OsStr::new("rustc"), &manifest(), Path::new("target"), MODEL).expect_err("a failing command is an error");
-        assert!(error.contains("failed"), "{error}");
+        let directory = unique_temp("lattice-validation-broken-plugin", "d");
+        std::fs::create_dir_all(&directory).unwrap();
+        let manifest = directory.join("Cargo.toml");
+        std::fs::write(&manifest, "this is [not toml").unwrap();
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let result = run_plugin_with(&cargo, &manifest, &directory.join("target"), MODEL);
+        std::fs::remove_dir_all(&directory).ok();
+        let error = result.expect_err("a manifest that is not TOML cannot build");
+        assert!(error.contains("failed") && error.contains("Cargo.toml"), "{error}");
+    }
+
+    /// Two calls never share a temporary path.
+    #[test]
+    fn temporary_paths_are_unique_per_call() {
+        let (a, b) = (unique_temp("x", "lattice"), unique_temp("x", "lattice"));
+        assert_ne!(a, b);
     }
 
     /// Whatever goes wrong, the case reports a failure and still returns.
