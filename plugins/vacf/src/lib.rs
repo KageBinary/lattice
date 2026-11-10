@@ -16,9 +16,11 @@
 //! # Memory
 //!
 //! The last `lags + 1` velocity snapshots live in a ring that [`Vacf::new`] allocates,
-//! together with the running sums. [`Observer::observe`] allocates nothing: at each
-//! sample it overwrites the oldest snapshot and adds one dot product per lag and
-//! particle.
+//! together with the running sums. The ring and the sums are never reallocated: at each
+//! sample [`Observer::observe`] overwrites the oldest snapshot and adds one dot product
+//! per lag and particle. The one allocation left is the row's name, cloned each time the
+//! row is recorded, because the name is built from the domain's and `record_metric`
+//! wants an owned or `'static` string.
 //!
 //! # What it cannot say
 //!
@@ -27,6 +29,8 @@
 //! tracked by slot, and the longest lag is the ring's length.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use lattice_sdk::{
     Backends, Curve, ObserveContext, Observations, Observer, ObserverContract, ParticleView,
@@ -54,6 +58,8 @@ pub struct Vacf {
     /// How many origins have lag `k`.
     origins: Vec<u64>,
     samples: u64,
+    /// The same count, readable after the observer has been handed to the simulation.
+    shared_samples: Arc<AtomicU64>,
     first_time: f64,
     /// The sample interval, seconds, from the first two samples.
     interval: Option<f64>,
@@ -101,6 +107,8 @@ impl Vacf {
                 Cow::Borrowed("particles are followed by slot: if one is spawned, destroyed or reordered, or the count changes, the correlation is wrong, and a changed count disables the observer"),
                 Cow::Borrowed("lags stop at the ring's length, and the longer lags have fewer origins"),
                 Cow::Borrowed("the row is the running estimate over the origins so far, not the final curve's value, and is absent until the second sample"),
+                Cow::Borrowed("velocities are used as they are: the centre-of-mass drift is not subtracted, so a net drift of the particles adds to C"),
+                Cow::Borrowed("2D only: it reads vel_x and vel_y of the particle domain and nothing else"),
                 Cow::Borrowed("exp(-gamma tau) holds only for free particles in a Langevin bath; with forces the curve is not that"),
             ],
             deterministic: true,
@@ -120,6 +128,7 @@ impl Vacf {
             denominator: vec![0.0; slots],
             origins: vec![0; slots],
             samples: 0,
+            shared_samples: Arc::new(AtomicU64::new(0)),
             first_time: 0.0,
             interval: None,
         })
@@ -148,6 +157,12 @@ impl Vacf {
     /// The number of samples taken so far.
     pub fn samples(&self) -> u64 {
         self.samples
+    }
+
+    /// A handle on the number of samples taken, which is the number of time origins at
+    /// lag 0. It stays readable after the observer is attached to a simulation.
+    pub fn sample_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared_samples)
     }
 
     /// The longest lag, in sample intervals.
@@ -206,6 +221,7 @@ impl Observer for Vacf {
             _ => {}
         }
         self.samples += 1;
+        self.shared_samples.store(self.samples, Ordering::Relaxed);
 
         // No row until a lag-1 pair exists, and none when nothing moves: C is 0/0 there,
         // and a NaN row would halt the run.
@@ -216,22 +232,33 @@ impl Observer for Vacf {
 
     fn curves(&self) -> Vec<Curve> {
         let Some(interval) = self.interval.filter(|dt| *dt > 0.0) else { return Vec::new() };
-        let (mut tau, mut c) = (Vec::new(), Vec::new());
-        for lag in 0..=self.lags {
-            if self.origins[lag] > 0 && self.denominator[lag] > 0.0 {
-                tau.push(lag as f64 * interval);
-                c.push(self.numerator[lag] / self.denominator[lag]);
-            }
-        }
+        // Every lag that has an origin is a point, at its true τ, so the point's index is
+        // its lag. A lag whose origins all have zero speed has no defined C (0/0): it is
+        // NaN, and the note says so, rather than leaving a gap that shifts the later lags.
         let last = self.lags.min(self.samples.saturating_sub(1) as usize);
-        vec![
-            Curve::new(self.curve.clone(), ("tau", "s"), ("C", "1"), tau, c).note(format!(
-                "{} samples of {} particles, sample interval {interval:e} s, lags 0..={}; \
-                 origins per lag fall from {} at lag 0 to {} at lag {last}; \
-                 origins overlap and there is no error bar",
-                self.samples, self.particles, self.lags, self.origins[0], self.origins[last]
-            )),
-        ]
+        let tau: Vec<f64> = (0..=last).map(|lag| lag as f64 * interval).collect();
+        let c: Vec<f64> = (0..=last)
+            .map(|lag| {
+                if self.denominator[lag] > 0.0 {
+                    self.numerator[lag] / self.denominator[lag]
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect();
+        let undefined = c.iter().filter(|c| c.is_nan()).count();
+        let mut curve = Curve::new(self.curve.clone(), ("tau", "s"), ("C", "1"), tau, c).note(format!(
+            "{} samples of {} particles, sample interval {interval:e} s, lags 0..={last} of at most {}; \
+             origins per lag fall from {} at lag 0 to {} at lag {last}; \
+             origins overlap and there is no error bar",
+            self.samples, self.particles, self.lags, self.origins[0], self.origins[last]
+        ));
+        if undefined > 0 {
+            curve = curve.note(format!(
+                "{undefined} lag(s) are NaN: every origin of those lags had zero speed, so C is 0/0"
+            ));
+        }
+        vec![curve]
     }
 }
 
@@ -320,6 +347,33 @@ mod tests {
         assert!((lag1.expect("the row is recorded") - 1.0).abs() < 1e-12);
         let first = &outcome.artifact.timeline()[0];
         assert!(first.values.iter().all(|(name, _)| name != "atoms.vacf.lag1"), "no lag-1 pair at the first sample");
+    }
+
+    /// Particles that never move have no defined C: the lags stay in the curve at their
+    /// true τ, as NaN with a note, instead of being dropped and shifting the later lags.
+    /// No row is recorded, since a NaN row would halt the run.
+    #[test]
+    fn particles_at_rest_leave_nan_lags_in_place() {
+        let path = write_model("rest", &model("").replace("temperature: 94 kelvin;", ""));
+        let mut simulation = compile_file(&path).unwrap_or_else(|d| panic!("{d:?}"));
+        std::fs::remove_file(&path).ok();
+        let vacf = Vacf::new("atoms", 25, 6).unwrap();
+        let samples = vacf.sample_counter();
+        simulation.add_observer(Box::new(vacf)).expect("attaches");
+        let outcome = simulation.run(&RunConfig::from_model(simulation.model()));
+        assert!(outcome.is_success(), "{}", outcome.stop.describe());
+        assert!(outcome.observer_faults.is_empty());
+        assert_eq!(samples.load(std::sync::atomic::Ordering::Relaxed) as usize, outcome.artifact.timeline().len());
+
+        let curves = simulation.curves();
+        let curve = curves.iter().find(|c| c.name == "atoms.vacf").expect("the curve");
+        assert_eq!(curve.x.len(), 7);
+        for (lag, (tau, c)) in curve.x.iter().zip(&curve.y).enumerate() {
+            assert!((tau - lag as f64 * 1e-13).abs() < 1e-24, "lag {lag} is at {tau} s");
+            assert!(c.is_nan(), "C at lag {lag} is {c}");
+        }
+        assert!(curve.notes.iter().any(|n| n.contains("7 lag(s) are NaN")), "{:?}", curve.notes);
+        assert!(outcome.artifact.timeline().iter().all(|s| s.values.iter().all(|(n, _)| n != "atoms.vacf.lag1")));
     }
 
     /// A bath decorrelates the velocities, so C falls with the lag and stays below 1.

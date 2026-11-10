@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 
 use lattice_sdk::{compile_file, ParticleView, RunConfig, SourceFile, SDK_VERSION};
 use vacf::{Vacf, WRITTEN_FOR_SDK};
@@ -69,6 +70,7 @@ fn run() -> Result<(), String> {
 
     let observer = Vacf::new(set, particles, lags)?;
     let curve_name = observer.curve_name().to_string();
+    let origins = observer.sample_counter();
     simulation
         .add_observer(Box::new(observer))
         .map_err(|gaps| format!("the observer was refused: {gaps:?}"))?;
@@ -91,7 +93,8 @@ fn run() -> Result<(), String> {
         .iter()
         .find(|curve| curve.name == curve_name)
         .ok_or_else(|| format!("the observer published no curve `{curve_name}`; it needs at least two samples"))?;
-    let samples = outcome.artifact.timeline().len();
+    // The observer's own count of samples, which is its number of time origins.
+    let samples = origins.load(Ordering::Relaxed);
     let interval = curve.x.get(1).copied().unwrap_or(0.0);
     println!("# vacf model={model} set={set} particles={particles} samples={samples} interval={interval:e}");
     for note in &curve.notes {

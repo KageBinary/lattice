@@ -61,6 +61,7 @@
 //! The spec's sketch gives `√(2/(N·M))` at lag 0. The estimator here is normalised by
 //! its own lag-0 sum, which makes lag 0 exact and the error at other lags the one above.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -108,6 +109,7 @@ const MODEL: &str = "project ideal_gas {
 ";
 
 /// What the plugin printed.
+#[derive(Debug)]
 struct Measured {
     particles: usize,
     samples: usize,
@@ -125,60 +127,75 @@ fn manifest() -> PathBuf {
 /// Its own target directory, under `CARGO_TARGET_DIR` when that is set and beside the
 /// plugin otherwise: the plugin is a separate workspace, and sharing the engine's
 /// directory would have the two cargo runs wait on each other's lock.
-fn run_plugin() -> Measured {
+///
+/// Every way this can go wrong is an `Err` saying why, never a panic: a case that
+/// panics aborts the whole validation run, and the cases after it would not run.
+fn run_plugin() -> Result<Measured, String> {
     let manifest = manifest();
-    assert!(manifest.exists(), "the plugin's manifest is missing: {}", manifest.display());
     let target = match std::env::var_os("CARGO_TARGET_DIR") {
         Some(dir) => PathBuf::from(dir).join("plugin-vacf"),
         None => manifest.with_file_name("target"),
     };
-    let model = std::env::temp_dir().join(format!("lattice-validation-vacf-{}.lattice", std::process::id()));
-    std::fs::write(&model, MODEL).expect("the temporary model is written");
-
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    run_plugin_with(&cargo, &manifest, &target, MODEL)
+}
+
+/// [`run_plugin`] with the cargo program, the manifest, the target directory and the
+/// model given.
+fn run_plugin_with(cargo: &OsStr, manifest: &Path, target: &Path, model_text: &str) -> Result<Measured, String> {
+    if !manifest.exists() {
+        return Err(format!("the plugin's manifest is missing: {}", manifest.display()));
+    }
+    let model = std::env::temp_dir().join(format!("lattice-validation-vacf-{}.lattice", std::process::id()));
+    std::fs::write(&model, model_text)
+        .map_err(|error| format!("cannot write the temporary model {}: {error}", model.display()))?;
     let output = Command::new(cargo)
         .args(["run", "--release", "--quiet", "--manifest-path"])
-        .arg(&manifest)
+        .arg(manifest)
         .arg("--target-dir")
-        .arg(&target)
+        .arg(target)
         .arg("--")
         .arg(&model)
         .args(["atoms", "--lags", &LAGS.to_string()])
-        .output()
-        .expect("cargo runs");
+        .output();
     std::fs::remove_file(&model).ok();
-    assert!(
-        output.status.success(),
-        "`cargo run --manifest-path plugins/vacf/Cargo.toml` failed:\n{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = output.map_err(|error| format!("cannot run `{}`: {error}", cargo.to_string_lossy()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`cargo run --manifest-path {}` failed ({}):\n{}{}",
+            manifest.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     parse(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Read the plugin's output: a `# vacf …` header, then `lag tau C` lines.
-fn parse(text: &str) -> Measured {
-    let header = text.lines().find(|line| line.starts_with("# vacf ")).expect("the plugin prints a header");
-    let field = |key: &str| -> &str {
+fn parse(text: &str) -> Result<Measured, String> {
+    let header = text
+        .lines()
+        .find(|line| line.starts_with("# vacf "))
+        .ok_or("the plugin printed no `# vacf` header")?;
+    let field = |key: &str| -> Result<usize, String> {
         header
             .split_whitespace()
             .find_map(|word| word.strip_prefix(key))
-            .unwrap_or_else(|| panic!("the header has no `{key}`: {header}"))
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| format!("the header has no usable `{key}`: {header}"))
     };
-    let particles = field("particles=").parse().expect("a particle count");
-    let samples = field("samples=").parse().expect("a sample count");
-    let curve = text
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-        .map(|line| {
-            let mut parts = line.split_whitespace();
-            let _lag = parts.next();
-            let tau = parts.next().and_then(|s| s.parse().ok()).expect("tau");
-            let c = parts.next().and_then(|s| s.parse().ok()).expect("C");
-            (tau, c)
-        })
-        .collect();
-    Measured { particles, samples, curve }
+    let (particles, samples) = (field("particles=")?, field("samples=")?);
+    let mut curve = Vec::new();
+    for line in text.lines().filter(|line| !line.starts_with('#') && !line.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let _lag = parts.next();
+        let mut number = |what: &str| -> Result<f64, String> {
+            parts.next().and_then(|s| s.parse().ok()).ok_or_else(|| format!("no {what} in the line `{line}`"))
+        };
+        curve.push((number("tau")?, number("C")?));
+    }
+    Ok(Measured { particles, samples, curve })
 }
 
 /// The standard error of `Ĉ_k` for an AR(1) velocity with correlation `rho` per sample,
@@ -213,9 +230,16 @@ struct Judgement {
 
 /// Judge `curve` (`(τ, C)` from lag 0) against `exp(−γτ)`, with `samples` origins in all
 /// and `particles` particles.
-fn judge(curve: &[(f64, f64)], gamma: f64, samples: usize, particles: usize) -> Judgement {
-    assert!(curve.len() >= 2, "a curve needs a lag besides 0");
-    assert!((curve[0].1 - 1.0).abs() < 1e-12, "C(0) is 1 by construction, found {}", curve[0].1);
+fn judge(curve: &[(f64, f64)], gamma: f64, samples: usize, particles: usize) -> Result<Judgement, String> {
+    if curve.len() < 2 {
+        return Err(format!("the curve has {} point(s); it needs a lag besides 0", curve.len()));
+    }
+    if (curve[0].1 - 1.0).abs() >= 1e-12 {
+        return Err(format!("C(0) is 1 by construction, but the plugin reported {}", curve[0].1));
+    }
+    if samples <= curve.len() {
+        return Err(format!("{samples} samples cannot give {} lags", curve.len()));
+    }
     let rho = (-gamma * curve[1].0).exp();
     let mut result =
         Judgement { worst_z: 0.0, worst_lag: 0, worst_deviation: 0.0, first_sigma: 0.0, last_sigma: 0.0 };
@@ -233,13 +257,30 @@ fn judge(curve: &[(f64, f64)], gamma: f64, samples: usize, particles: usize) -> 
         }
         result.last_sigma = sigma;
     }
-    result
+    Ok(result)
+}
+
+/// A report of a case that could not be measured: the observed value is NaN, which no
+/// criterion accepts, and the note says why.
+fn unmeasured(reason: String) -> Outcome {
+    Outcome::at_most("the case could not measure the plugin", "sigma", f64::NAN, Z_LIMIT).note(reason)
 }
 
 fn vacf_ideal_gas() -> Outcome {
-    let measured = run_plugin();
-    assert_eq!(measured.curve.len(), LAGS + 1, "one point per lag, 0 to {LAGS}");
-    let judgement = judge(&measured.curve, GAMMA, measured.samples, measured.particles);
+    let measured = match run_plugin() {
+        Ok(measured) => measured,
+        Err(reason) => return unmeasured(reason),
+    };
+    if measured.curve.len() != LAGS + 1 {
+        return unmeasured(format!(
+            "expected one point per lag, 0 to {LAGS}; the plugin printed {}",
+            measured.curve.len()
+        ));
+    }
+    let judgement = match judge(&measured.curve, GAMMA, measured.samples, measured.particles) {
+        Ok(judgement) => judgement,
+        Err(reason) => return unmeasured(reason),
+    };
     Outcome::at_most(
         "largest |C(tau) - exp(-gamma tau)| over lags 1..=40, in standard errors of the estimate",
         "sigma",
@@ -260,6 +301,7 @@ fn vacf_ideal_gas() -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Criterion;
     use lattice_ir::Pcg32;
 
     fn exact(gamma: f64) -> Vec<(f64, f64)> {
@@ -270,9 +312,9 @@ mod tests {
     /// 10% off is far beyond the limit.
     #[test]
     fn a_wrong_decay_rate_is_judged_a_failure() {
-        let right = judge(&exact(GAMMA), GAMMA, 1001, 400);
+        let right = judge(&exact(GAMMA), GAMMA, 1001, 400).unwrap();
         assert!(right.worst_z < 1e-6, "{}", right.worst_z);
-        let wrong = judge(&exact(1.1 * GAMMA), GAMMA, 1001, 400);
+        let wrong = judge(&exact(1.1 * GAMMA), GAMMA, 1001, 400).unwrap();
         assert!(wrong.worst_z > 3.0 * Z_LIMIT, "{}", wrong.worst_z);
     }
 
@@ -330,10 +372,63 @@ mod tests {
         }
     }
 
+    /// A plugin that cannot be run is a failed report with the reason, not a panic that
+    /// would abort the whole validation run and the cases after this one.
+    #[test]
+    fn a_missing_manifest_is_a_reason_not_a_panic() {
+        let missing = Path::new("no-such-directory").join("Cargo.toml");
+        let error = run_plugin_with(OsStr::new("cargo"), &missing, Path::new("target"), MODEL).expect_err("a missing manifest is an error");
+        assert!(error.contains("manifest is missing") && error.contains("no-such-directory"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_cargo_is_a_reason_not_a_panic() {
+        let error = run_plugin_with(OsStr::new("no-such-cargo-program"), &manifest(), Path::new("target"), MODEL).expect_err("a missing cargo is an error");
+        assert!(error.contains("cannot run `no-such-cargo-program`"), "{error}");
+    }
+
+    /// A build that fails (here, a program that exits at once with an error) is reported
+    /// with its exit status.
+    #[test]
+    fn a_failing_build_is_a_reason_not_a_panic() {
+        // `rustc` rejects the arguments cargo would take, so it stands in for a failed build.
+        let error = run_plugin_with(OsStr::new("rustc"), &manifest(), Path::new("target"), MODEL).expect_err("a failing command is an error");
+        assert!(error.contains("failed"), "{error}");
+    }
+
+    /// Whatever goes wrong, the case reports a failure and still returns.
+    #[test]
+    fn an_unmeasured_case_fails() {
+        let outcome = unmeasured("because".to_string());
+        assert!(!outcome.passed());
+        assert_eq!(outcome.notes, ["because"]);
+    }
+
+    #[test]
+    fn a_malformed_output_is_a_reason_not_a_panic() {
+        assert!(parse("nothing useful").expect_err("no header").contains("header"));
+        assert!(parse("# vacf particles=4 samples=x
+").is_err());
+        assert!(parse("# vacf particles=4 samples=9
+0 0e0
+").is_err());
+        assert!(judge(&[(0.0, 1.0)], GAMMA, 1001, 400).is_err());
+        assert!(judge(&[(0.0, 0.5), (1e-13, 0.9)], GAMMA, 1001, 400).is_err());
+    }
+
+    /// A NaN lag in the plugin's curve is a failure, not a pass.
+    #[test]
+    fn a_nan_lag_is_judged_a_failure() {
+        let mut curve = exact(GAMMA);
+        curve[3].1 = f64::NAN;
+        let judgement = judge(&curve, GAMMA, 1001, 400).unwrap();
+        assert!(!Criterion::AtMost { limit: Z_LIMIT }.accepts(judgement.worst_z));
+    }
+
     #[test]
     fn the_plugins_output_is_read() {
         let text = "# vacf model=m set=atoms particles=400 samples=1001 interval=1e-13\n# note\n# lag tau_seconds C\n0 0e0 1e0\n1 1e-13 9.0e-1\n";
-        let measured = parse(text);
+        let measured = parse(text).unwrap();
         assert_eq!((measured.particles, measured.samples), (400, 1001));
         assert_eq!(measured.curve, [(0.0, 1.0), (1e-13, 0.9)]);
     }
