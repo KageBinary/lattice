@@ -20,6 +20,7 @@ lattice-expr = { path = "crates/lattice-expr", version = "0.1.0" }
 lattice-syntax = { path = "crates/lattice-syntax", version = "0.1.0" }
 lattice-compiler = { path = "crates/lattice-compiler", version = "0.1.0" }
 lattice-runtime = { path = "crates/lattice-runtime", version = "0.1.0" }
+lattice-sdk = { path = "crates/lattice-sdk", version = "0.1.0" }
 lattice-observe = { path = "crates/lattice-observe", version = "0.1.0" }
 lattice-domain-particle = { path = "crates/lattice-domain-particle", version = "0.1.0" }
 lattice-domain-grid2d = { path = "crates/lattice-domain-grid2d", version = "0.1.0" }

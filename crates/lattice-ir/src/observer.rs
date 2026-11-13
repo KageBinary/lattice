@@ -21,7 +21,7 @@
 //! [`Domain::as_any`](crate::contract::DomainType::as_any), and only for a domain the observer's
 //! contract lists in `reads`; any other name gives `None`. That couples the observer to
 //! the domain's internals. A read-only view over the domain's data is the better
-//! surface, and the SDK is to provide one for particles (it does not exist yet).
+//! surface, and `lattice-sdk` provides one for particles (`ParticleView`).
 //!
 //! # What the runtime enforces
 //!

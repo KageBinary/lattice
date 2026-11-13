@@ -1,4 +1,5 @@
 /target
+/plugins/*/target
 **/*.rs.bk
 Cargo.lock.bak
 

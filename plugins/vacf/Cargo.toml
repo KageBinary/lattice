@@ -1,0 +1,32 @@
+[package]
+name = "vacf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+description = "Example plugin: the velocity autocorrelation of a particle domain, written against lattice-sdk only"
+
+# Its own workspace, so it is not a member of the engine's: it is built the way a plugin
+# outside this repository would be, with `cargo build --manifest-path plugins/vacf/Cargo.toml`,
+# and it changes no engine source (FR-015).
+[workspace]
+
+[lib]
+name = "vacf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vacf"
+path = "src/bin/vacf.rs"
+
+[dependencies]
+lattice-sdk = { path = "../../crates/lattice-sdk", version = "0.1.0" }
+
+# The default is "unwind" and must stay so: the engine disables an observer that panics
+# (E0951) with `catch_unwind`, which an `abort` build would turn into the end of the run.
+[profile.release]
+opt-level = 3
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
