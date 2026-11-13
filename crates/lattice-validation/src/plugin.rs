@@ -413,6 +413,25 @@ mod tests {
         assert!(error.contains("failed") && error.contains("Cargo.toml"), "{error}");
     }
 
+    /// A plugin run that disables its observer partway makes the binary exit non-zero, and
+    /// the case reports that as a reason and an unmeasured (failed) case, not a curve judged
+    /// on the shortened sample count. `every 0.105 ps` is not a multiple of the 10 fs step,
+    /// so the sample spacing changes and the observer disables itself.
+    #[test]
+    fn a_degraded_plugin_run_is_a_reason_not_a_curve() {
+        let manifest = manifest();
+        let target = match std::env::var_os("CARGO_TARGET_DIR") {
+            Some(dir) => PathBuf::from(dir).join("plugin-vacf"),
+            None => manifest.with_file_name("target"),
+        };
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let degraded = MODEL.replace("every 0.1 picosecond", "every 0.105 picosecond");
+        assert_ne!(degraded, MODEL);
+        let error = run_plugin_with(&cargo, &manifest, &target, &degraded).expect_err("a degraded run is an error");
+        assert!(error.contains("failed") && error.contains("disabled"), "{error}");
+        assert!(!unmeasured(error).passed());
+    }
+
     /// Two calls never share a temporary path.
     #[test]
     fn temporary_paths_are_unique_per_call() {

@@ -81,11 +81,18 @@ fn run() -> Result<(), String> {
         config.duration = None;
     }
     let outcome = simulation.run(&config);
-    for fault in &outcome.observer_faults {
-        eprintln!("{}", fault.describe());
-    }
     if !outcome.is_success() {
         return Err(format!("the run stopped early: {}", outcome.stop.describe()));
+    }
+    // An observer that disabled itself partway holds a truncated sample set; a curve from
+    // it would look like a result and its sample count would shrink the caller's error bars
+    // without anyone being told. No curve is printed.
+    if !outcome.observer_faults.is_empty() {
+        let faults: Vec<String> = outcome.observer_faults.iter().map(|fault| fault.describe()).collect();
+        return Err(format!(
+            "the observer was disabled during the run, so its samples are incomplete and no curve is printed:\n{}",
+            faults.join("\n")
+        ));
     }
 
     let curves = simulation.curves();
