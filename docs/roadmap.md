@@ -1187,15 +1187,18 @@ law `0.5 * a.mass * |a.velocity|²` and compares its `sum` with the built-in
 `atoms.kinetic_energy` at every sample. It is **bit for bit**: the built-in is a left fold
 from `+0.0` of `0.5 * m * (vx*vx + vy*vy)` in index order, and the law lowers to the
 same terms in the same order (the built-in skips non-finite masses, the law does not,
-and the example has none). Thread-count identity, which now includes the law observer
-rows of all four reductions, compares 1, 2, 3 and 8 threads. That comparison is weak:
-the model has 64 particles, below the particle grain of 65,536, so the pool never splits
-and every thread count runs the same sequential path. The identity holds by construction,
-because the pool never runs an observer, and not because the test showed it for a split
-pool (the handoff lists the gap). `plugin_vacf_ideal_gas`
+and the example has none). Thread-count identity of law-observer rows is held in two
+places. The validation case `particle_trajectories_match_across_thread_counts` (80,000
+particles, above the particle grain of 65,536, and
+`the_cases_actually_split_their_work` shows the pool splitting them) now also attaches
+law observers (`sum`, `mean`, `min`, `max`, compiled from source) and compares their rows
+bit for bit on 1, 2, 3 and 8 threads. A 64-particle test in
+`crates/lattice-compiler/tests/observers.rs` does the same through a compiled model, but
+64 is below the grain, so every thread count takes the sequential path there; it checks
+the plumbing, and the split pool is the validation case's. `plugin_vacf_ideal_gas`
 builds and runs the plugin and requires `C(τ)` to be `exp(−γτ)` within five standard
 errors, derived in the case (Isserlis' theorem for the ratio estimator, with the overlap
-of origins accounted for) and not tuned. 1,399 tests, 55 invalid fixtures (three of them new in T1 and three in T3, and the
+of origins accounted for) and not tuned. 1,400 tests, 55 invalid fixtures (three of them new in T1 and three in T3, and the
 one that asserted `E0900` for `observer` removed), 79 validation cases (90 with
 `--features gpu`), against 1,312, 50 and 77 (88) at M6.1d.
 
@@ -1283,11 +1286,6 @@ Left, with where each is recorded:
   plugin failure that leaves the canonical project intact. A plugin runs in the engine's
   process, and what M6.2 has is the isolation of a panic within a run (`catch_unwind`),
   which says nothing about saved state or a plugin that writes files.
-- **Thread-count identity of law-observer rows is tested only on a pool that never
-  splits.** The test (`crates/lattice-compiler/tests/observers.rs`) uses 64 particles,
-  below the particle grain (65,536), so every thread count takes the sequential path.
-  The identity holds by construction, since the pool never runs an observer, but a test
-  on a model large enough to split the particle loop would exercise it.
 - **The same law, reduction and set cannot be observed twice** with different parameters:
   the row name leaves the parameters out (`E0201`).
 - **The viewer** calls `observe()` once per frame, so a law observer with `every` shows only
@@ -1298,8 +1296,11 @@ Left, with where each is recorded:
   artifact, and the table keeps the first. It records an invariant as plain `invariant`,
   without saying which.
 - **No timing was taken.** Neither a law observer's cost nor the plugin's was benchmarked.
-  Law observers evaluate on the batched interpreter, whose gain over the scalar one was
-  1.03× at 16,384 atoms (M6.1d), so nothing here should be read as fast.
+  Law observers evaluate on the batched interpreter. The only measurement of it is M6.1d's,
+  on a pair `force` law inside the force loop: 1.03× over the scalar interpreter at 16,384
+  atoms (median of five paired per-run ratios) and 1.16× at 1,024. An observer law is
+  evaluated once per particle per sample with no neighbour loop, which is a different
+  workload, and it was not timed. Nothing here should be read as fast.
 - **Not built, by decision:** dynamic loading and a stable ABI (spec §23), observers on
   the GPU (`backends.gpu` can be set; nothing runs it), and a Python hook (M6.5, which
   should wrap the `Observer` trait).
