@@ -698,7 +698,8 @@ rather than refuse. Spec §25.2's own example triggers two of them.
 ## User-defined laws
 
 Spec §8.3's *"restricted, typed, side-effect-free language"* for force laws (and, in
-the same language, a reaction's rate: see [Rate laws](#rate-laws)). A law is
+the same language, a reaction's rate: see [Rate laws](#rate-laws), and a per-particle
+measurement: see [Observer laws](#observer-laws)). A law is
 declared once, checked for types and units, compiled to a program, and used by name
 where a built-in force would be. A complete model is
 [`examples/damped_spring.lattice`](../examples/damped_spring.lattice).
@@ -953,15 +954,36 @@ reduction of a user's quantity is never an invariant. `sum` is a left fold from 
 observer runs on the CPU pool.
 
 An observer samples at its own `every`, by the half-step rule the run's sample cadence
-uses. The run samples at the smallest interval of all its `observe` statements, so a
-slower observer is due at some of those samples and never between them, and its series
-has fewer points. Without `every` it is due at every sample. Each reduction of a law over a
-set is recorded once (`E0201` for a repeat).
+uses: it is due at the first sample at or past its next instant, to within half a step. The
+run samples at the smallest interval of all its `observe` statements, so a slower
+observer is due at some of those samples and never between them, and its series has
+fewer points (`every 0.1` against `every 0.3` is about 3 : 1 on a long run; over 0.9 s,
+the initial sample included, it is 10 points to 4). Without `every` it is
+due at every sample. Two things follow from "its own cadence":
+
+- **The run's forced final sample skips an observer that is off its cadence.** A run takes
+  one last sample at its final step whether or not the cadence says one is due, and a law
+  observer answers it by the same rule as any other: if the instant is not one of its
+  own, it records nothing. The last point of a slow observer's series can therefore be
+  earlier than the run's end.
+- **The viewer shows a law observer with `every` only at frames on its cadence.** The
+  viewer samples once per frame, at its own pace and not at the model's `every`, and asks
+  each observer whether the frame is due, so a slow observer's value is absent from most
+  frames. The viewer attaches the model's own law observers and no plugin, and it does not
+  print `E0951` (`lattice run` does).
+
+A row is named from the reduction, the law and the set alone (`atoms.kinetic_x.sum`), so
+each combination is recorded once, whatever its parameters or its `every` (`E0201` for a
+repeat, and `E0405` for an `every` on a law form that is not a positive time). Observing
+one law over one set twice with different parameter values would give two rows of the same
+name, so it is refused too: declare a second law to observe both.
 
 On an empty set `sum` is `0` and `mean`, `min` and `max` are NaN, which halts a run like
-any other non-finite row; the compiler warns (`W0321`) when the set is declared with
-`count: 0`. A law that no `observe` uses draws `W0316`. A row that goes non-finite halts
-the run, and `lattice run` explains it (`E0950`) by evaluating the law again on the state it
+any other non-finite row; the compiler warns (`W0321`) for `mean`, `min` and `max` when the
+set is declared with `count: 0`. A law that no `observe` uses draws `W0316`. A row that
+goes non-finite halts the run, which is the same rule every row follows, though the
+initial sample (time 0) is not checked, for any row: the first check is at the first
+sample after a step. `lattice run` explains the halt (`E0950`) by evaluating the law again on the state it
 sampled, which the run still holds, so nothing is replayed: it names the first particle in
 index order whose value is not finite and the operation that made it so. Some non-finite
 rows have no such particle, and then the explanation blames none: a `sum` that overflows
@@ -988,11 +1010,23 @@ particle and equals the built-in's sum to the bit.
 domain's whole set of rows is recorded at the smallest interval of all the `observe`
 statements, whatever the targets say. Its target is resolved, though: it must be a domain,
 a species or field, or an observation some domain publishes (`total_energy`), and
-otherwise the compiler warns `W0320`, with a "did you mean" when a name is close. Making
-the plain form filter is recorded for a later stage.
+otherwise the compiler warns `W0320`, with a "did you mean" when a name is close. Spec
+§25.1's own `observe total_species every 0.1 second;` draws it, because no domain
+publishes a row of that name. Making the plain form filter is recorded for a later
+stage.
+
+A call with a reduction's name is no longer a plain target. Before the `observer` kind
+existed, `observe sum(atoms);` parsed and set a cadence like any other; it is now `E0202`,
+because a reduction must be given the call of an observer law.
 
 An observer that a run switches off (a plugin that panics, or one that breaks its contract)
-is printed by `lattice run` as `E0951`, and the run carries on without it.
+is printed by `lattice run` as `E0951`, and the run carries on without it. The isolation
+is a `catch_unwind` around each call, so it covers panics: an observer that loops
+forever, overflows the stack or aborts the process (`panic = "abort"` in the build
+profile, or a panic while one is already unwinding) still takes the run with it. The
+rest of the run is bit-identical to a run without the observer, and the observer's rows
+stop at the last call that finished. A plugin written in Rust is described in
+[plugins.md](plugins.md).
 
 ### Values and operations
 
@@ -1081,7 +1115,12 @@ observe temperature every 20 second;
 observe probability_norm;              // every step
 visualize temperature as heatmap;
 visualize probability_density;         // the domain picks an encoding
+observe sum(kinetic_x(atoms)) every 0.1 picosecond;   // an observer law, reduced
 ```
+
+The plain `observe` sets the sampling cadence; the reduction of an `observer` law is a new
+row ([Observer laws](#observer-laws)). A measurement the language cannot express is written
+as a Rust plugin ([plugins.md](plugins.md)).
 
 ---
 

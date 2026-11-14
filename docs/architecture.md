@@ -75,6 +75,24 @@ returns to say where in a law a run first went non-finite, carries an
 points downward like every other, and `lattice-expr` knows nothing of `lattice-syntax`:
 an `Origin` is a byte range, and the CLI turns it into a caret.
 
+The **`Observer` trait** (M6.2) is in `lattice-ir` (`observer.rs`), beside `Domain`, and not
+in `lattice-runtime`, because the particle crate implements it and must not depend on the
+runtime. An observer is spec §16.3's third tier: it reads domains through `&`, keeps its
+own state, and publishes rows and curves. `Simulation::add_observer` (in the runtime)
+audits its `ObserverContract` and attaches it; the runtime calls each observer after the
+domains have published, in attachment order, gated by `due`, inside a `catch_unwind` that
+disables a panicking observer and records `E0951`. The engine's own `observe
+sum(law(set))` statements are `LawObserver`s in `lattice-domain-particle`, attached first, and go
+through the same trait, so it is not an interface only an example uses.
+
+**`lattice-sdk`** is a facade for code outside the workspace: it depends on the compiler,
+the runtime, the IR, the syntax crate and the particle domain, and re-exports the part a
+plugin may use (`Observer`, the contract types, `ObserveContext`, `Observations`, `Curve`,
+`compile`, `Simulation`) with `ParticleView`, `compile_file` and `SDK_VERSION`. Nothing in
+the engine depends on it. `plugins/vacf` links it from a crate with its own
+`[workspace]`, so building that plugin changes no engine source (FR-015). See
+[plugins.md](plugins.md).
+
 `lattice-cpu` is at the bottom beside `lattice-units` because it knows nothing about
 simulation: it splits slices and runs closures. It is *below* `lattice-ir` rather than
 beside the domains because `StepContext` carries an `Executor` — a solver is handed the
@@ -535,6 +553,14 @@ order, while its CPU pair-scatter reference remains unchanged.
   a time because cells take different adaptive sub-steps. GPU lowering (M6.3) is not
   built, and the builtin vocabulary elsewhere is still a closed set: an unrecognized
   function is an error that *lists what is available*.
+- **Observers are CPU-only, sequential, and particle-only at the language level.** An
+  `observer` law reads one particle (M6.2); pair observers, and laws over grids,
+  wavefunctions or rigid bodies, are not built, because only the particle domain has a
+  law input layout. A plugin runs on the main thread after the domains publish, never on
+  the worker pool, so a reduction's order is fixed and the thread count cannot change a
+  row. There is no dynamic loading and no stable ABI (spec §23): a plugin is compiled
+  with the engine version it names. A panic in a plugin is caught and the plugin
+  disabled; an abort, a hang or a stack overflow is not.
 - **No general GPU model scheduler.** The released GPU solvers provide composable
   command encoding, but arbitrary coupled models still execute on the CPU.
 

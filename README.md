@@ -73,7 +73,7 @@ honesty over feature count**:
 | **Diagnostics** | Solver contracts, conservation drift monitors, coupling ledger, residual histories, render channels | Every solver publishes equations, assumptions, and what it does *not* conserve |
 | **Execution** | A worker pool and an explicit partitioning executor; parallel diffusion stencils and per-particle integration; `--threads` and a `--compare` mode that measures its own speedup | Parallel and scalar agree *bit for bit* — every cell, every particle, the CG iteration count, and the reproducibility hash. 4.8× at 512², 1.9× on 262k particles, and nothing slower than it was |
 | **Backends** | A dependency-free backend boundary — devices, buffers, §10.5 precision modes, a kernel cache keyed the way §15.5 asks — with the scalar CPU path and a portable `wgpu` compute backend behind it; explicit diffusion and Crank–Nicolson both device-resident, the latter with a conjugate gradient whose reduction has a *stated* association order; `--backend gpu` on the benchmark harness | The GPU differs from the CPU reference by 4.3 `f32` ulps over 200 explicit steps, using 0.3% of a budget *derived* from `f32` rounding rather than fitted — and agrees to the bit where nothing rounds. 130× the scalar CPU on a 1024² stencil, and 4.1× *slower* end-to-end at 256²; both are published, because neither is honest alone. The implicit path refuses a residual tolerance below `ε·(1 + ‖A‖₂)` instead of failing to reach it, and its budget is dominated by the two solves' stopping criteria rather than by precision |
-| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1312 tests including doctests across 20 crates with all features |
+| **Tooling** | `lattice check`, `run`, `validate`, `bench`, `demo`, `inspect`; JSON run artifacts with reproducible content hashes; terminal viewer | 1400 tests including doctests across 21 crates with all features |
 | **Viewer** | `lattice-view` — a window with field heatmaps, particle scatter, rigid-body outlines, contact normals, transport controls, live plots, curves, conservation drift and the solver's contract; phase on a cyclic wheel, vector fields as magnitude and arrows | Perceptually uniform ramps asserted single-hue and monotone in lightness; flat fields and round-off never drawn as structure |
 
 ### What is not built yet
@@ -93,8 +93,19 @@ faster than evaluating one pair at a time (medians of paired per-run ratios; the
 median rates at 16,384 is 1.09×). Rate laws
 have not been benchmarked. When a law makes a run go non-finite, `lattice run` names the
 law and puts a caret under the sub-expression that failed (`E0950`), and
-`lattice inspect expr` prints what a law compiled to. Observers, GPU lowering and the
-Python API are still to come. See [the roadmap's M6 section](docs/roadmap.md#m6--extensibility-in-progress).
+`lattice inspect expr` prints what a law compiled to.
+
+Observers are in too (M6.2). An `observer` law measures one particle, and
+`observe sum(kinetic(atoms)) every 0.1 picosecond;` reduces it over a particle set
+(`sum`, `mean`, `min` or `max`, in index order) at its own cadence; the run records the
+row's unit and kind in a `series` table. Code outside the engine can add a measurement
+through the `lattice-sdk` crate, which re-exports the `Observer` trait, its contract and a
+read-only `ParticleView`: [`plugins/vacf`](plugins/vacf) is a velocity autocorrelation built
+that way, outside the workspace and against an unmodified engine. A plugin that panics is
+disabled and the run carries on; an abort or a hang is not caught, and there is no stable
+ABI. See [docs/plugins.md](docs/plugins.md). Pair observers, a histogram reduction and
+filtering by `observe` target are not built. GPU lowering and the Python API are
+still to come. See [the roadmap's M6 section](docs/roadmap.md#m6--extensibility-in-progress).
 
 GPU execution is deliberately limited to the released kernels and boundary modes.
 General GPU execution of arbitrary coupled `.lattice` projects is not implemented;
@@ -107,7 +118,7 @@ residual tolerances disagree by four orders of magnitude more than `f32` storage
 an `f32` solve *cannot* be asked for the CPU's `1e-10` — the backend refuses it, naming the
 floor `ε·(1 + ‖A‖₂)` it came from. See [docs/backends.md](docs/backends.md). The backend is
 off by default, because `wgpu` is a few hundred crates and the rest of the CLI has none:
-`--features gpu` turns `lattice validate`'s 77 cases into 88 when an adapter is available.
+`--features gpu` turns `lattice validate`'s 79 cases into 90 when an adapter is available.
 
 The measured lesson of the implicit path is that **the stall is the program**: the diffusion
 stencil runs 27× the CPU at 256², and a CG iteration runs 1.8×, because §10.3 requires the
@@ -413,6 +424,8 @@ lattice/
                               the law checker (spec §8.3)
     lattice-expr/             compiled user laws: the program, its interpreter, and
                               its exact derivative
+    lattice-sdk/              the public surface for plugins: the `Observer` trait and
+                              contract, `ParticleView`, `compile_file`
     lattice-runtime/          clock, timestep negotiation, stepping, run artifacts
     lattice-domain-particle/  integrators, force laws, neighbour search
     lattice-domain-grid2d/    diffusion operator, boundaries, conjugate gradient
@@ -428,6 +441,9 @@ lattice/
                               plots, the diagnostics panel
     lattice-playground/       the `lattice-play` sandbox: mode shell, physics,
                               reactions and heat
+  plugins/
+    vacf/                     the example plugin: a velocity autocorrelation, in its own
+                              workspace, against `lattice-sdk` only
   examples/                   working .lattice models
   tests/invalid/              models that must be rejected, each declaring why
   docs/
@@ -437,6 +453,7 @@ lattice/
     execution.md              how work is divided across threads, and what that may change
     backends.md               who runs the arithmetic, at what precision, and what the
                               answer is allowed to differ by
+    plugins.md                writing an observer plugin: the SDK surface, panics, no stable ABI
     roadmap.md                what each milestone delivered
     viewer.md                 what the window shows and the rules it draws by
     playground.md             the sandbox: its modes, and what its panel will claim
@@ -445,7 +462,7 @@ lattice/
 
 ## Dependencies
 
-Seventeen of the twenty crates have no external dependencies. Everything from units through the compiler to
+Eighteen of the twenty-one crates have no external dependencies. Everything from units through the compiler to
 the validation lab builds from `std` alone — including, somewhat to my own surprise, the
 whole M1 compiler and its diagnostics, and the M4 worker pool.
 

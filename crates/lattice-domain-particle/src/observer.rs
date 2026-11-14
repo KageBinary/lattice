@@ -156,9 +156,10 @@ impl Observer for LawObserver {
     }
 
     /// Due at `0`, then every `interval` by the half-step rule the run's own sample
-    /// cadence uses: the sample nearest the instant, not the first one past it. The run
-    /// samples at the smallest interval of all its observers, so a slower one is due at
-    /// some samples and not others, and is never due between them.
+    /// cadence uses: the first sample at or past the instant, to within half a step (a
+    /// sample half a step early counts). The run samples at the smallest interval of all
+    /// its observers, so a slower one is due at some samples and not others, and is never
+    /// due between them.
     ///
     /// A sample at or before the previous one's instant starts the schedule over: a
     /// second `run` on the same simulation samples its initial state at the instant the
