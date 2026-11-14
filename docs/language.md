@@ -957,7 +957,8 @@ An observer samples at its own `every`, by the half-step rule the run's sample c
 uses: it is due at the first sample at or past its next instant, to within half a step. The
 run samples at the smallest interval of all its `observe` statements, so a slower
 observer is due at some of those samples and never between them, and its series has
-fewer points (a run with `every 0.1` and `every 0.3` records 3 : 1). Without `every` it is
+fewer points (`every 0.1` against `every 0.3` is about 3 : 1 on a long run; over 0.9 s,
+the initial sample included, it is 10 points to 4). Without `every` it is
 due at every sample. Two things follow from "its own cadence":
 
 - **The run's forced final sample skips an observer that is off its cadence.** A run takes

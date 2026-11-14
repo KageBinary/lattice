@@ -1188,10 +1188,14 @@ law `0.5 * a.mass * |a.velocity|²` and compares its `sum` with the built-in
 from `+0.0` of `0.5 * m * (vx*vx + vy*vy)` in index order, and the law lowers to the
 same terms in the same order (the built-in skips non-finite masses, the law does not,
 and the example has none). Thread-count identity, which now includes the law observer
-rows of all four reductions, holds on 1, 2, 3 and 8 threads. `plugin_vacf_ideal_gas`
+rows of all four reductions, compares 1, 2, 3 and 8 threads. That comparison is weak:
+the model has 64 particles, below the particle grain of 65,536, so the pool never splits
+and every thread count runs the same sequential path. The identity holds by construction,
+because the pool never runs an observer, and not because the test showed it for a split
+pool (the handoff lists the gap). `plugin_vacf_ideal_gas`
 builds and runs the plugin and requires `C(τ)` to be `exp(−γτ)` within five standard
 errors, derived in the case (Isserlis' theorem for the ratio estimator, with the overlap
-of origins accounted for) and not tuned. 1,398 tests, 55 invalid fixtures (three of them new in T1 and three in T3, and the
+of origins accounted for) and not tuned. 1,399 tests, 55 invalid fixtures (three of them new in T1 and three in T3, and the
 one that asserted `E0900` for `observer` removed), 79 validation cases (90 with
 `--features gpu`), against 1,312, 50 and 77 (88) at M6.1d.
 
@@ -1219,7 +1223,8 @@ one that asserted `E0900` for `observer` removed), 79 validation cases (90 with
 - **A panic boundary leaks through what is called outside it.** `Observer::contract()`
   was called outside `catch_unwind` on the fault-recording and row-validation paths, so a
   panicking `contract()` took the run down. T4 caches name, `reads` and `outputs` at
-  attach. One call remains: `explain_observer_halt` reads it again, after a halt, unguarded.
+  attach. One call was left, in `explain_observer_halt` (after a halt, unguarded); the T6
+  review found it and it now uses the cached outputs, with a test.
 - **Sampling rules meet at the edges.** A run takes a final sample whether or not it is on
   anyone's cadence, so a slow law observer's last point can be earlier than the run's end;
   a second `run` on one simulation samples its start at the instant the first ended, so
@@ -1274,15 +1279,24 @@ Left, with where each is recorded:
   the chemistry and quantum contracts, and the particle thermostat configurations, are
   audited only by their own crates' unit tests. An `ObserverContract` is audited when it
   is attached, which checks that it is filled in and not that it is true.
-- **`explain_observer_halt` calls `contract()` unguarded** after a halt on an observer's
-  row (above).
+- **NFR-004's own test is not built.** The spec's acceptance is a sandboxed process or
+  plugin failure that leaves the canonical project intact. A plugin runs in the engine's
+  process, and what M6.2 has is the isolation of a panic within a run (`catch_unwind`),
+  which says nothing about saved state or a plugin that writes files.
+- **Thread-count identity of law-observer rows is tested only on a pool that never
+  splits.** The test (`crates/lattice-compiler/tests/observers.rs`) uses 64 particles,
+  below the particle grain (65,536), so every thread count takes the sequential path.
+  The identity holds by construction, since the pool never runs an observer, but a test
+  on a model large enough to split the particle loop would exercise it.
 - **The same law, reduction and set cannot be observed twice** with different parameters:
   the row name leaves the parameters out (`E0201`).
 - **The viewer** calls `observe()` once per frame, so a law observer with `every` shows only
   at the frames on its cadence; it attaches no plugin and never shows `E0951`. The
   `t = 0` sample is not checked for non-finite values, for any row.
-- **The `series` table keeps the first unit and kind it sees** for a name, silently, and
-  records an invariant as plain `invariant`.
+- **The `series` table keeps the first unit and kind it sees** for a name. A later sample
+  that disagrees (including a change of invariant) adds one warning per name to the
+  artifact, and the table keeps the first. It records an invariant as plain `invariant`,
+  without saying which.
 - **No timing was taken.** Neither a law observer's cost nor the plugin's was benchmarked.
   Law observers evaluate on the batched interpreter, whose gain over the scalar one was
   1.03× at 16,384 atoms (M6.1d), so nothing here should be read as fast.

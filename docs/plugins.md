@@ -111,7 +111,15 @@ the half-written row of that call is dropped, the run carries on, and `lattice r
 prints `error[E0951]: observer `vacf` panicked at step N and was disabled: …`. The other
 rows are bit-identical to a run without the observer, and its own rows stop at the last
 call that finished (a unit test in `lattice-runtime` checks this with an observer that
-panics on its third call). NFR-004 (*a failing extension does not take the run down*) is met for a panic.
+panics on its third call).
+
+That is isolation of a panic within the run. It is not the whole of NFR-004, which asks
+that *crashes in optional scripts or plugins must not corrupt saved project state*, and
+tests it with a sandboxed process or plugin failure that leaves the canonical project
+intact. That test is not built: a plugin runs in the engine's own process, and nothing
+here sandboxes it. What the engine does offer is narrower: a panic is caught, the run
+carries on, and a plugin cannot change a domain through the `&` API. A plugin that writes
+files (`SideEffects::WritesFiles`) is trusted not to damage them.
 
 It is **not** met for anything that is not a panic:
 
@@ -130,9 +138,9 @@ It is **not** met for anything that is not a panic:
   plugin at all (it runs a model file and the model's own law observers).
 - `contract()` is read when the observer is attached, outside `catch_unwind`, so a
   `contract()` that panics fails `add_observer` for the caller. The runtime caches the
-  name, `reads` and `outputs` then and does not call it during a run. One call is
-  left: when a run halts on a non-finite row an observer declared, `explain_observer_halt`
-  reads that observer's contract again, unguarded (listed in the handoff).
+  name, `reads` and `outputs` then and does not call it again: not during a run, and not
+  when a halt on one of its rows is explained (`explain_observer_halt` uses the cached
+  outputs).
 
 ## No stable ABI
 
