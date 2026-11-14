@@ -692,7 +692,7 @@ rest build on its parameter surface.
 | M6.1b | a std-only `lattice-expr` crate: a scalar interpreter, user `force`/`potential` in the particle domain, derived forces and per-law contracts | ✅ |
 | M6.1c | §8.3's reaction form: `stoichiometry`, `heat_release`, rate laws reading concentrations and temperature | ✅ |
 | M6.1d | a batched interpreter bit-identical to the scalar one, non-finite tracing to source, `lattice inspect expr` | ✅ |
-| M6.2 | `observer` laws and the Rust observer SDK — the exit condition's "and observer" | |
+| M6.2 | `observer` laws and the Rust observer SDK — the exit condition's "and observer" | ✅ |
 | M6.3 | WGSL lowering, with a budget derived per expression as M4.2 did per kernel | |
 | M6.4 | batch sweeps over `let` constants and `param` bindings, re-bound without recompiling | |
 | M6.5 | the Python API (pyo3), whose `Sweep` is §25.3's | |
@@ -1127,6 +1127,168 @@ Docs and spec clean-up from the same reviews: the replay deviation above is reco
 the spec; the rate-law step wording; "pays nothing" became "pays one flag test"; and
 `docs/architecture.md` names the `lattice-ir` → `lattice-expr` dependency, new with
 `LawFault`. The spec's `inspect expr` example said 14 inputs; the program has 15.
+
+### M6.2 — Observers a user can write ✅
+
+M6.1 made the first half of M6's exit condition true: a user can write a force, a
+potential or a rate law. The second half, *"and observer"*, was a reserved word that
+failed with `E0900`, and the survey for this stage found that `observe TARGET` was
+thinner than its syntax: the target was never resolved, every domain's whole set of rows
+was recorded at the smallest interval of all the statements, and a misspelt name went
+unnoticed. Spec: [`specs/m6-2.md`](../specs/m6-2.md). Five tasks, T1–T5, each
+reviewed to approval, and this one, T6, which is the documentation.
+
+- **`observer` laws.** `observer kinetic(a: particle) -> joule { … }` is a per-particle
+  expression, type- and unit-checked like a body law, over one `particle` (`E0416` for a
+  second, `E0417` for a vector return, `E0418` for `c(…)`, `temperature` or
+  `arrhenius`). It lowers to the body input layout with one output and no derivative.
+- **The use site.** `observe sum(kinetic(atoms)) every 0.1 picosecond;` evaluates the law
+  once per particle, eight at a time through `eval_batch`, and reduces in index order with
+  `sum`, `mean`, `min` or `max`. The row is `SET.LAW.REDUCTION`, in the law's unit, of kind
+  `Metric` (the engine cannot know a user's quantity is conserved). Wrong forms are
+  `E0419` (not a reduction), `E0420` (a force or potential at an `observe`, and an
+  observer in a `force:`) and `E0421` (not a solved particle set). Beyond the spec:
+  `E0201` for a row observed twice and `E0405` for a non-positive `every` on that form.
+  Each law observer has its own cadence, by the half-step rule the run's cadence uses.
+- **A plain `observe TARGET` is resolved and still filters nothing.** A target that is not
+  a domain, a species or field, or a published observation is `W0320` with a "did you
+  mean". `W0321` warns that `mean`, `min` or `max` of a set declared with `count: 0` is
+  NaN, which halts a run. Spec §25.1's own `observe total_species` draws `W0320`, because
+  no domain publishes that name.
+- **The `Observer` trait** (`lattice-ir`): a contract (name, summary, reads, outputs with
+  units, side effects, limitations, determinism, backends, differentiability),
+  `due`, `curves`, and `explain_non_finite`. `Simulation::add_observer` audits the contract
+  and refuses a gap: an empty `limitations`, `reads`, `outputs`, `summary` or `name`, a
+  `reads` name the model lacks, or an output another observer or a domain already
+  publishes. Observers run after the domains publish, in attachment order, law observers
+  first. A call that panics is caught, the observer disabled, its half-written row
+  dropped and `E0951` recorded; the run continues, and every other row is bit-identical
+  to a run without it. The same contract is enforced as behaviour: an undeclared row, a
+  wrong unit, a repeated row or an `Invariant` kind disables the observer too.
+- **`LawObserver`** is the engine's own `Observer`, in the particle crate, so the trait
+  is not an interface only the example uses. A non-finite row halts the run (G7), and
+  `E0950` explains it against the state the run stopped in, with no replay: the observer's
+  input is the sampled state, so it names the first bad particle and the operation.
+- **`lattice-sdk` and `plugins/vacf`.** The SDK re-exports the trait, its contract and
+  context, `Observations`, `Curve` and `compile`/`Simulation`, and adds `ParticleView`
+  (read-only slices), `compile_file` (which attaches the model's own observers) and
+  `SDK_VERSION = (0, 1)`. `plugins/vacf` has its own `[workspace]` and a path dependency
+  on the SDK, so building it changes no engine source (FR-015). It keeps a fixed ring of
+  velocity snapshots allocated in `new`, publishes `C(τ)` as a curve and a running `C` at
+  one lag as a row, and states ten limitations in its contract. See
+  [plugins.md](plugins.md).
+- **The artifact has a `series` table**: each series' unit and kind, once, in name order,
+  and `ARTIFACT_SCHEMA = 2`. There was no schema constant before, so 1 is an artifact with
+  no `schema` field. Every content hash changes once; none is pinned anywhere in the
+  tests.
+
+Validation: `observer_ke_matches_builtin` runs `examples/argon.lattice` with an observer
+law `0.5 * a.mass * |a.velocity|²` and compares its `sum` with the built-in
+`atoms.kinetic_energy` at every sample. It is **bit for bit**: the built-in is a left fold
+from `+0.0` of `0.5 * m * (vx*vx + vy*vy)` in index order, and the law lowers to the
+same terms in the same order (the built-in skips non-finite masses, the law does not,
+and the example has none). Thread-count identity, which now includes the law observer
+rows of all four reductions, holds on 1, 2, 3 and 8 threads. `plugin_vacf_ideal_gas`
+builds and runs the plugin and requires `C(τ)` to be `exp(−γτ)` within five standard
+errors, derived in the case (Isserlis' theorem for the ratio estimator, with the overlap
+of origins accounted for) and not tuned. 1,398 tests, 55 invalid fixtures (three of them new in T1 and three in T3, and the
+one that asserted `E0900` for `observer` removed), 79 validation cases (90 with
+`--features gpu`), against 1,312, 50 and 77 (88) at M6.1d.
+
+### What M6.2 taught us
+
+- **A doc written ahead of the code, again.** The ledger comment at
+  `crates/lattice-cli/src/project.rs` said the per-step entries "are in the run artifact";
+  they are not, and have never been. It was found by the survey, not by a test, and is
+  fixed here. T6's own audit then corrected the observer section of language.md, which
+  three earlier tasks had written in stages (the `W0321` sentence implied it fired for
+  `sum`; the `E0201` help said to change the cadence when the row name leaves the
+  parameters out; `LawObserver::due`'s comment said "nearest" where the code takes the
+  first sample at or past the instant).
+- **`f64::min` skips a NaN, and a reduction that did so would hide the fault the run
+  halts on.** `min` and `max` built on it would drop a NaN
+  particle and publish a finite row. T3 made them propagate NaN instead, and equal
+  operands pick by sign as the interpreters do (the M6.1d rule, reused).
+- **The spec's own limitation text was backwards.** It said the *min/max ties* depend on
+  index order. They do not; `sum` and `mean` do, through floating-point addition. The
+  contract now says so, and §4.3 of the spec was corrected.
+- **The spec asked for `as_any` on every domain; it already existed.** `Domain: DomainType`
+  with a blanket impl over `Any`. The spec did not account for the
+  supertrait. The plugin boundary is therefore a downcast the engine could not forbid,
+  which is why `ParticleView` is the *supported* surface and not the only one.
+- **A panic boundary leaks through what is called outside it.** `Observer::contract()`
+  was called outside `catch_unwind` on the fault-recording and row-validation paths, so a
+  panicking `contract()` took the run down. T4 caches name, `reads` and `outputs` at
+  attach. One call remains: `explain_observer_halt` reads it again, after a halt, unguarded.
+- **Sampling rules meet at the edges.** A run takes a final sample whether or not it is on
+  anyone's cadence, so a slow law observer's last point can be earlier than the run's end;
+  a second `run` on one simulation samples its start at the instant the first ended, so
+  `LawObserver::due` starts over when time does not advance and `Vacf` refuses (it would
+  store one state twice). An `every` that is not a multiple of the timestep gives uneven
+  spacing, which VACF cannot use, so it disables itself rather than mix lags.
+- **The SDK bypasses the compiler's checks, so each check has to live where it can be
+  reached.** `LawObserver::new` accepted `Some(0.0)` or `Some(NaN)` and silently sampled
+  every step. It returns an error now. The compiler's `E0405` is no longer the only guard.
+- **A validation case that shells out can pass on a truncated sample.** The plugin's binary
+  disabled itself partway, printed a fault to stderr, exited 0 and printed a curve, and the
+  case judged the shortened origin count. The binary now exits non-zero when an observer
+  was disabled, and the case reports every way it can fail (no manifest, no cargo, a failed
+  build, malformed output) as an unmeasured case with the reason, rather than panicking and
+  aborting `lattice validate`.
+- **The spec's tolerance sketch did not fit the estimator.** It gave `√(2/(N·M))` at lag 0.
+  The plugin normalises by its own lag-0 sum, so lag 0 is exactly 1 and carries no error,
+  and the error at other lags is a ratio's, with the overlap of origins in it. The case
+  derives the standard error and passes at five of them.
+- **Reductions can be bit-identical to a built-in, and it is worth checking.** The spec allowed a
+  bound from summation order if the sums differed. Both are the same left fold over the same terms,
+  so the bound is zero and the case asserts bit equality. The one difference is a pinned
+  particle: the built-in skips an infinite mass, and a law computes `inf * 0`, so the
+  law needs an `if` on the mass (language.md shows it).
+- **Review earned its keep, and cost rounds.** T1 took three rounds, T2 four, T3 three, T4
+  three, T5 four. Among what the later rounds found: the two-run case,
+  the off-grid final sample, a row published twice, a panicking `contract()`, and the
+  abort a `catch_unwind` cannot catch.
+
+### Handoff from M6.2
+
+Left, with where each is recorded:
+
+- **Plain `observe TARGET` filtering (spec O2(b)).** It resolves and warns, and filters
+  nothing: every domain's rows are recorded at the smallest interval, whatever the
+  targets say. Making it filter changes what every example records, and needs a decision
+  about species targets.
+- **Pair observers, and a `histogram` reduction (M6.2b, a candidate).** A coordination
+  number needs the neighbour list and the pair laws' cutoff semantics. A histogram is a
+  curve and not a scalar, and how to accumulate across samples (latest or running) is
+  undecided. Observer laws over grids, wavefunctions or rigid bodies wait on a law input
+  layout for them, which M6.3's WGSL work has to define anyway.
+- **The coupling ledger is missing from the run artifact.** `lattice run` prints totals and
+  the artifact has nothing of the ledger; the comment in `project.rs` that said otherwise is
+  corrected. The per-step transfers are not written anywhere. (CSV export is the same
+  kind of gap.)
+- **Domains `format!` row names on every sample (NFR-001).** Each `Domain::observe` builds
+  its names as strings each time, and so do `LawObserver` and `Vacf` when they record a row
+  (the name is cloned per record). The hot loop does not pay it, but a sample does.
+- **Contract-audit coverage is partial.** The validation lab's case audits the particle,
+  heat and rigid contracts, and `lattice inspect contracts` the particle and heat ones;
+  the chemistry and quantum contracts, and the particle thermostat configurations, are
+  audited only by their own crates' unit tests. An `ObserverContract` is audited when it
+  is attached, which checks that it is filled in and not that it is true.
+- **`explain_observer_halt` calls `contract()` unguarded** after a halt on an observer's
+  row (above).
+- **The same law, reduction and set cannot be observed twice** with different parameters:
+  the row name leaves the parameters out (`E0201`).
+- **The viewer** calls `observe()` once per frame, so a law observer with `every` shows only
+  at the frames on its cadence; it attaches no plugin and never shows `E0951`. The
+  `t = 0` sample is not checked for non-finite values, for any row.
+- **The `series` table keeps the first unit and kind it sees** for a name, silently, and
+  records an invariant as plain `invariant`.
+- **No timing was taken.** Neither a law observer's cost nor the plugin's was benchmarked.
+  Law observers evaluate on the batched interpreter, whose gain over the scalar one was
+  1.03× at 16,384 atoms (M6.1d), so nothing here should be read as fast.
+- **Not built, by decision:** dynamic loading and a stable ABI (spec §23), observers on
+  the GPU (`backends.gpu` can be set; nothing runs it), and a Python hook (M6.5, which
+  should wrap the `Observer` trait).
 
 ## Outside the milestones: the playground
 
