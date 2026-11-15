@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-Rust 1.85 or newer (edition 2024). No other tools are needed. Seventeen of the twenty
+Rust 1.85 or newer (edition 2024). No other tools are needed. Eighteen of the twenty-one
 crates have no external dependencies at all: the two that open a window, and the portable
 GPU backend, are the exceptions.
 
@@ -34,7 +34,7 @@ problem for exactly the people this note is for.
 ## Building and testing
 
 ```console
-$ cargo test --workspace --all-features # 1312 tests including doctests across 20 crates
+$ cargo test --workspace --all-features # 1400 tests including doctests across 21 crates
 $ cargo test -p lattice-units     # one crate
 $ cargo build --release           # the `lattice` binary
 $ cargo build --release -p lattice-viewer   # the `lattice-view` window
@@ -53,7 +53,7 @@ does reach them, so run the whole workspace before committing.
 ### The GPU backend
 
 Off by default. §19.1's GPU cross-backend rows are *absent* from `lattice validate` without
-the feature — 77 cases rather than 88 — rather than reported as skipped-and-passing.
+the feature — 79 cases rather than 90 — rather than reported as skipped-and-passing.
 
 ```console
 $ cargo run -p lattice-wgpu --example probe    # what this machine's adapter offers
@@ -112,6 +112,36 @@ side and marks its result invalid if their final energies differ.
 When a run halts as non-finite and a user law is responsible, `lattice run` replays it
 and explains the law (`E0950`); that replay is `Simulation::trace_non_finite`, and a
 domain with user laws opts in through `Domain::trace_laws` and `Domain::law_fault`.
+
+## Working on observers and the plugin
+
+An observer is the `Observer` trait in `crates/lattice-ir/src/observer.rs`; a law
+observer (`observe sum(law(set))`) is `LawObserver` in `lattice-domain-particle`; the
+public surface for code outside the engine is `crates/lattice-sdk`, and
+[plugins.md](plugins.md) is what a plugin author reads. Three rules:
+
+- **Keep `panic = "unwind"`.** `Simulation` isolates an observer that panics with
+  `catch_unwind`, which an `abort` profile turns into the end of the run. No
+  `Cargo.toml` in the repository sets a `panic` key; do not add one.
+- **Anything reachable from `lattice-sdk` is a promise to plugins.** The re-exports and
+  `ParticleView` are the surface. Changing one is a change to `SDK_VERSION`, and
+  `plugins/vacf` has to keep building: it is *outside* the workspace, so
+  `cargo test --workspace` does not build it.
+- **A new `Observer` implementation states a contract.** `add_observer` refuses an empty
+  `limitations`, and the contract's `outputs` are enforced at run time (an undeclared
+  row, a wrong unit or a repeated row switches the observer off with `E0951`).
+
+```console
+$ cargo build --manifest-path plugins/vacf/Cargo.toml    # the plugin builds, in its own target dir
+$ cargo run -p lattice-cli -- validate --filter plugin   # builds it, runs it, checks C(τ) = exp(−γτ)
+```
+
+`plugin_vacf_ideal_gas` runs `cargo run --release` on the plugin's manifest, found through
+the path compiled into the validation crate. So **`lattice validate` needs cargo on the
+`PATH` (or `CARGO` set) and a source checkout**; without them the case fails as unmeasured
+and says why, and the rest of the run goes on. Its first run also builds the engine a
+second time, in release, into the plugin's own target directory (`plugins/vacf/target`, or
+`$CARGO_TARGET_DIR/plugin-vacf`), which takes minutes; later runs reuse it.
 
 ## Adding a parallel kernel
 

@@ -311,8 +311,9 @@ fn coupling_report(simulation: &Simulation) -> String {
     if ledger.is_empty() {
         out.push_str("  nothing was transferred\n");
     } else {
-        // Totals per (quantity, source, target), which is what a reader wants — the
-        // per-step entries are in the run artifact for anyone who needs them.
+        // Totals per (quantity, source, target), which is what a reader wants. The
+        // per-step entries are not written anywhere: the run artifact does not carry
+        // the ledger (the roadmap's handoff records that as a gap).
         let mut totals: BTreeMap<(String, String, String), (f64, usize)> = BTreeMap::new();
         for transfer in ledger.transfers() {
             let key = (

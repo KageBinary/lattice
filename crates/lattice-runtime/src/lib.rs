@@ -457,7 +457,9 @@ impl Simulation {
     /// observer that panics while explaining is skipped.
     pub fn explain_observer_halt(&self, observation: &str) -> Option<lattice_ir::LawFault> {
         self.observers.iter().filter(|slot| !slot.disabled).find_map(|slot| {
-            if !slot.observer.contract().outputs.iter().any(|(name, _)| name == observation) {
+            // The cached outputs, not `contract()`: that is user code, and this is outside
+            // `catch_unwind`.
+            if !slot.outputs.iter().any(|(name, _)| name == observation) {
                 return None;
             }
             let ctx = ObserveContext::new(self.clock.time, self.clock.step, &self.domains, &self.observations)
@@ -2131,6 +2133,23 @@ mod tests {
         assert_eq!(column(&outcome, "healthy.calls").len(), 6);
         let curves: Vec<&str> = outcome.artifact.curves().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(curves, ["healthy.curve"]);
+    }
+
+    /// Explaining a halt on an observer's row finds the observer from the outputs cached at
+    /// attachment, so a `contract()` that panics by then does not take the caller down.
+    #[test]
+    fn explaining_a_halt_does_not_call_contract() {
+        let probe = Probe::new("p");
+        let armed = std::sync::Arc::clone(&probe.contract_panics);
+        let mut simulation = observed(vec![probe]);
+        let outcome = run5(&mut simulation);
+        assert!(outcome.is_success(), "{:?}", outcome.stop);
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // The probe declares the row and has nothing to say about it (the default
+        // `explain_non_finite`), so the answer is `None`, reached without a panic.
+        assert!(simulation.explain_observer_halt("p.steps").is_none());
+        assert!(simulation.explain_observer_halt("nobody.publishes.this").is_none());
     }
 
     /// The outcome carries the accumulated faults on every return path, as the

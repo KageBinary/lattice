@@ -59,7 +59,7 @@ pub(crate) static CASES: &[Case] = &[
         name: "particle_trajectories_match_across_thread_counts",
         domain: "cpu",
         level: Level::CrossBackend,
-        claim: "per-particle force laws, a user-defined law, and every integrator give bit-identical trajectories on 1, 2, 3 and 8 threads",
+        claim: "per-particle force laws, a user-defined law, and every integrator give bit-identical trajectories, and law observers (sum, mean, min, max) bit-identical rows, on 1, 2, 3 and 8 threads",
         run: particle_trajectories_match,
     },
     Case {
@@ -261,6 +261,92 @@ fn run_particles(executor: &Executor, integrator: Integrator, steps: usize) -> V
         .collect()
 }
 
+/// A model that declares nothing: the domain is built by hand and the run is configured
+/// by hand, so there is nothing for the compiler to say.
+fn bare_model(name: &str) -> lattice_ir::CompiledModel {
+    lattice_ir::CompiledModel {
+        name: name.to_string(),
+        dimensions: 2,
+        fidelity: lattice_ir::FidelityProfile::Engineering2d,
+        precision: lattice_ir::Precision::Accurate64,
+        domains: Vec::new(),
+        buffers: lattice_ir::BufferPlan::new(),
+        graph: lattice_ir::OperationGraph::build(Vec::new()),
+        observers: Vec::new(),
+        visuals: Vec::new(),
+        timestep: None,
+        duration: None,
+        notes: Vec::new(),
+    }
+}
+
+/// The law observers the cloud carries, as a model's `observe` statements declare them
+/// (spec M6.2 §4.3): sum, mean, min and max of one law over `cloud`.
+///
+/// They are compiled from source so they are the observers a user gets, and a four-atom
+/// model is enough for that: the program does not depend on how many particles the set
+/// has, and only its name, `cloud`, has to match the domain they are attached to.
+fn cloud_law_observers() -> Vec<Box<dyn lattice_ir::Observer>> {
+    let source = "project cloud_observers {
+        dimensions: 2;
+        duration: 0.12 second;
+        observer kinetic(a: particle) -> joule {
+            return 0.5 * a.mass * dot(a.velocity, a.velocity);
+        }
+        particles cloud {
+            count: 4;
+            region: [10 meter, 10 meter];
+            spacing: 1 meter;
+            mass: 2 kilogram;
+            speed: 1 meter / second;
+            seed: 5;
+        }
+        solve dynamics(cloud) with velocity_verlet(dt=0.001 second);
+        observe sum(kinetic(cloud)) every 0.02 second;
+        observe mean(kinetic(cloud)) every 0.02 second;
+        observe min(kinetic(cloud)) every 0.04 second;
+        observe max(kinetic(cloud)) every 0.02 second;
+    }";
+    let file = lattice_syntax::SourceFile::new("cloud_observers.lattice", source);
+    let (compiled, diagnostics) = lattice_compiler::compile_source(&file);
+    assert!(!diagnostics.has_errors(), "{}", diagnostics.render(&file));
+    compiled.expect("a model").observers
+}
+
+/// The law observers' rows over a run of the cloud, as `(time, value)` bit patterns, one
+/// series after another: sum, mean, min, max.
+///
+/// This is what spec M6.2 §4.3 promises — a law observer's row is the same bits whatever
+/// the thread count — held on a population the pool really splits. The observers do not
+/// run on the pool (a parallel reduction would reorder the additions), so what this
+/// checks is that the *state* they read, which the pool did advance, and the fold over
+/// it are the same on every count.
+fn run_cloud_observers(executor: Executor, steps: u64) -> Vec<(u64, u64)> {
+    let mut simulation =
+        Simulation::new(bare_model("cross_backend_cloud"), vec![Box::new(particle_domain())])
+            .with_executor(executor);
+    simulation.add_observers(cloud_law_observers()).expect("the cloud's observers attach");
+    let mut config = RunConfig::new().with_max_steps(steps).with_timestep(1.0e-3);
+    config.sample_interval = Some(0.02);
+    let outcome = simulation.run(&config);
+    assert!(outcome.is_success(), "{}", outcome.stop.describe());
+    ["sum", "mean", "min", "max"]
+        .iter()
+        .flat_map(|reduction| {
+            let row = format!("cloud.kinetic.{reduction}");
+            outcome
+                .artifact
+                .timeline()
+                .iter()
+                .filter_map(|sample| {
+                    sample.values.iter().find(|(name, _)| *name == row).map(|(_, v)| (sample.time, *v))
+                })
+                .collect::<Vec<_>>()
+        })
+        .map(|(time, value)| (time.to_bits(), value.to_bits()))
+        .collect()
+}
+
 fn particle_trajectories_match() -> Outcome {
     let steps = 120;
     let schemes =
@@ -285,8 +371,29 @@ fn particle_trajectories_match() -> Outcome {
         notes.push(format!("{}: {} values differ", scheme.name(), scheme_worst));
     }
 
+    // Law observers (spec M6.2 §4.3) over the same cloud: a row that differs, or a run
+    // that recorded a different number of rows, counts as differing.
+    let reference_rows = run_cloud_observers(Executor::sequential(), steps as u64);
+    let mut rows_worst = 0usize;
+    for threads in THREAD_COUNTS {
+        let rows = run_cloud_observers(Executor::with_threads(threads), steps as u64);
+        rows_worst = rows_worst.max(
+            rows.iter().zip(&reference_rows).filter(|(a, b)| a != b).count()
+                + rows.len().abs_diff(reference_rows.len()),
+        );
+    }
+    worst += rows_worst;
+    // A comparison of nothing is not a pass.
+    if reference_rows.is_empty() {
+        worst += 1;
+    }
+    notes.push(format!(
+        "law observers (sum, mean, min, max): {} row values compared per thread count, {rows_worst} differ",
+        reference_rows.len()
+    ));
+
     let mut outcome = Outcome::at_most(
-        format!("differing state values after {steps} steps"),
+        format!("differing state values and law-observer row values after {steps} steps"),
         "values",
         worst as f64,
         0.0,
@@ -371,22 +478,8 @@ fn quantum_split_step_matches() -> Outcome {
 fn artifact_hash_is_thread_independent() -> Outcome {
     let hash_with = |executor: Executor| {
         let domain = heat_model();
-        let model = lattice_ir::CompiledModel {
-            name: "cross_backend_plate".to_string(),
-            dimensions: 2,
-            fidelity: lattice_ir::FidelityProfile::Engineering2d,
-            precision: lattice_ir::Precision::Accurate64,
-            domains: Vec::new(),
-            buffers: lattice_ir::BufferPlan::new(),
-            graph: lattice_ir::OperationGraph::build(Vec::new()),
-            observers: Vec::new(),
-            visuals: Vec::new(),
-            timestep: None,
-            duration: None,
-            notes: Vec::new(),
-        };
-        let mut simulation =
-            Simulation::new(model, vec![Box::new(domain)]).with_executor(executor);
+        let mut simulation = Simulation::new(bare_model("cross_backend_plate"), vec![Box::new(domain)])
+            .with_executor(executor);
         let outcome =
             simulation.run(&RunConfig::new().with_max_steps(300).with_timestep(1.0e-3));
         assert!(outcome.is_success(), "{}", outcome.stop.describe());
@@ -451,6 +544,21 @@ mod tests {
                 PARTICLE_GRAIN.floor
             );
         }
+    }
+
+    /// The law-observer comparison has to compare something real: rows of all four
+    /// reductions, at their own cadences, with values that are neither NaN nor all one
+    /// number. The cloud they read is the one `the_cases_actually_split_their_work`
+    /// shows the pool splitting.
+    #[test]
+    fn the_particle_case_records_law_observer_rows() {
+        let rows = run_cloud_observers(Executor::with_threads(2), 120);
+        // The initial state and then every 0.02 s to 0.12 s for sum, mean and max; every
+        // 0.04 s for min.
+        assert_eq!(rows.len(), 7 + 7 + 4 + 7, "{rows:?}");
+        let values: Vec<f64> = rows.iter().map(|(_, v)| f64::from_bits(*v)).collect();
+        assert!(values.iter().all(|v| v.is_finite() && *v > 0.0), "{values:?}");
+        assert!(values.windows(2).any(|pair| pair[0] != pair[1]), "{values:?}");
     }
 
     /// A partition whose chunks all divide evenly never exercises the short final chunk,

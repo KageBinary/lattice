@@ -3075,7 +3075,7 @@ impl<'a> Compiler<'a> {
                                 .with_code("E0201")
                                 .at(statement.target.span, "the same law, reduction and set again")
                                 .also(first, "first observed here")
-                                .help("each reduction of a law over a set is recorded once; change the cadence on the first"),
+                                .help("a row is named from the law, the reduction and the set only, so each combination is recorded once, whatever its parameters or cadence; to observe it with other parameters, declare a second law"),
                         );
                         continue;
                     }
