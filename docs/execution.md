@@ -23,13 +23,14 @@ $ lattice run examples/diffusing_pulse.lattice --threads auto --json b.json
 `a.json` and `b.json` differ in their `execution` section and their timings. Their
 `content_hash` is identical.
 
-Four validation cases hold this in place, at `lattice validate --filter cpu`:
+Five validation cases hold this in place, at `lattice validate --filter cpu`:
 
 | Case | What it compares |
 |---|---|
 | `heat_field_matches_across_thread_counts` | every cell of a variable-diffusivity field after 200 explicit steps |
-| `implicit_solve_matches_across_thread_counts` | the field *and* the conjugate-gradient iteration count after 40 Crank–Nicolson steps |
-| `particle_trajectories_match_across_thread_counts` | position and velocity for 3,000 particles under three integrators |
+| `implicit_solve_matches_across_thread_counts` | the field *and* the conjugate-gradient iteration count after 25 Crank–Nicolson steps |
+| `particle_trajectories_match_across_thread_counts` | position and velocity for 80,000 particles (above the particle grain, so the pool splits) under three integrators, with built-in forces and a user-defined law; and the rows of four law observers (`sum`, `mean`, `min`, `max`) |
+| `quantum_split_step_matches_across_thread_counts` | the wavefunction and the absorbed probability after 150 split-step Fourier steps on a 96×75 grid (Bluestein transforms in both passes, split across the pool) |
 | `run_artifacts_hash_identically_across_thread_counts` | the FR-011 reproducibility hash, end to end |
 
 The implicit case is the sharp one. CG stops on `‖r‖ ≤ tol·‖b‖`, so a difference of a
